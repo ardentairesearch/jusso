@@ -1,0 +1,361 @@
+---
+"/protocols/gmx-v2/markets":
+  get:
+    summary: Read GMX V2 Arbitrum Sepolia markets
+    parameters:
+    - &1
+      in: query
+      name: chain
+      required: false
+      schema:
+        type: string
+        enum:
+        - arbitrum
+        default: arbitrum
+    - &2
+      in: query
+      name: start
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    - &3
+      in: query
+      name: end
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+    responses:
+      '200':
+        description: GMX markets response
+        content:
+          application/json:
+            schema:
+              type: object
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/positions":
+  get:
+    summary: Read GMX V2 Arbitrum Sepolia positions for an agent wallet
+    parameters: &4
+    - in: query
+      name: agent_id
+      required: true
+      schema:
+        type: string
+    - *1
+    - *2
+    - *3
+    responses:
+      '200':
+        description: GMX positions response
+        content:
+          application/json:
+            schema:
+              type: object
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/orders":
+  post:
+    summary: Execute GMX V2 Arbitrum Sepolia create order action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxCreateOrderRequest"
+    responses:
+      '200':
+        description: Execution accepted/queued
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/orders/simulate":
+  post:
+    summary: Simulate GMX V2 Arbitrum Sepolia create order action
+    description: Compiles approve -> ExchangeRouter.multicall(sendWnt, sendTokens,
+      createOrder) as a single ERC-4337 batch.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxCreateOrderRequest"
+    responses:
+      '200':
+        description: Simulation result
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/orders/cancel/simulate":
+  post:
+    summary: Simulate GMX V2 Arbitrum Sepolia cancel order action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxCancelOrderRequest"
+    responses:
+      '200':
+        description: Simulation result
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/orders/cancel":
+  post:
+    summary: Execute GMX V2 Arbitrum Sepolia cancel order action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxCancelOrderRequest"
+    responses:
+      '200':
+        description: Execution accepted/queued
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/orders/update/simulate":
+  post:
+    summary: Simulate GMX V2 Arbitrum Sepolia update order action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxUpdateOrderRequest"
+    responses:
+      '200':
+        description: Simulation result
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/orders/update":
+  post:
+    summary: Execute GMX V2 Arbitrum Sepolia update order action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxUpdateOrderRequest"
+    responses:
+      '200':
+        description: Execution accepted/queued
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/deposits/simulate":
+  post:
+    summary: Simulate GMX V2 Arbitrum Sepolia create deposit action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxCreateDepositRequest"
+    responses:
+      '200':
+        description: Simulation result
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/deposits":
+  post:
+    summary: Execute GMX V2 Arbitrum Sepolia create deposit action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxCreateDepositRequest"
+    responses:
+      '200':
+        description: Execution accepted/queued
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/withdrawals/simulate":
+  post:
+    summary: Simulate GMX V2 Arbitrum Sepolia create withdrawal action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxCreateWithdrawalRequest"
+    responses:
+      '200':
+        description: Simulation result
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/withdrawals":
+  post:
+    summary: Execute GMX V2 Arbitrum Sepolia create withdrawal action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxCreateWithdrawalRequest"
+    responses:
+      '200':
+        description: Execution accepted/queued
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/requests/cancel/simulate":
+  post:
+    summary: Simulate GMX V2 Arbitrum Sepolia cancel request action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxCancelRequest"
+    responses:
+      '200':
+        description: Simulation result
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/requests/cancel":
+  post:
+    summary: Execute GMX V2 Arbitrum Sepolia cancel request action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxCancelRequest"
+    responses:
+      '200':
+        description: Execution accepted/queued
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/claims/simulate":
+  post:
+    summary: Simulate GMX V2 Arbitrum Sepolia claim action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxClaimRequest"
+    responses:
+      '200':
+        description: Simulation result
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/claims":
+  post:
+    summary: Execute GMX V2 Arbitrum Sepolia claim action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/GmxClaimRequest"
+    responses:
+      '200':
+        description: Execution accepted/queued
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/gmx-v2/balances":
+  get:
+    summary: Read GMX V2 Arbitrum Sepolia GM market and underlying token balances for an agent wallet
+    description: Returns GM/market LP token balances in `balances` and the wallet's underlying GMX market asset balances in `token_balances`.
+    parameters: *4
+    responses:
+      '200':
+        description: GMX balances response
+        content:
+          application/json:
+            schema:
+              type: object
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"

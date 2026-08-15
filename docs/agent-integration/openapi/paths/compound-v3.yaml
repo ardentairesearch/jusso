@@ -1,0 +1,297 @@
+---
+"/protocols/compound-v3/supply/simulate":
+  post:
+    summary: Simulate Compound III Base Sepolia supply action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/CompoundSupplyRequest"
+    responses:
+      '200':
+        description: Simulation result
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/compound-v3/supply":
+  post:
+    summary: Execute Compound III Base Sepolia supply action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/CompoundSupplyRequest"
+    responses:
+      '200':
+        description: Execution accepted/queued
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/compound-v3/withdraw/simulate":
+  post:
+    summary: Simulate Compound III Base Sepolia withdraw action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/CompoundWithdrawRequest"
+    responses:
+      '200':
+        description: Simulation result
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/compound-v3/withdraw":
+  post:
+    summary: Execute Compound III Base Sepolia withdraw action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/CompoundWithdrawRequest"
+    responses:
+      '200':
+        description: Execution accepted/queued
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/compound-v3/repay/simulate":
+  post:
+    summary: Simulate Compound III Base Sepolia repay action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/CompoundRepayRequest"
+    responses:
+      '200':
+        description: Simulation result
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/compound-v3/repay":
+  post:
+    summary: Execute Compound III Base Sepolia repay action
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/CompoundRepayRequest"
+    responses:
+      '200':
+        description: Execution accepted/queued
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/compound-v3/borrow/simulate":
+  post:
+    summary: Simulate Compound III Base Sepolia borrow action
+    description: Compound III borrows are base-asset withdrawals from Comet.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/CompoundBorrowRequest"
+    responses:
+      '200':
+        description: Simulation result
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/compound-v3/borrow":
+  post:
+    summary: Execute Compound III Base Sepolia borrow action
+    description: Compound III borrows are base-asset withdrawals from Comet.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            "$ref": "#/components/schemas/CompoundBorrowRequest"
+    responses:
+      '200':
+        description: Execution accepted/queued
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/ExecutionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/compound-v3/position":
+  get:
+    summary: Read Compound III Base Sepolia position for an agent wallet
+    parameters:
+    - in: query
+      name: agent_id
+      required: true
+      schema:
+        type: string
+    - in: query
+      name: chain
+      required: false
+      schema:
+        type: string
+        enum:
+        - base
+        default: base
+    - in: query
+      name: market
+      required: false
+      schema:
+        type: string
+        enum:
+        - usdc
+        - weth
+        default: usdc
+    responses:
+      '200':
+        description: Compound position response
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/CompoundPositionResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/compound-v3/markets":
+  get:
+    summary: List and verify Compound III Base Sepolia markets
+    description: Returns the maintained USDC and WETH Comet registry after verifying each proxy's base token on-chain.
+    parameters:
+    - in: query
+      name: chain
+      schema: { type: string, enum: [base], default: base }
+    - in: query
+      name: base_asset
+      schema: { type: string, enum: [USDC, WETH] }
+    responses:
+      '200':
+        description: Verified Comet registry
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/CompoundMarketsResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/compound-v3/balances":
+  get:
+    summary: Read Compound III Base Sepolia wallet and protocol balances
+    parameters:
+    - in: query
+      name: agent_id
+      required: true
+      schema:
+        type: string
+    - in: query
+      name: chain
+      required: false
+      schema:
+        type: string
+        enum:
+        - base
+        default: base
+    - in: query
+      name: market
+      required: false
+      schema:
+        type: string
+        enum:
+        - usdc
+        - weth
+        default: usdc
+    responses:
+      '200':
+        description: Compound balances response
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/CompoundBalancesResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"
+"/protocols/compound-v3/borrow-capacity":
+  get:
+    summary: Read Compound III Base Sepolia borrow capacity and market rates
+    description: Returns collateral-based borrow capacity in the selected market base asset, current borrow balance, available borrow, market utilization, and supply/borrow APR.
+    parameters:
+    - in: query
+      name: agent_id
+      required: true
+      schema:
+        type: string
+    - in: query
+      name: chain
+      required: false
+      schema:
+        type: string
+        enum:
+        - base
+        default: base
+    - in: query
+      name: market
+      required: false
+      schema:
+        type: string
+        enum:
+        - usdc
+        - weth
+        default: usdc
+    responses:
+      '200':
+        description: Compound borrow capacity response
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/CompoundBorrowCapacityResponse"
+      '400':
+        "$ref": "#/components/responses/ErrorResponse"
+      '401':
+        "$ref": "#/components/responses/ErrorResponse"

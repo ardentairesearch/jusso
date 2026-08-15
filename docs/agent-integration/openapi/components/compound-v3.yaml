@@ -1,0 +1,360 @@
+---
+schemas:
+  CompoundMarketsResponse:
+    type: object
+    properties:
+      chain: { type: string }
+      markets:
+        type: array
+        items:
+          type: object
+          properties:
+            market: { type: string, enum: [usdc, weth] }
+            comet_address: { type: string }
+            verified: { type: boolean }
+            base_token_address: { type: string }
+            base_token_symbol: { type: string }
+            base_token_decimals: { type: integer }
+            utilization_raw: { type: string }
+            utilization_percent: { type: string }
+            supply_apr_percent: { type: string }
+            borrow_apr_percent: { type: string }
+            collateral_assets:
+              type: array
+              items:
+                type: object
+                properties:
+                  symbol: { type: string }
+                  token_address: { type: string }
+                  decimals: { type: integer }
+                  price_feed_address: { type: string }
+                  borrow_collateral_factor_percent: { type: string }
+                  liquidation_collateral_factor_percent: { type: string }
+                  supply_cap_raw: { type: string }
+  CompoundSupplyRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum:
+        - base
+        default: base
+      asset:
+        type: string
+        description: USDC/base, WETH, or a token address supported by the selected Comet market.
+      market:
+        type:
+        - string
+        - 'null'
+        enum:
+        - usdc
+        - weth
+        description: Compound III Base Sepolia market. Defaults from asset.
+      amount:
+        type:
+        - string
+        - number
+        - 'null'
+        description: Human-readable token amount. JSON numbers are accepted; strings are recommended for precision-sensitive decimals. Use amount_raw for raw token addresses.
+      amount_raw:
+        type:
+        - string
+        - 'null'
+        description: Raw token base-unit amount, or "max" for wallet balance.
+      strategy_id:
+        type:
+        - string
+        - 'null'
+      callback_url:
+        type:
+        - string
+        - 'null'
+        format: uri
+    required:
+    - agent_id
+    - asset
+  CompoundWithdrawRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum:
+        - base
+        default: base
+      asset:
+        type: string
+      market:
+        type:
+        - string
+        - 'null'
+        enum:
+        - usdc
+        - weth
+        description: Compound III Base Sepolia market. Defaults from asset.
+      amount:
+        type:
+        - string
+        - number
+        - 'null'
+        description: Human-readable token amount, or "max". JSON numbers are also accepted.
+      amount_raw:
+        type:
+        - string
+        - 'null'
+        description: Raw token base-unit amount, or "max".
+      strategy_id:
+        type:
+        - string
+        - 'null'
+      callback_url:
+        type:
+        - string
+        - 'null'
+        format: uri
+    required:
+    - agent_id
+    - asset
+  CompoundRepayRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum:
+        - base
+        default: base
+      asset:
+        type: string
+        default: base
+        description: "Selected market base asset only: USDC/base or WETH/base."
+      market:
+        type:
+        - string
+        - 'null'
+        enum:
+        - usdc
+        - weth
+        description: Compound III Base Sepolia market. Defaults from asset.
+      amount:
+        type:
+        - string
+        - number
+        - 'null'
+        description: Human-readable base asset amount, or "max". JSON numbers are also accepted.
+      amount_raw:
+        type:
+        - string
+        - 'null'
+        description: Raw base asset amount, or "max".
+      strategy_id:
+        type:
+        - string
+        - 'null'
+      callback_url:
+        type:
+        - string
+        - 'null'
+        format: uri
+    required:
+    - agent_id
+  CompoundBorrowRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum:
+        - base
+        default: base
+      asset:
+        type: string
+        default: base
+        description: "Selected market base asset only: USDC/base or WETH/base."
+      market:
+        type:
+        - string
+        - 'null'
+        enum:
+        - usdc
+        - weth
+        description: Compound III Base Sepolia market. Defaults from asset.
+      amount:
+        type:
+        - string
+        - number
+        - 'null'
+        description: Human-readable base asset amount. JSON numbers are also accepted.
+      amount_raw:
+        type:
+        - string
+        - 'null'
+        description: Raw base asset amount.
+      strategy_id:
+        type:
+        - string
+        - 'null'
+      callback_url:
+        type:
+        - string
+        - 'null'
+        format: uri
+    required:
+    - agent_id
+  CompoundCollateralBalance:
+    type: object
+    properties:
+      symbol:
+        type: string
+      token_address:
+        type: string
+      decimals:
+        type: integer
+      collateral_balance_raw:
+        type: string
+      collateral_balance_formatted:
+        type: string
+  CompoundBorrowCapacityCollateral:
+    type: object
+    properties:
+      symbol:
+        type: string
+      token_address:
+        type: string
+      decimals:
+        type: integer
+      price_feed_address:
+        type: string
+      price_raw:
+        type: string
+      borrow_collateral_factor_raw:
+        type: string
+      borrow_collateral_factor_percent:
+        type: string
+      collateral_balance_raw:
+        type: string
+      collateral_balance_formatted:
+        type: string
+      borrow_capacity_raw:
+        type: string
+      borrow_capacity_formatted:
+        type: string
+  CompoundAssetBalance:
+    type: object
+    properties:
+      symbol:
+        type: string
+      token_address:
+        type: string
+      decimals:
+        type: integer
+      wallet_balance_raw:
+        type: string
+      wallet_balance_formatted:
+        type: string
+      compound_balance_raw:
+        type: string
+      compound_balance_formatted:
+        type: string
+      is_base_asset:
+        type: boolean
+  CompoundPositionResponse:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+      smart_wallet_address:
+        type: string
+      comet_address:
+        type: string
+      base_token_address:
+        type: string
+      base_token_symbol:
+        type: string
+      base_token_decimals:
+        type: integer
+      base_supply_balance_raw:
+        type: string
+      base_supply_balance_formatted:
+        type: string
+      base_borrow_balance_raw:
+        type: string
+      base_borrow_balance_formatted:
+        type: string
+      collateral_assets:
+        type: array
+        items:
+          "$ref": "#/components/schemas/CompoundCollateralBalance"
+  CompoundBalancesResponse:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+      smart_wallet_address:
+        type: string
+      comet_address:
+        type: string
+      assets:
+        type: array
+        items:
+          "$ref": "#/components/schemas/CompoundAssetBalance"
+  CompoundBorrowCapacityResponse:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+      smart_wallet_address:
+        type: string
+      comet_address:
+        type: string
+      base_token_address:
+        type: string
+      base_token_symbol:
+        type: string
+      base_token_decimals:
+        type: integer
+      base_price_feed_address:
+        type: string
+      base_price_raw:
+        type: string
+      utilization_raw:
+        type: string
+      utilization_percent:
+        type: string
+      supply_rate_per_second_raw:
+        type: string
+      supply_apr_percent:
+        type: string
+      borrow_rate_per_second_raw:
+        type: string
+      borrow_apr_percent:
+        type: string
+      current_borrow_raw:
+        type: string
+      current_borrow_formatted:
+        type: string
+      total_borrow_capacity_raw:
+        type: string
+      total_borrow_capacity_formatted:
+        type: string
+      available_borrow_raw:
+        type: string
+      available_borrow_formatted:
+        type: string
+      is_borrow_collateralized:
+        type: boolean
+      collateral_assets:
+        type: array
+        items:
+          "$ref": "#/components/schemas/CompoundBorrowCapacityCollateral"

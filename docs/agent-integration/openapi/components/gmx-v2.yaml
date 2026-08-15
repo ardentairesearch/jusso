@@ -1,0 +1,414 @@
+---
+schemas:
+  GmxCreateOrderRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum:
+        - arbitrum
+        default: arbitrum
+        description: Hosted testnet uses arbitrum as the Arbitrum Sepolia chain label.
+      order_type:
+        type: string
+        enum:
+        - market_swap
+        - limit_swap
+        - market_increase
+        - limit_increase
+        - market_decrease
+        - limit_decrease
+        - stop_loss_decrease
+        - stop_increase
+      market:
+        type: string
+        description: GMX market token address.
+      initial_collateral_token:
+        type: string
+        description: Collateral/input token sent to the GMX OrderVault.
+      initial_collateral_delta_amount_raw:
+        type: string
+        description: Raw collateral/input amount in token base units.
+      size_delta_usd_raw:
+        type:
+        - string
+        - 'null'
+        description: Raw 30-decimal USD size delta. Required for market_increase.
+      acceptable_price_raw:
+        type:
+        - string
+        - 'null'
+        description: Raw 30-decimal acceptable price. Required for market_increase.
+      min_output_amount_raw:
+        type:
+        - string
+        - 'null'
+        description: Raw minimum output amount. Required for market_swap.
+      execution_fee_raw:
+        type: string
+        description: Raw ETH execution fee in wei.
+      is_long:
+        type:
+        - boolean
+        - 'null'
+        default: true
+      receiver:
+        type:
+        - string
+        - 'null'
+        description: Optional receiver. Defaults to the agent wallet.
+      cancellation_receiver:
+        type:
+        - string
+        - 'null'
+        description: Optional cancellation receiver. Defaults to receiver.
+      callback_contract:
+        type:
+        - string
+        - 'null'
+      ui_fee_receiver:
+        type:
+        - string
+        - 'null'
+      swap_path:
+        type: array
+        items:
+          type: string
+        default: []
+      trigger_price_raw:
+        type:
+        - string
+        - 'null'
+      callback_gas_limit_raw:
+        type:
+        - string
+        - 'null'
+      valid_from_time_raw:
+        type:
+        - string
+        - 'null'
+        description: Raw timestamp from which the order is valid. Defaults to 0.
+      referral_code:
+        type:
+        - string
+        - 'null'
+        description: bytes32 hex or short ASCII referral code.
+      should_unwrap_native_token:
+        type:
+        - boolean
+        - 'null'
+        default: false
+      auto_cancel:
+        type:
+        - boolean
+        - 'null'
+        default: false
+      strategy_id:
+        type:
+        - string
+        - 'null'
+      callback_url:
+        type:
+        - string
+        - 'null'
+        format: uri
+    required:
+    - agent_id
+    - order_type
+    - market
+    - initial_collateral_token
+    - initial_collateral_delta_amount_raw
+    - execution_fee_raw
+  GmxCancelOrderRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum:
+        - arbitrum
+        default: arbitrum
+      order_key:
+        type: string
+        description: GMX bytes32 order key.
+      strategy_id:
+        type:
+        - string
+        - 'null'
+      callback_url:
+        type:
+        - string
+        - 'null'
+        format: uri
+    required:
+    - agent_id
+    - order_key
+  GmxUpdateOrderRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum:
+        - arbitrum
+        default: arbitrum
+      order_key:
+        type: string
+      size_delta_usd_raw:
+        type: string
+      acceptable_price_raw:
+        type: string
+      trigger_price_raw:
+        type: string
+      min_output_amount_raw:
+        type: string
+      valid_from_time_raw:
+        type: string
+      auto_cancel:
+        type:
+        - boolean
+        - 'null'
+        default: false
+      strategy_id:
+        type:
+        - string
+        - 'null'
+      callback_url:
+        type:
+        - string
+        - 'null'
+        format: uri
+    required:
+    - agent_id
+    - order_key
+    - size_delta_usd_raw
+    - acceptable_price_raw
+    - trigger_price_raw
+    - min_output_amount_raw
+    - valid_from_time_raw
+  GmxCreateDepositRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum:
+        - arbitrum
+        default: arbitrum
+      market:
+        type: string
+      initial_long_token:
+        type: string
+      initial_short_token:
+        type: string
+      initial_long_token_amount_raw:
+        type:
+        - string
+        - 'null'
+      initial_short_token_amount_raw:
+        type:
+        - string
+        - 'null'
+      min_market_tokens_raw:
+        type: string
+      execution_fee_raw:
+        type: string
+      receiver:
+        type:
+        - string
+        - 'null'
+      callback_contract:
+        type:
+        - string
+        - 'null'
+      ui_fee_receiver:
+        type:
+        - string
+        - 'null'
+      long_token_swap_path:
+        type: array
+        items:
+          type: string
+        default: []
+      short_token_swap_path:
+        type: array
+        items:
+          type: string
+        default: []
+      callback_gas_limit_raw:
+        type:
+        - string
+        - 'null'
+      should_unwrap_native_token:
+        type:
+        - boolean
+        - 'null'
+        default: false
+      strategy_id:
+        type:
+        - string
+        - 'null'
+      callback_url:
+        type:
+        - string
+        - 'null'
+        format: uri
+    required:
+    - agent_id
+    - market
+    - initial_long_token
+    - initial_short_token
+    - min_market_tokens_raw
+    - execution_fee_raw
+  GmxCreateWithdrawalRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum:
+        - arbitrum
+        default: arbitrum
+      market:
+        type: string
+      market_token_amount_raw:
+        type: string
+      min_long_token_amount_raw:
+        type: string
+      min_short_token_amount_raw:
+        type: string
+      execution_fee_raw:
+        type: string
+      receiver:
+        type:
+        - string
+        - 'null'
+      callback_contract:
+        type:
+        - string
+        - 'null'
+      ui_fee_receiver:
+        type:
+        - string
+        - 'null'
+      long_token_swap_path:
+        type: array
+        items:
+          type: string
+        default: []
+      short_token_swap_path:
+        type: array
+        items:
+          type: string
+        default: []
+      callback_gas_limit_raw:
+        type:
+        - string
+        - 'null'
+      should_unwrap_native_token:
+        type:
+        - boolean
+        - 'null'
+        default: false
+      strategy_id:
+        type:
+        - string
+        - 'null'
+      callback_url:
+        type:
+        - string
+        - 'null'
+        format: uri
+    required:
+    - agent_id
+    - market
+    - market_token_amount_raw
+    - min_long_token_amount_raw
+    - min_short_token_amount_raw
+    - execution_fee_raw
+  GmxCancelRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum:
+        - arbitrum
+        default: arbitrum
+      request_type:
+        type: string
+        enum:
+        - order
+        - deposit
+        - withdrawal
+        - shift
+      key:
+        type: string
+      strategy_id:
+        type:
+        - string
+        - 'null'
+      callback_url:
+        type:
+        - string
+        - 'null'
+        format: uri
+    required:
+    - agent_id
+    - request_type
+    - key
+  GmxClaimRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum:
+        - arbitrum
+        default: arbitrum
+      claim_type:
+        type: string
+        enum:
+        - funding_fees
+        - collateral
+        - affiliate_rewards
+        - ui_fees
+      markets:
+        type: array
+        items:
+          type: string
+      tokens:
+        type: array
+        items:
+          type: string
+      time_keys_raw:
+        type: array
+        items:
+          type: string
+        default: []
+      receiver:
+        type:
+        - string
+        - 'null'
+      strategy_id:
+        type:
+        - string
+        - 'null'
+      callback_url:
+        type:
+        - string
+        - 'null'
+        format: uri
+    required:
+    - agent_id
+    - claim_type
+    - markets
+    - tokens

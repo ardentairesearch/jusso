@@ -1,0 +1,156 @@
+---
+schemas:
+  UniswapV4SwapRequest:
+    type: object
+    properties:
+      agent_id:
+        type: string
+      chain:
+        type: string
+        enum: [ethereum]
+        default: ethereum
+      token_in:
+        type: string
+        description: Input currency address. Use the zero address for native ETH.
+      token_out:
+        type: string
+        description: Output currency address. Use the zero address for native ETH.
+      fee:
+        oneOf:
+        - type: integer
+          minimum: 0
+          maximum: 1000000
+        - type: integer
+          const: 8388608
+        description: Explicit pool fee, or 8388608 for a dynamic-fee pool. Omit with tick_spacing and hooks for automatic selection.
+      tick_spacing:
+        type: integer
+        minimum: 1
+        maximum: 32767
+      hooks:
+        type: string
+      include_hooked_pools:
+        type: boolean
+        default: false
+        description: Allow automatic selection to consider hook-enabled pools.
+      hook_data:
+        type: string
+        default: "0x"
+      swap_kind:
+        type: string
+        enum: [exact_in, exact_out]
+        default: exact_in
+      amount_raw:
+        type: string
+        description: Exact input for exact_in, or exact output for exact_out, in raw units.
+      limit_raw:
+        type: [string, "null"]
+        description: Minimum output for exact_in, or maximum input for exact_out. Derived from the quote when omitted.
+      slippage_bps:
+        type: integer
+        minimum: 0
+        maximum: 10000
+        default: 100
+      deadline:
+        type: [integer, "null"]
+        description: Future Unix timestamp. Defaults to twenty minutes after request handling.
+      strategy_id:
+        type: [string, "null"]
+      callback_url:
+        type: [string, "null"]
+        format: uri
+    required: [agent_id, token_in, token_out, amount_raw]
+    dependentRequired:
+      fee: [tick_spacing]
+      tick_spacing: [fee]
+      hooks: [fee, tick_spacing]
+  UniswapV4QuoteResponse:
+    type: object
+    properties:
+      agent_id: { type: string }
+      chain: { type: string }
+      smart_wallet_address: { type: string }
+      pool_id: { type: string }
+      pool_selection:
+        type: string
+        enum: [automatic, explicit]
+      token_in: { type: string }
+      token_out: { type: string }
+      fee: { type: integer }
+      tick_spacing: { type: integer }
+      hooks: { type: string }
+      swap_kind: { type: string }
+      amount_raw: { type: string }
+      quoted_amount_raw: { type: string }
+      limit_raw: { type: string }
+      slippage_bps: { type: integer }
+      quoter_gas_estimate: { type: string }
+      deadline: { type: integer }
+      candidates_discovered: { type: integer }
+      candidates_quoted: { type: integer }
+  UniswapV4PoolResponse:
+    type: object
+    properties:
+      chain: { type: string }
+      pool_id: { type: string }
+      currency0: { type: string }
+      currency1: { type: string }
+      fee: { type: integer }
+      tick_spacing: { type: integer }
+      hooks: { type: string }
+      initialized: { type: boolean }
+      sqrt_price_x96: { type: string }
+      tick: { type: integer }
+      protocol_fee: { type: integer }
+      lp_fee: { type: integer }
+      liquidity: { type: string }
+      pool_manager_address: { type: string }
+      universal_router_address: { type: string }
+      state_view_address: { type: string }
+      quoter_address: { type: string }
+      permit2_address: { type: string }
+  UniswapV4TokenBalance:
+    type: object
+    properties:
+      address: { type: string }
+      symbol: { type: string }
+      name: { type: string }
+      decimals: { type: integer }
+      balance_raw: { type: string }
+      balance_formatted: { type: string }
+  UniswapV4BalancesResponse:
+    type: object
+    properties:
+      agent_id: { type: string }
+      chain: { type: string }
+      smart_wallet_address: { type: string }
+      tokens:
+        type: array
+        items:
+          "$ref": "#/components/schemas/UniswapV4TokenBalance"
+  UniswapV4DiscoveredPool:
+    type: object
+    properties:
+      pool_id: { type: string }
+      currency0: { type: string }
+      currency1: { type: string }
+      fee: { type: integer }
+      tick_spacing: { type: integer }
+      hooks: { type: string }
+      initialized: { type: boolean }
+      sqrt_price_x96: { type: string }
+      tick: { type: integer }
+      protocol_fee: { type: integer }
+      lp_fee: { type: integer }
+      liquidity: { type: string }
+  UniswapV4PoolsResponse:
+    type: object
+    properties:
+      chain: { type: string }
+      token_a: { type: string }
+      token_b: { type: string }
+      include_hooked_pools: { type: boolean }
+      pools:
+        type: array
+        items:
+          "$ref": "#/components/schemas/UniswapV4DiscoveredPool"
