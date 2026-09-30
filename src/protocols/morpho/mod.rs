@@ -1,4 +1,4 @@
-//! Morpho Blue typed actions and reads for Base Sepolia.
+//! Morpho Blue typed actions and reads for an operator-pinned Arc deployment.
 
 pub mod adapter;
 pub mod service;

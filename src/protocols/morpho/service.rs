@@ -19,9 +19,12 @@ use super::adapter::{
     MorphoMarketsQuery, MorphoPosition, MorphoPositionQuery, ResolvedAmount,
 };
 use crate::agent_wallet::AgentWalletRegistry;
-use crate::api::services::{handle_execute, handle_simulate, resolve_chain_smart_wallet_address};
+use crate::api::services::{
+    handle_execute_idempotent, handle_simulate_authenticated, resolve_chain_smart_wallet_address,
+};
+use crate::config::MorphoDeploymentConfig;
 use crate::execution_engine::ExecutionEngine;
-use crate::types::{Chain, ExecutionResponse};
+use crate::types::{AuthContext, Chain, ExecutionResponse};
 
 const WAD: u64 = 1_000_000_000_000_000_000;
 const ORACLE_PRICE_SCALE_EXPONENT: usize = 36;
@@ -31,13 +34,14 @@ const SECONDS_PER_YEAR: u64 = 31_536_000;
 const MAX_SAFE_TOKEN_DECIMALS: u8 = 77;
 const DEFAULT_MIN_HEALTH_FACTOR_WAD: u128 = 1_050_000_000_000_000_000;
 const PYTH_STALE_PRICE_SELECTOR: &str = "0x19abf40e";
-const BLOCKSCOUT_LOGS_URL: &str = "https://base-sepolia.blockscout.com/api";
+const BLOCKSCOUT_LOGS_URL: &str = "https://testnet.arcscan.app/api";
 const CREATE_MARKET_TOPIC: &str =
     "0xac4b2400f169220b0c0afdde7a0b32e775ba727ea1cb30b35f935cdaab8683ac";
 const MARKET_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone)]
 struct MarketDiscoveryCache {
+    morpho_address: Address,
     fetched_at: Instant,
     markets: Vec<(H256, MorphoMarketParams)>,
 }
@@ -136,6 +140,7 @@ pub struct MorphoPositionResponse {
 
 #[derive(Debug, Clone)]
 struct MarketContext {
+    morpho_address: Address,
     market_id: H256,
     params: MorphoMarketParams,
     state: MorphoMarketState,
@@ -163,18 +168,26 @@ macro_rules! action_handlers {
             pool: &PgPool,
             redis_conn: &mut ConnectionManager,
             wallet_registry: &AgentWalletRegistry,
-            organization_id: Uuid,
+            auth_context: &AuthContext,
             req: &MorphoActionRequest,
+            idempotency_key: &str,
         ) -> Result<ExecutionResponse> {
-            let (execution_req, _) =
-                prepare_action(engine, wallet_registry, organization_id, req, $action).await?;
-            handle_execute(
+            let (execution_req, _) = prepare_action(
+                engine,
+                wallet_registry,
+                auth_context.organization_id,
+                req,
+                $action,
+            )
+            .await?;
+            handle_execute_idempotent(
                 engine,
                 pool,
                 redis_conn,
                 wallet_registry,
-                organization_id,
+                auth_context,
                 &execution_req,
+                idempotency_key,
             )
             .await
             .map_err(|error| anyhow!("Morpho {} failed: {}", $action.slug(), error))
@@ -185,16 +198,22 @@ macro_rules! action_handlers {
             engine: &ExecutionEngine,
             pool: &PgPool,
             wallet_registry: &AgentWalletRegistry,
-            organization_id: Uuid,
+            auth_context: &AuthContext,
             req: &MorphoActionRequest,
         ) -> Result<ExecutionResponse> {
-            let (execution_req, _) =
-                prepare_action(engine, wallet_registry, organization_id, req, $action).await?;
-            handle_simulate(
+            let (execution_req, _) = prepare_action(
+                engine,
+                wallet_registry,
+                auth_context.organization_id,
+                req,
+                $action,
+            )
+            .await?;
+            handle_simulate_authenticated(
                 engine,
                 pool,
                 wallet_registry,
-                organization_id,
+                auth_context,
                 &execution_req,
             )
             .await
@@ -267,7 +286,8 @@ pub async fn handle_markets(
         .transpose()?
         .unwrap_or_default();
 
-    let discovered = discover_markets().await?;
+    let deployment = morpho_deployment(engine)?;
+    let discovered = discover_markets(&deployment).await?;
     let mut ranked = Vec::new();
     for (market_id, params) in discovered {
         if loan_filter.is_some_and(|token| token != params.loan_token)
@@ -336,7 +356,7 @@ fn build_market_response(chain: &str, context: MarketContext) -> Result<MorphoMa
         .saturating_sub(context.state.total_borrow_assets);
     Ok(MorphoMarketResponse {
         chain: chain.to_string(),
-        morpho_address: format!("{:?}", morpho::morpho_address()),
+        morpho_address: format!("{:?}", context.morpho_address),
         market_id: format!("{:?}", context.market_id),
         loan_token: token_response(
             context.params.loan_token,
@@ -383,35 +403,50 @@ fn build_market_response(chain: &str, context: MarketContext) -> Result<MorphoMa
 struct BlockscoutLogsResponse {
     status: String,
     message: String,
-    result: Vec<BlockscoutLog>,
+    result: Option<BlockscoutLogsResult>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BlockscoutLogsResult {
+    Logs(Vec<BlockscoutLog>),
+    Message(String),
 }
 
 #[derive(Deserialize)]
 struct BlockscoutLog {
-    #[serde(rename = "blockNumber")]
-    block_number: String,
     data: String,
     topics: Vec<Option<String>>,
 }
 
-async fn discover_markets() -> Result<Vec<(H256, MorphoMarketParams)>> {
+async fn discover_markets(
+    deployment: &MorphoDeploymentConfig,
+) -> Result<Vec<(H256, MorphoMarketParams)>> {
     let cache = MARKET_DISCOVERY_CACHE.get_or_init(|| RwLock::new(None));
     if let Some(entry) = cache.read().await.as_ref() {
-        if entry.fetched_at.elapsed() < MARKET_CACHE_TTL {
+        if entry.morpho_address == deployment.address
+            && entry.fetched_at.elapsed() < MARKET_CACHE_TTL
+        {
             return Ok(entry.markets.clone());
         }
     }
 
-    match fetch_markets_from_blockscout().await {
+    match fetch_markets_from_blockscout(deployment).await {
         Ok(markets) => {
             *cache.write().await = Some(MarketDiscoveryCache {
+                morpho_address: deployment.address,
                 fetched_at: Instant::now(),
                 markets: markets.clone(),
             });
             Ok(markets)
         }
         Err(error) => {
-            if let Some(entry) = cache.read().await.as_ref() {
+            if let Some(entry) = cache
+                .read()
+                .await
+                .as_ref()
+                .filter(|entry| entry.morpho_address == deployment.address)
+            {
                 return Ok(entry.markets.clone());
             }
             Err(error)
@@ -419,22 +454,25 @@ async fn discover_markets() -> Result<Vec<(H256, MorphoMarketParams)>> {
     }
 }
 
-async fn fetch_markets_from_blockscout() -> Result<Vec<(H256, MorphoMarketParams)>> {
+async fn fetch_markets_from_blockscout(
+    deployment: &MorphoDeploymentConfig,
+) -> Result<Vec<(H256, MorphoMarketParams)>> {
     const PAGE_SIZE: usize = 1_000;
     const MAX_PAGES: usize = 100;
     let client = reqwest::Client::new();
     let mut markets = HashMap::new();
-    let mut from_block = 0u64;
     for page in 1..=MAX_PAGES {
         let response = client
             .get(BLOCKSCOUT_LOGS_URL)
             .query(&[
                 ("module", "logs".to_string()),
                 ("action", "getLogs".to_string()),
-                ("address", morpho::MORPHO_ADDRESS.to_string()),
+                ("address", format!("{:?}", deployment.address)),
                 ("topic0", CREATE_MARKET_TOPIC.to_string()),
-                ("fromBlock", from_block.to_string()),
+                ("fromBlock", deployment.deployment_block.to_string()),
                 ("toBlock", "latest".to_string()),
+                ("page", page.to_string()),
+                ("offset", PAGE_SIZE.to_string()),
             ])
             .send()
             .await
@@ -449,19 +487,33 @@ async fn fetch_markets_from_blockscout() -> Result<Vec<(H256, MorphoMarketParams
             .json()
             .await
             .context("Morpho market discovery response was invalid")?;
-        if body.status != "1" {
-            if page > 1 && body.result.is_empty() {
-                break;
+        let mut result_message = None;
+        let logs = match body.result {
+            Some(BlockscoutLogsResult::Logs(logs)) => logs,
+            Some(BlockscoutLogsResult::Message(message)) => {
+                result_message = Some(message);
+                Vec::new()
             }
-            bail!("Morpho market discovery failed: {}", body.message);
-        }
-        let result_count = body.result.len();
-        let mut highest_block = from_block;
-        for log in body.result {
-            highest_block = highest_block.max(
-                u64::from_str_radix(log.block_number.trim_start_matches("0x"), 16)
-                    .context("Morpho discovery returned an invalid block number")?,
+            None => Vec::new(),
+        };
+        let valid_empty_response = body.status == "0"
+            && logs.is_empty()
+            && (is_no_logs_message(&body.message)
+                || result_message.as_deref().is_some_and(is_no_logs_message));
+        if (body.status == "1" && result_message.is_some())
+            || (body.status != "1" && !valid_empty_response)
+        {
+            bail!(
+                "Morpho market discovery failed: {}{}",
+                body.message,
+                result_message
+                    .as_deref()
+                    .map(|message| format!(" ({message})"))
+                    .unwrap_or_default()
             );
+        }
+        let result_count = logs.len();
+        for log in logs {
             let topic = log
                 .topics
                 .get(1)
@@ -478,10 +530,6 @@ async fn fetch_markets_from_blockscout() -> Result<Vec<(H256, MorphoMarketParams
         if result_count < PAGE_SIZE {
             break;
         }
-        if highest_block <= from_block {
-            bail!("Morpho market discovery block pagination made no progress");
-        }
-        from_block = highest_block;
         if page == MAX_PAGES {
             bail!("Morpho market discovery exceeded {MAX_PAGES} pages");
         }
@@ -489,6 +537,11 @@ async fn fetch_markets_from_blockscout() -> Result<Vec<(H256, MorphoMarketParams
     let mut markets = markets.into_iter().collect::<Vec<_>>();
     markets.sort_by_key(|(id, _)| *id);
     Ok(markets)
+}
+
+fn is_no_logs_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("no records") || normalized.contains("no logs")
 }
 
 pub async fn handle_position(
@@ -580,7 +633,14 @@ async fn prepare_action(
     let amount =
         resolve_action_amount(engine, &chain, req, action, &context, &position, wallet).await?;
     enforce_health_guard(req, action, &context, &position, amount)?;
-    let execution = morpho::compile_action(req, action, &context.params, wallet, amount)?;
+    let execution = morpho::compile_action(
+        req,
+        action,
+        context.morpho_address,
+        &context.params,
+        wallet,
+        amount,
+    )?;
     Ok((execution, wallet))
 }
 
@@ -646,7 +706,7 @@ async fn load_market_context(
     metadata_scope: MetadataScope,
 ) -> Result<MarketContext> {
     let market_id = morpho::parse_market_id(market_id_raw)?;
-    let morpho_address = morpho::morpho_address();
+    let morpho_address = morpho_deployment(engine)?.address;
     let (params_raw, state_raw) = tokio::try_join!(
         call_raw(
             engine,
@@ -718,6 +778,7 @@ async fn load_market_context(
     accrue_market_state(engine, chain, &mut state, borrow_rate).await?;
 
     Ok(MarketContext {
+        morpho_address,
         market_id,
         params,
         state,
@@ -849,7 +910,7 @@ fn build_position_response(
         agent_id: query.agent_id.clone(),
         chain: query.chain.clone(),
         smart_wallet_address: format!("{wallet:?}"),
-        morpho_address: format!("{:?}", morpho::morpho_address()),
+        morpho_address: format!("{:?}", context.morpho_address),
         market_id: format!("{:?}", context.market_id),
         loan_token: token_response(
             context.params.loan_token,
@@ -908,7 +969,7 @@ async fn load_position(
     let raw = call_raw(
         engine,
         chain,
-        morpho::morpho_address(),
+        morpho_deployment(engine)?.address,
         morpho::encode_position(market_id, wallet),
     )
     .await?;
@@ -970,10 +1031,18 @@ async fn call_raw(
 fn parse_chain(chain: &str) -> Result<Chain> {
     let parsed =
         Chain::from_str_loose(chain).ok_or_else(|| anyhow!("unsupported chain: {chain}"))?;
-    if parsed != Chain::Base {
-        bail!("Morpho Blue integration currently supports Base Sepolia only");
+    if parsed != Chain::ArcTestnet {
+        bail!("Morpho Blue integration is enabled on Arc testnet only");
     }
     Ok(parsed)
+}
+
+fn morpho_deployment(engine: &ExecutionEngine) -> Result<MorphoDeploymentConfig> {
+    engine.config.morpho.clone().ok_or_else(|| {
+        anyhow!(
+            "Morpho on Arc testnet is not configured; set ARC_MORPHO_ADDRESS only after verifying the intended deployment"
+        )
+    })
 }
 
 fn token_response(address: Address, symbol: &str, decimals: u8) -> MorphoToken {
@@ -1262,6 +1331,7 @@ mod tests {
 
     fn health_context() -> MarketContext {
         MarketContext {
+            morpho_address: Address::from_low_u64_be(99),
             market_id: H256::zero(),
             params: MorphoMarketParams {
                 loan_token: Address::from_low_u64_be(1),
@@ -1291,8 +1361,8 @@ mod tests {
     fn action_request(min_health_factor: Option<&str>) -> MorphoActionRequest {
         MorphoActionRequest {
             agent_id: "agent".to_string(),
-            chain: "base".to_string(),
-            market_id: morpho::DEFAULT_MARKET_ID.to_string(),
+            chain: "arc-testnet".to_string(),
+            market_id: format!("{:?}", H256::zero()),
             amount: Some("1".to_string()),
             amount_raw: None,
             min_health_factor: min_health_factor.map(str::to_string),
@@ -1436,8 +1506,8 @@ mod tests {
         let response = build_position_response(
             &MorphoPositionQuery {
                 agent_id: "agent".to_string(),
-                chain: "base".to_string(),
-                market_id: morpho::DEFAULT_MARKET_ID.to_string(),
+                chain: "arc-testnet".to_string(),
+                market_id: format!("{:?}", H256::zero()),
             },
             Address::from_low_u64_be(7),
             context,
@@ -1479,15 +1549,5 @@ mod tests {
             ResolvedAmount::Assets(U256::one()),
         )
         .is_err());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires the public Base Sepolia Blockscout API"]
-    async fn live_discovers_and_verifies_default_market_event() {
-        let markets = fetch_markets_from_blockscout().await.unwrap();
-        let default_id = morpho::parse_market_id(morpho::DEFAULT_MARKET_ID).unwrap();
-        assert!(markets
-            .iter()
-            .any(|(id, params)| { *id == default_id && morpho::derive_market_id(params) == *id }));
     }
 }

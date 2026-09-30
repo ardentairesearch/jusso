@@ -115,6 +115,31 @@ pub async fn ack_job(
     Ok(())
 }
 
+/// Atomically replace the processing copy with an updated retry payload.
+pub async fn retry_job(
+    conn: &mut ConnectionManager,
+    current: &ExecutionJob,
+    retry: &ExecutionJob,
+    worker_id: u32,
+) -> Result<()> {
+    let old_payload = serde_json::to_string(current)?;
+    let new_payload = serde_json::to_string(retry)?;
+    let moved: i64 = redis::Script::new(
+        "if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then \
+         redis.call('LPUSH', KEYS[2], ARGV[2]); return 1 else return 0 end",
+    )
+    .key(processing_key(worker_id))
+    .key(QUEUE_KEY)
+    .arg(old_payload)
+    .arg(new_payload)
+    .invoke_async(conn)
+    .await?;
+    if moved != 1 {
+        return Err(anyhow!("processing job disappeared before retry"));
+    }
+    Ok(())
+}
+
 /// Move a job from this worker's processing list to the dead-letter queue.
 ///
 /// Removes the job from the processing list and pushes it to the DLQ.
@@ -127,9 +152,20 @@ pub async fn move_to_dlq(
     let proc_key = processing_key(worker_id);
     let payload = serde_json::to_string(job)?;
 
-    // Remove from processing, push to DLQ
-    let _: i64 = conn.lrem(&proc_key, 1, &payload).await?;
-    let _: () = conn.lpush(DLQ_KEY, &payload).await?;
+    let moved: i64 = redis::Script::new(
+        "if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 1 then \
+         redis.call('LPUSH', KEYS[2], ARGV[1]); return 1 else return 0 end",
+    )
+    .key(proc_key)
+    .key(DLQ_KEY)
+    .arg(payload)
+    .invoke_async(conn)
+    .await?;
+    if moved != 1 {
+        return Err(anyhow!(
+            "processing job disappeared before dead-letter move"
+        ));
+    }
 
     warn!(
         request_id = %job.request_id,
@@ -234,8 +270,8 @@ mod tests {
             execution_permit_id: Uuid::new_v4(),
             agent_id: "queue-test".into(),
             smart_wallet_address: "0x1234567890abcdef1234567890abcdef12345678".into(),
-            chain: Chain::Ethereum,
-            target_contract: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238".into(),
+            chain: Chain::ArcTestnet,
+            target_contract: "0x3600000000000000000000000000000000000000".into(),
             calldata: "0xa9059cbb".into(),
             value: "0".into(),
             created_at: chrono::Utc::now(),

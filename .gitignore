@@ -3,7 +3,3 @@
 *.swp
 *.swo
 .DS_Store
-
-# Foundry build artifacts & cache
-contracts/out/
-contracts/cache/

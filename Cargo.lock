@@ -2234,7 +2234,6 @@ dependencies = [
  "rand 0.8.5",
  "redis",
  "reqwest 0.12.28",
- "rlp",
  "serde",
  "serde_json",
  "serde_urlencoded",

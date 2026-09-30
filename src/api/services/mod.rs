@@ -2,7 +2,7 @@
 //! agent wallet registry, database, queue, and payment verification for each
 //! API endpoint.
 //!
-//! The Base Beta flow is:
+//! The Arc Beta flow is:
 //!   validate → resolve smart wallet → simulate → price → check payment → enqueue
 
 use anyhow::{Context, Result};
@@ -17,53 +17,37 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::agent_wallet::AgentWalletRegistry;
+use crate::arc::execution::{execution_calls, fee_transfer_call};
 use crate::db;
 use crate::execution_engine::{pricing::usd_to_token_raw_amount, ExecutionEngine};
-use crate::native_aa::{execution_calls, NativeAaClient, NativeAaConfig};
 use crate::queue;
 use crate::types::*;
 
-async fn simulate_native_request(
+async fn simulate_arc_request(
     engine: &ExecutionEngine,
     req: &ExecutionRequest,
     chain: &Chain,
     sender: Address,
     fee: Option<&ExecutionFeeCharge>,
-    request_id: Uuid,
+    _request_id: Uuid,
 ) -> Result<SimulationResult> {
-    if chain != &Chain::Base {
-        anyhow::bail!("Beta supports Base only");
-    }
-    let chain_config = engine.config.chain_config(chain)?;
-    let payer = engine.config.native_payer_address;
-    let client = NativeAaClient::new(NativeAaConfig {
-        rpc_url: chain_config.rpc_url.clone(),
-        chain_id: chain_config.chain_id,
-        default_account: engine.config.native_default_account,
-        payer,
-        execution_token: chain_config.execution_token.address,
-        execution_token_symbol: chain_config.execution_token.symbol.clone(),
-        receipt_timeout: std::time::Duration::from_secs(
-            engine.config.native_receipt_timeout_seconds,
-        ),
-        max_payer_gas_cost_wei: engine.config.native_max_payer_gas_cost_wei,
-    })?;
-    let calls = execution_calls(
+    engine.config.chain_config(chain)?;
+    let mut calls = execution_calls(
         &req.target_contract,
         &req.calldata,
         &req.value,
         req.batch_calls.as_deref(),
     )?;
-    match client.prepare(sender, fee, &calls, request_id).await {
+    if let Some(fee) = fee {
+        calls.insert(0, fee_transfer_call(fee)?);
+    }
+    match engine.arc_client.prepare(sender, &calls).await {
         Ok(prepared) => Ok(SimulationResult {
             success: true,
-            gas_estimate: prepared.transaction().gas_limit.as_u64(),
-            max_fee_per_gas_wei: Some(prepared.transaction().max_fee_per_gas.to_string()),
-            return_data: Some(format!(
-                "native_aa_phases={};account_changes={}",
-                prepared.transaction().phases.len(),
-                prepared.transaction().account_changes.len()
-            )),
+            gas_estimate: u64::try_from(prepared.gas_limit)
+                .map_err(|_| anyhow::anyhow!("Arc gas estimate exceeds u64"))?,
+            max_fee_per_gas_wei: Some(prepared.max_fee_per_gas.to_string()),
+            return_data: Some(format!("user_operation_hash={:?}", prepared.hash)),
             error: None,
         }),
         Err(error) => Ok(SimulationResult {
@@ -71,19 +55,23 @@ async fn simulate_native_request(
             gas_estimate: 0,
             max_fee_per_gas_wei: None,
             return_data: None,
-            error: Some(format!("native AA simulation failed: {error:#}")),
+            error: Some(format!("Arc UserOperation preparation failed: {error:#}")),
         }),
     }
 }
 
-/// Base native AA uses the provider-managed EOA itself as the account address.
+/// Arc uses a dedicated ERC-4337 account, never the Turnkey signer as a deposit address.
 pub async fn resolve_chain_smart_wallet_address(
     engine: &ExecutionEngine,
     chain: &Chain,
     agent_wallet: &crate::agent_wallet::AgentWallet,
 ) -> Result<Address> {
     engine.config.chain_config(chain)?;
-    Ok(agent_wallet.address)
+    Ok(engine
+        .smart_accounts
+        .get_or_create(agent_wallet, engine.config.arc_network)
+        .await?
+        .address)
 }
 
 /// Execute through the normal Jusso flow. The configured execution-token fee
@@ -122,28 +110,29 @@ pub async fn handle_execute_idempotent(
     result
 }
 
-/// Internal compatibility for typed adapters while their HTTP routes are
-/// disabled. Re-enable those routes only after threading the caller's
-/// Idempotency-Key through each typed handler.
-pub async fn handle_execute(
+/// Return a previously accepted typed execution before recomputing a mutable
+/// pool selection, quote, deadline, balance, or position-derived amount.
+pub async fn handle_existing_protocol_execution(
     engine: &ExecutionEngine,
     pool: &PgPool,
-    redis_conn: &mut ConnectionManager,
-    wallet_registry: &AgentWalletRegistry,
-    organization_id: Uuid,
-    req: &ExecutionRequest,
-) -> Result<ExecutionResponse> {
-    let _ = (
-        engine,
+    auth_context: &AuthContext,
+    agent_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<ExecutionResponse>> {
+    let Some(row) = db::get_execution_request_by_idempotency_key_for_agent(
         pool,
-        redis_conn,
-        wallet_registry,
-        organization_id,
-        req,
-    );
-    anyhow::bail!(
-        "typed protocol execution is disabled until its authenticated route is re-enabled"
+        auth_context,
+        agent_id,
+        idempotency_key,
     )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let chain = Chain::from_str_loose(&row.chain)
+        .ok_or_else(|| anyhow::anyhow!("stored execution has unsupported chain {}", row.chain))?;
+    let execution_token = &engine.config.chain_config(&chain)?.execution_token;
+    existing_execution_response(row, execution_token).map(Some)
 }
 
 /// Create the locked quote used by the x402 challenge response.
@@ -194,7 +183,7 @@ pub async fn handle_x402_preflight(
         .get_or_create(auth_context.organization_id, &req.agent_id)
         .await?;
     let smart_wallet = resolve_chain_smart_wallet_address(engine, &chain, &wallet).await?;
-    simulate_native_request(engine, req, &chain, smart_wallet, None, Uuid::new_v4()).await
+    simulate_arc_request(engine, req, &chain, smart_wallet, None, Uuid::new_v4()).await
 }
 
 /// Queue an execution after an x402 facilitator has settled its token payment.
@@ -299,6 +288,8 @@ async fn handle_execution(
     } = context;
     // 1. Validate
     let chain = engine.validate(req)?;
+    let (_, policy) = db::authorize_execution_agent(pool, auth_context, &req.agent_id).await?;
+    crate::auth::enforce_compiled_execution_limits(&policy, req)?;
     let execution_token = engine.config.chain_config(&chain)?.execution_token.clone();
 
     // Validate callback_url if provided
@@ -413,8 +404,8 @@ async fn handle_execution(
     };
 
     // 4. Simulate (using smart wallet as `from`)
-    let sim = simulate_native_request(engine, req, &chain, smart_wallet_address, None, request_id)
-        .await?;
+    let sim =
+        simulate_arc_request(engine, req, &chain, smart_wallet_address, None, request_id).await?;
     if !sim.success {
         db::update_execution_status(
             pool,
@@ -441,7 +432,7 @@ async fn handle_execution(
     }
 
     let quoted_cost = engine
-        .estimate_native_cost(&chain, sim.gas_estimate, simulation_fee_cap(&sim)?, true)
+        .estimate_arc_cost(&chain, sim.gas_estimate, simulation_fee_cap(&sim)?, true)
         .await?;
     let mut queued_req = req.clone();
     let mut final_sim = sim.clone();
@@ -553,7 +544,7 @@ async fn handle_execution(
                 &ExecutionStatus::PaymentVerified,
                 None,
                 Some(&format!(
-                    "{} execution fee assigned to native AA phase 0",
+                    "{} execution fee included in the sponsored atomic UserOperation",
                     execution_token.symbol
                 )),
                 Some(final_sim.gas_estimate as i64),
@@ -574,7 +565,7 @@ async fn handle_execution(
         });
     let permit = db::issue_execution_permit(pool, request_id, permit_fee_raw, 300).await?;
 
-    // Enqueue the immutable action and fee terms for native-AA signing.
+    // Enqueue the immutable action and fee terms for ERC-4337 signing.
     let job = ExecutionJob {
         request_id,
         organization_id: auth_context.organization_id,
@@ -698,7 +689,7 @@ async fn prepare_atomic_fee_execution(
 
     let mut fee_usd = initial_cost_usd;
     let mut fee_raw = usd_to_token_raw_amount(fee_usd, token.decimals)?;
-    let recipient = engine.config.native_payer_address;
+    let recipient = engine.config.execution_fee_recipient;
     let mut fee = ExecutionFeeCharge {
         token_symbol: token.symbol.clone(),
         token_contract: format!("{:?}", token.address),
@@ -707,18 +698,17 @@ async fn prepare_atomic_fee_execution(
         recipient_address: format!("{recipient:?}"),
     };
     let mut simulation =
-        simulate_native_request(engine, request, chain, smart_wallet, Some(&fee), request_id)
-            .await?;
+        simulate_arc_request(engine, request, chain, smart_wallet, Some(&fee), request_id).await?;
 
     // Phase 0 changes the gas estimate. Re-price until the token amount covers
-    // the fee-inclusive native-AA transaction.
+    // the fee-inclusive sponsored UserOperation.
     for attempt in 0..3 {
         if !simulation.success {
             break;
         }
 
         let quoted_usd = engine
-            .estimate_native_cost(
+            .estimate_arc_cost(
                 chain,
                 simulation.gas_estimate,
                 simulation_fee_cap(&simulation)?,
@@ -737,7 +727,7 @@ async fn prepare_atomic_fee_execution(
         fee.amount_raw = fee_raw.to_string();
         fee.amount_usd = fee_usd;
         simulation =
-            simulate_native_request(engine, request, chain, smart_wallet, Some(&fee), request_id)
+            simulate_arc_request(engine, request, chain, smart_wallet, Some(&fee), request_id)
                 .await?;
     }
 
@@ -793,19 +783,12 @@ pub(crate) async fn fetch_erc20_balance_of(
     Ok(U256::from_big_endian(&amount_slot))
 }
 
-pub async fn validate_native_aa_deployment(engine: &ExecutionEngine) -> Result<()> {
-    let chain = Chain::Base;
-    let provider = engine.provider_for_chain(&chain)?;
-    let default_account = engine.config.native_default_account;
-    let code = provider.get_code(default_account, None).await?;
-    if code.is_empty() {
-        anyhow::bail!("configured native AA DefaultAccount has no bytecode at {default_account:?}");
-    }
-    Ok(())
-}
-
 pub async fn validate_execution_token(engine: &ExecutionEngine) -> Result<()> {
-    let chain = Chain::Base;
+    let chain = if engine.config.arc_network == crate::arc::ArcNetwork::Testnet {
+        Chain::ArcTestnet
+    } else {
+        Chain::Arc
+    };
     let chain_config = engine.config.chain_config(&chain)?;
     let provider = engine.provider_for_chain(&chain)?;
     let configured = &chain_config.execution_token;
@@ -889,29 +872,28 @@ async fn read_erc20_decimals(
     Ok(value.as_u32() as u8)
 }
 
-pub async fn native_payer_status(
-    engine: &ExecutionEngine,
-    payer: Address,
-    low_balance_wei: U256,
-) -> Result<serde_json::Value> {
-    let chain = Chain::Base;
+pub async fn arc_fee_recipient_status(engine: &ExecutionEngine) -> Result<serde_json::Value> {
+    let chain = if engine.config.arc_network == crate::arc::ArcNetwork::Testnet {
+        Chain::ArcTestnet
+    } else {
+        Chain::Arc
+    };
     let chain_config = engine.config.chain_config(&chain)?;
     let provider = engine.provider_for_chain(&chain)?;
-    let payer_balance = provider.get_balance(payer, None).await?;
+    let recipient = engine.config.execution_fee_recipient;
     let token = &chain_config.execution_token;
-    let payer_token_balance =
-        fetch_erc20_balance_of(provider.as_ref(), token.address, payer).await?;
+    let recipient_token_balance =
+        fetch_erc20_balance_of(provider.as_ref(), token.address, recipient).await?;
 
     Ok(serde_json::json!({
-        "network_profile": format!("{:?}", engine.config.network_profile).to_ascii_lowercase(),
+        "network": engine.config.arc_network.name(),
         "chain_id": chain_config.chain_id,
-        "native_payer": format!("{payer:?}"),
-        "native_payer_balance_wei": payer_balance.to_string(),
-        "native_payer_low_balance": payer_balance < low_balance_wei,
-        "native_payer_low_balance_threshold_wei": low_balance_wei.to_string(),
-        "execution_fee_recipient": format!("{payer:?}"),
+        "gas_sponsor": "alchemy_gas_manager",
+        "max_sponsored_gas_units": engine.config.arc_max_sponsored_gas_units,
+        "max_sponsored_gas_cost_wei": engine.config.arc_max_sponsored_gas_cost_wei.to_string(),
+        "execution_fee_recipient": format!("{recipient:?}"),
         "execution_token": format!("{:?}", token.address),
-        "execution_token_balance_raw": payer_token_balance.to_string(),
+        "execution_token_balance_raw": recipient_token_balance.to_string(),
         "execution_token_symbol": token.symbol,
         "execution_token_decimals": token.decimals
     }))
@@ -986,7 +968,7 @@ async fn validate_and_record_x402_payment(
     Ok(())
 }
 
-/// Resolve the agent's smart wallet and return ERC-20 + native token balances.
+/// Resolve the agent's smart wallet and return Arc USDC once.
 pub async fn handle_get_wallet_balance(
     engine: &ExecutionEngine,
     wallet_registry: &AgentWalletRegistry,
@@ -1014,31 +996,14 @@ pub async fn handle_get_wallet_balance(
         resolve_chain_smart_wallet_address(engine, &chain, &agent_wallet).await?;
     let smart_wallet_str = format!("{smart_wallet_address:?}");
 
-    // ── Native balance ────────────────────────────────────────────────
-    let native_wei: U256 = provider.get_balance(smart_wallet_address, None).await?;
-    let native_balance_wei = native_wei.to_string();
-    // Format Base's native ETH balance with 18 decimals.
-    // Convert via low 128 bits only; typical
-    // wallet balances are far below 2^128 wei so precision is not lost.
-    let native_formatted = {
-        let divisor = 1_000_000_000_000_000_000u128 as f64; // 1e18
-        let val = native_wei.low_u128() as f64;
-        format!("{:.6}", val / divisor)
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_string()
-    };
-
-    // ── ERC-20 balances ───────────────────────────────────────────────
-    // Reuse the existing fetch_erc20_balance_of helper (reads last 32 bytes
-    // of the call response, handles short-return gracefully).
+    // Arc native and ERC-20 USDC are one balance. Use the six-decimal interface
+    // for the one user-visible balance and execution-fee checks.
     let raw_balance = fetch_erc20_balance_of(
         provider.as_ref(),
         chain_cfg.execution_token.address,
         smart_wallet_address,
     )
-    .await
-    .unwrap_or(U256::zero());
+    .await?;
     let formatted = format_units(raw_balance, chain_cfg.execution_token.decimals as usize)?;
     let tokens = vec![TokenBalance {
         symbol: chain_cfg.execution_token.symbol,
@@ -1052,8 +1017,6 @@ pub async fn handle_get_wallet_balance(
         agent_id: agent_id.to_string(),
         smart_wallet_address: smart_wallet_str,
         chain: chain.to_string(),
-        native_balance_wei,
-        native_balance_formatted: native_formatted,
         tokens,
     })
 }
@@ -1067,6 +1030,8 @@ pub async fn handle_simulate_authenticated(
     req: &ExecutionRequest,
 ) -> Result<ExecutionResponse> {
     let chain = engine.validate(req)?;
+    let (_, policy) = db::authorize_execution_agent(pool, auth_context, &req.agent_id).await?;
+    crate::auth::enforce_compiled_execution_limits(&policy, req)?;
     let agent_wallet = wallet_registry
         .get_or_create(auth_context.organization_id, &req.agent_id)
         .await?;
@@ -1084,11 +1049,10 @@ pub async fn handle_simulate_authenticated(
     .await?;
     let request_id = db_row.id;
     let initial_sim =
-        simulate_native_request(engine, req, &chain, smart_wallet_address, None, request_id)
-            .await?;
+        simulate_arc_request(engine, req, &chain, smart_wallet_address, None, request_id).await?;
     let (sim, cost, execution_fee) = if initial_sim.success {
         let initial_cost = engine
-            .estimate_native_cost(
+            .estimate_arc_cost(
                 &chain,
                 initial_sim.gas_estimate,
                 simulation_fee_cap(&initial_sim)?,
@@ -1149,26 +1113,12 @@ pub async fn handle_simulate_authenticated(
     })
 }
 
-/// Typed protocol routes are frozen and cannot bypass the authenticated agent model.
-pub async fn handle_simulate(
-    engine: &ExecutionEngine,
-    pool: &PgPool,
-    wallet_registry: &AgentWalletRegistry,
-    organization_id: Uuid,
-    req: &ExecutionRequest,
-) -> Result<ExecutionResponse> {
-    let _ = (engine, pool, wallet_registry, organization_id, req);
-    anyhow::bail!(
-        "typed protocol simulation is disabled until its authenticated route is re-enabled"
-    )
-}
-
 fn simulation_fee_cap(simulation: &SimulationResult) -> Result<U256> {
     let raw = simulation
         .max_fee_per_gas_wei
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("native simulation omitted max fee per gas"))?;
-    U256::from_dec_str(raw).context("native simulation returned invalid max fee per gas")
+        .ok_or_else(|| anyhow::anyhow!("Arc simulation omitted max fee per gas"))?;
+    U256::from_dec_str(raw).context("Arc simulation returned invalid max fee per gas")
 }
 
 /// Handle a wallet lookup — return the agent's smart wallet address.
@@ -1203,27 +1153,20 @@ pub async fn handle_get_wallet(
     let smart_wallet_addr =
         resolve_chain_smart_wallet_address(engine, &resolved_chain, &agent_wallet).await?;
 
-    // An EOA is fundable immediately. `deployed` indicates whether its
-    // canonical native-account delegation is already installed.
+    // A counterfactual ERC-4337 account is fundable before deployment.
     let provider = engine.provider_for_chain(&resolved_chain)?;
     let code: ethers::types::Bytes = provider.get_code(smart_wallet_addr, None).await?;
-    let deployed = match crate::native_aa::delegation_target(&code)? {
-        None => false,
-        Some(target) if target == engine.config.native_default_account => true,
-        Some(target) => {
-            anyhow::bail!("wallet is delegated to unauthorized account implementation {target:?}")
-        }
-    };
+    let deployed = !code.is_empty();
 
     let smart_wallet_str = format!("{smart_wallet_addr:?}");
 
     let message = if deployed {
         format!(
-            "Base native account is active. Send any ERC-20 tokens or native currency to {smart_wallet_str} before executing transactions that spend them.",
+            "Arc smart account is deployed. Fund {smart_wallet_str} with USDC or assets required by your action.",
         )
     } else {
         format!(
-            "This provider-managed account is ready to fund at {smart_wallet_str}. Its canonical Base native-account delegation will be installed atomically on the first execution.",
+            "This Arc smart account is ready to fund at {smart_wallet_str}. It deploys with its first sponsored UserOperation.",
         )
     };
 

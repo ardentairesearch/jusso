@@ -5,8 +5,8 @@
 //! 2. PostgreSQL connection pool + migrations
 //! 3. Redis connection
 //! 4. Execution engine (providers)
-//! 5. Provider-backed Base accounts
-//! 6. Native EIP-8130 execution and payer service
+//! 5. Tenant-scoped Turnkey signers and dedicated Arc smart accounts
+//! 6. Sponsored ERC-4337 execution
 //! 7. Background worker(s)
 //! 8. Axum HTTP server with routing + middleware
 
@@ -25,16 +25,19 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use jusso::{
     agent_wallet::AgentWalletRegistry,
     api::routes::{self, AppState},
+    arc::{
+        probe_bundler, probe_rpc,
+        smart_account::{AlchemyMav2Verifier, AlchemySmartAccountProvider, SmartAccountRegistry},
+    },
     auth::{self, AuthService},
     config::AppConfig,
     db,
     execution_engine::ExecutionEngine,
-    native_aa::{NativeAaClient, NativeAaConfig},
     queue,
     rate_limit::{self, RateLimiter},
     wallet_provider::{TurnkeyWalletProvider, WalletManager},
@@ -146,56 +149,56 @@ async fn main() -> anyhow::Result<()> {
     let redis_conn = queue::create_redis_connection(&config.redis_url).await?;
     info!("redis connected");
 
-    // ── Wallet custody and native AA ────────────────────────────────
-    let mut turnkey_api_private_key = std::mem::take(&mut config.turnkey_api_private_key);
+    // ── Turnkey custody and Arc ERC-4337 ────────────────────────────
+    let turnkey_api_private_key =
+        Zeroizing::new(std::mem::take(&mut config.turnkey_api_private_key));
+    let turnkey_credential_encryption_key =
+        std::mem::take(&mut config.turnkey_credential_encryption_key);
     let turnkey = TurnkeyWalletProvider::new(
         config.turnkey_organization_id.clone(),
         &config.turnkey_api_public_key,
         &turnkey_api_private_key,
         config.turnkey_base_url.as_deref(),
+        db_pool.clone(),
+        turnkey_credential_encryption_key,
     )?;
-    turnkey_api_private_key.zeroize();
     let wallet_manager = WalletManager::new(db_pool.clone(), Arc::new(turnkey));
-    let payer_wallet = wallet_manager
-        .get_or_create(&config.turnkey_payer_wallet_name)
-        .await?;
-    let payer_address = payer_wallet.provider_wallet.address;
-    if let Some(expected) = config.turnkey_payer_expected_address {
-        if payer_address != expected {
-            anyhow::bail!(
-                "Turnkey payer address mismatch: expected {expected:?}, got {payer_address:?}"
-            );
-        }
-    }
-    config.native_payer_address = Some(payer_address);
-
-    let engine = ExecutionEngine::new(config.runtime_config()?)?;
-    routes::validate_beta_runtime_startup(&engine, &config, payer_address).await?;
     let wallet_registry = AgentWalletRegistry::new(db_pool.clone(), wallet_manager);
-    let base = config.chain_config(&jusso::types::Chain::Base)?;
-    let native_client = NativeAaClient::new(NativeAaConfig {
-        rpc_url: base.rpc_url.clone(),
-        chain_id: base.chain_id,
-        default_account: config.native_default_account,
-        payer: payer_address,
-        execution_token: base.execution_token.address,
-        execution_token_symbol: base.execution_token.symbol.clone(),
-        receipt_timeout: std::time::Duration::from_secs(config.native_receipt_timeout_seconds),
-        max_payer_gas_cost_wei: config.native_max_payer_gas_cost_wei,
-    })?;
+    let chain = match config.arc_network {
+        jusso::arc::ArcNetwork::Mainnet => jusso::types::Chain::Arc,
+        jusso::arc::ArcNetwork::Testnet => jusso::types::Chain::ArcTestnet,
+    };
+    let arc = config.chain_config(&chain)?;
+    let smart_provider = AlchemySmartAccountProvider::new(&config.alchemy_api_key)?;
+    let smart_verifier = AlchemyMav2Verifier::new(&arc.rpc_url)?;
+    let smart_accounts = SmartAccountRegistry::new(
+        db_pool.clone(),
+        Arc::new(smart_provider),
+        Arc::new(smart_verifier),
+    );
+    let engine = ExecutionEngine::new(config.runtime_config(), smart_accounts)?;
+    probe_rpc(config.arc_network, &arc.rpc_url, None).await?;
+    let bundler_url = format!(
+        "https://{}.g.alchemy.com/v2/{}",
+        if config.arc_network == jusso::arc::ArcNetwork::Testnet {
+            "arc-testnet"
+        } else {
+            "arc-mainnet"
+        },
+        config.alchemy_api_key,
+    );
+    probe_bundler(&bundler_url).await?;
+    routes::validate_beta_runtime_startup(&engine).await?;
     info!(
-        payer = %payer_address,
-        execution_fee_recipient = %payer_address,
-        profile = ?config.network_profile,
-        "Turnkey custody and Base native AA initialized"
+        execution_fee_recipient = %config.execution_fee_recipient,
+        network = ?config.arc_network,
+        "Turnkey custody and Arc ERC-4337 initialized"
     );
 
     let worker_ctx = WorkerContext {
         db_pool: db_pool.clone(),
         wallet_registry: wallet_registry.clone(),
-        payer_wallet,
         engine: engine.clone(),
-        native_client: native_client.clone(),
         webhook_client: jusso::webhook::build_http_client(),
         webhook_encryption_key: config.auth_secret_encryption_key.clone(),
     };
@@ -220,11 +223,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Spawn workers with a supervisor that auto-restarts on panic.
+    // Blocking queue reads must use dedicated Redis connections. A cloned
+    // ConnectionManager shares its multiplexed connection, so BLMOVE would
+    // otherwise stall API-side Redis work such as registration rate limits.
     for wid in 0..num_workers {
-        let redis_clone = redis_conn.clone();
+        let worker_redis = queue::create_redis_connection(&config.redis_url).await?;
         let ctx_clone = worker_ctx.clone();
-        tokio::spawn(worker_supervisor(redis_clone, ctx_clone, wid));
+        tokio::spawn(worker_supervisor(worker_redis, ctx_clone, wid));
     }
     info!(
         workers = num_workers,
@@ -259,20 +264,16 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ── Router ──────────────────────────────────────────────────────
-    // Admin sub-router — separate auth (bearer token, not API key)
+    // Admin sub-router — separate bootstrap-token authentication.
     let admin_router = Router::new()
-        .route("/api-keys", post(routes::create_api_key_handler))
-        .route("/api-keys", get(routes::list_api_keys_handler))
-        .route(
-            "/api-keys/:id",
-            axum::routing::delete(routes::revoke_api_key_handler),
-        )
-        .route("/api-keys/:id/rotate", post(routes::rotate_api_key_handler))
         .route(
             "/organizations/:id/webhook-secret/rotate",
             post(routes::rotate_webhook_secret_handler),
         )
-        .route("/payer/status", get(routes::payer_status_handler))
+        .route(
+            "/fee-recipient/status",
+            get(routes::fee_recipient_status_handler),
+        )
         .layer(middleware::from_fn_with_state(
             admin_auth,
             routes::admin_auth_middleware,
@@ -345,11 +346,34 @@ async fn main() -> anyhow::Result<()> {
             "/federation-trusts/:id",
             axum::routing::delete(routes::revoke_federation_trust_handler),
         )
-        // Preserve a stable API-level response while typed integrations are frozen.
-        .route("/protocols", any(routes::protocol_routes_disabled_handler))
+        .route(
+            "/protocols/uniswap-v4/swap",
+            post(routes::uniswap_v4_swap_handler),
+        )
+        .route(
+            "/protocols/uniswap-v4/swap/simulate",
+            post(routes::uniswap_v4_swap_simulate_handler),
+        )
+        .route(
+            "/protocols/uniswap-v4/swap/quote",
+            post(routes::uniswap_v4_quote_handler),
+        )
+        .route(
+            "/protocols/uniswap-v4/pool",
+            get(routes::uniswap_v4_pool_handler),
+        )
+        .route(
+            "/protocols/uniswap-v4/pools",
+            get(routes::uniswap_v4_pools_handler),
+        )
+        .route(
+            "/protocols/uniswap-v4/balances",
+            get(routes::uniswap_v4_balances_handler),
+        )
+        .route("/protocols", any(routes::protocol_not_enabled_handler))
         .route(
             "/protocols/*path",
-            any(routes::protocol_routes_disabled_handler),
+            any(routes::protocol_not_enabled_handler),
         )
         // Distributed per-principal rate limiting (after authorization).
         .layer({
@@ -372,7 +396,7 @@ async fn main() -> anyhow::Result<()> {
             auth_service.clone(),
             auth::authorization_middleware,
         ))
-        // API key compatibility + OAuth bearer authentication
+        // DPoP-bound OAuth bearer authentication.
         .layer(middleware::from_fn_with_state(
             auth_service.clone(),
             auth::authentication_middleware,
@@ -386,9 +410,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/register", post(routes::self_service_registration_handler))
         .route("/agents/enroll", post(routes::agent_enrollment_handler))
         .merge(oauth_router)
-        // Admin endpoints (bearer-token auth, no x402 or API key middleware)
+        // Admin endpoints use only the bootstrap-token middleware.
         .nest("/admin", admin_router)
-        // Protected API endpoints (API key or OAuth, policy, rate limit)
+        // Protected API endpoints use OAuth, policy, and rate limiting.
         .merge(protected_api_router)
         .layer(TraceLayer::new_for_http())
         // ── Request body size limit (1 MB — prevents OOM from giant payloads)

@@ -1,410 +1,184 @@
 # Jusso
 
-**Base-native execution infrastructure for autonomous AI agents.**
+Jusso is execution infrastructure for autonomous AI agents. The Beta runtime
+targets Arc testnet. Each agent has a dedicated ERC-4337 smart account; its
+Turnkey-managed key is the owner signer, **not** the address to fund. Alchemy
+Wallet APIs prepare and submit sponsored UserOperations. A configured recipient
+collects the USDC execution fee, while the gas policy pays Arc native USDC gas.
 
-Jusso lets an AI agent own a persistent on-chain account, simulate actions,
-pay a predictable stablecoin execution fee, and submit transactions without
-holding native gas. The service manages execution policy, wallet custody,
-sponsorship, settlement, retries, and transaction status behind one API.
+The Arc stack has passed a live Turnkey + Alchemy + Arc testnet execution,
+including first-operation account deployment, sponsorship, atomic fee
+settlement, and receipt verification. It is not production-ready until the
+remaining checks in [TODO.md](TODO.md) are complete. Typed protocol HTTP routes
+are enabled only for Uniswap V4 on Arc testnet, using pinned official
+deployments. Preserved adapters, including Morpho, remain dormant because they
+do not have a verified Arc testnet deployment.
 
-This repository is the new Jusso Beta. It is intentionally focused on Base
-and Base native account abstraction. The previous ERC-4337 factory, bundler,
-and verifying-paymaster architecture is no longer part of the runtime.
+## Execution Flow
 
-> Current network status: the complete native-account flow is tested on Base
-> VibeNet. Persistent public deployment waits for the Cobalt native-account
-> upgrade to reach Base Sepolia. Protocol HTTP routes remain disabled until
-> then, while their typed action layers are preserved in this repository.
+1. An organization registers a principal and agent. Jusso provisions a
+   tenant-scoped Turnkey signer and a separate counterfactual Arc smart account.
+2. `GET /wallet` returns the smart-account address, including before its first
+   deployment. Fund **that** address with USDC and assets the action will use.
+3. `POST /simulate` or `POST /execute` validates the caller's authorization,
+   prepares the full sponsored UserOperation, and estimates a USDC fee from
+   the Arc gas cap. The default execution includes the USDC fee transfer and
+   requested calls in one atomic smart-account batch.
+4. The worker rechecks the permit and immutable request, signs the verified
+   UserOperation digest with the agent's Turnkey signer, persists the signed
+   operation, and submits it to Alchemy. Retries reuse that same signed payload.
+5. The worker confirms the provider call, transaction receipt, and ERC-4337
+   `UserOperationEvent` before marking success or recording the fee.
 
-## What Jusso Does
+An optional x402 route can collect a settled payment before the action, but it
+requires an Arc-capable facilitator configured with `X402_FACILITATOR_URL`.
+It is not part of the default managed-wallet payment path.
 
-- Creates one organization-owned account for each agent through a
-  provider-neutral custody interface, currently backed by Turnkey.
-- Uses Base native account abstraction so the agent keeps the same address
-  before and after it becomes programmable.
-- Simulates every action before accepting it for execution.
-- Adds the stablecoin execution fee and the requested action to one atomic
-  transaction.
-- Signs sender and payer authorizations without exposing private keys to the
-  API, database, or agent.
-- Pays native gas from an infrastructure payer account and records the
-  stablecoin fee received by that same account.
-- Supports x402 V2 as an alternative payment path for independently funded
-  agents and external wallets.
-- Provides short-lived OAuth credentials, scoped authorization, idempotency,
-  rate limits, audit events, webhooks, retries, and status tracking.
-
-## Product Model
-
-The default model is deliberately simple:
-
-1. The developer registers an agent identity.
-2. Jusso provisions the agent's Base account through the configured wallet
-   provider.
-3. The agent funds that address with the assets it intends to use and the
-   accepted execution-fee stablecoin.
-4. The agent requests a simulation.
-5. Jusso calculates gas cost plus the configured platform fee.
-6. On execution, phase zero transfers the stablecoin fee to the payer and
-   phase one performs the requested action.
-7. The payer sponsors native gas, the network executes both phases, and
-   Jusso returns or pushes the final result.
-
-If the action phase fails, the transaction is reported as reverted. The
-receipt is checked against the expected payer and phase count before the result
-is accepted.
-
-## Architecture
+## Boundaries
 
 ```text
-AI agent or agent application
-        |
-        | private_key_jwt OAuth or scoped API key
-        v
-+-------------------------- Jusso API ---------------------------+
-| registration | authorization | policy | rate limit | audit    |
-| wallet       | simulation    | execution | status  | x402     |
-+-----------------------------+----------------------------------+
-                              |
-                  +-----------+-----------+
-                  |                       |
-                  v                       v
-          PostgreSQL state          Redis job queue
-          identities, wallets,      retries, recovery,
-          quotes, payments, txs     dead-letter handling
-                  |                       |
-                  +-----------+-----------+
-                              v
-                    supervised workers
-                              |
-              +---------------+----------------+
-              |                                |
-              v                                v
-     provider-neutral custody          Base native-AA client
-     Turnkey today                     simulate, sign, submit,
-     more providers later              verify receipt
-              |                                |
-              +---------------+----------------+
-                              v
-                     Base native account
-                phase 0: stablecoin execution fee
-                phase 1: requested on-chain action
-                     payer: native gas sponsor
+Agent or developer
+  -> OAuth + DPoP authentication and agent policy
+  -> Jusso API: wallet lookup / simulate / execute / status
+  -> Postgres permit + idempotent request; Redis execution queue
+  -> Arc worker: full sponsored UserOperation validation
+       -> tenant Turnkey signer (private key never enters Jusso)
+       -> Alchemy Wallet API / bundler / gas policy
+       -> Arc EntryPoint v0.7 -> dedicated smart account
+            -> atomic USDC execution fee + requested calls
 ```
 
-### Trust boundaries
+Turnkey custody is provider-neutral at the `WalletProvider` boundary. Jusso
+organizations have separate Turnkey sub-organizations and tenant runtime
+credentials. Smart-account addresses are persisted separately from Turnkey
+signer addresses and bound to the agent, chain, and account provider. Native
+Arc USDC uses 18 decimals for gas; its ERC-20 interface at
+`0x3600000000000000000000000000000000000000` uses 6 decimals for transfers.
 
-- Turnkey holds wallet key material. Jusso stores only provider identifiers
-  and public addresses.
-- Agent authentication keys remain with the agent. Self-service registration
-  sends only a public JWK to Jusso.
-- PostgreSQL owns durable identity, authorization, idempotency, and execution
-  state.
-- Redis is a delivery queue, not the source of truth.
-- The payer has an explicit maximum sponsored-gas policy and is pinned to an
-  expected address in production.
+Self-service policies are Arc-only, permit only typed protocol routes, reject
+native-value transfers, cap execution fees at one USDC, and deny raw execution
+unless an organization owner creates and assigns an explicitly opted-in policy.
+Every smart-account load independently checks the official factory derivation,
+EntryPoint, implementation, and embedded Turnkey owner. Bring-your-own-wallet
+is disabled.
 
-## Current and Planned Networks
+## Authentication
 
-| Stage | Network | Fee token | Protocol routes |
-| --- | --- | --- | --- |
-| Development now | Base VibeNet | USDV | Disabled |
-| Local testing | Local native-AA node | Configurable | Disabled |
-| Cobalt test phase | Base Sepolia | USDC | Re-enabled after deployment verification |
-| Beta launch | Base | USDC | Enabled protocol by protocol |
-
-VibeNet is ephemeral and may rotate its RPC state or native-account contracts.
-The VibeNet smoke test detects profile drift before a live execution test is
-run.
-
-## Preserved Protocol Layers
-
-The following typed integrations remain compiled and tested:
-
-- Aave V3
-- Balancer V3
-- Compound III
-- GMX V2
-- Morpho Blue
-- Uniswap V4
-
-They currently translate high-level protocol actions into validated single or
-batched calls. Their HTTP routes intentionally return a temporary-unavailable
-response. Once Cobalt is available on Base Sepolia, each integration will be
-updated to verified Base deployments, connected to the native executor, and
-opened independently.
-
-## Authentication and Onboarding
-
-Jusso models identity in four layers: an organization owns stable agents;
-principals receive explicit grants to those agents; credentials authenticate a
-principal; and cloud runs become short-lived agent instances. Authorization
-policies belong to agents and constrain chains, protocols, actions, contract
-targets, transaction value, and execution fee.
-
-For local development, the CLI creates a P-256 key on the developer's machine,
-registers only its public JWK, stores the private key with `0600` permissions,
-configures the returned client ID, exchanges a `private_key_jwt`, and verifies
-wallet access automatically:
+Organizations own stable agents. Principals have grants to those agents;
+credentials authenticate principals; hosted runs become short-lived instances.
+Access tokens are short-lived and DPoP-bound. Local onboarding creates a P-256
+key on the developer's machine, registers only its public JWK, stores the key
+with `0600` permissions, and verifies wallet access:
 
 ```bash
-cargo run --bin jusso -- onboard \
-  --organization "Acme" \
-  --agent-id treasury \
-  --accept-terms
+cargo run --bin jusso -- onboard --organization "Acme" --agent-id treasury --accept-terms
 ```
 
-Organization owners can create additional agents and receive a one-time,
-15-minute enrollment token. The child runtime generates its own key and calls
-`POST /agents/enroll`; neither the owner key nor an API secret is copied into
-the new agent. First, the owner creates the stable agent from its saved profile:
+Owners create another stable agent and a one-time enrollment token:
 
 ```bash
 cargo run --bin jusso -- agent create \
   --profile ~/.config/jusso/profiles/jso_client_OWNER.json \
-  --agent-id research \
-  --display-name "Research agent"
+  --agent-id research --display-name "Research agent"
 ```
 
-That command returns a one-time enrollment token. The child runtime completes
-the flow without handling the owner's key material:
+The child runtime enrolls with its own key, without receiving the owner key:
 
 ```bash
 cargo run --bin jusso -- enroll \
   --enrollment-token jso_enroll_REDACTED \
-  --display-name "Treasury worker"
+  --display-name "Research worker"
 ```
 
-Each onboarding stores a separate profile under
-`~/.config/jusso/profiles/`, so multiple agents can coexist on one machine.
+Hosted agents can use an organization-configured OIDC federation trust. Jusso
+checks issuer, HTTPS JWKS, audience, and subject, and consumes proof IDs once
+to prevent replay. Credential rotation does not change the stable agent's
+Turnkey signer or Arc smart account.
 
-Hosted agents use OAuth token exchange against an organization-configured OIDC
-federation trust. Jusso verifies the issuer's HTTPS JWKS, audience, and exact or
-trailing-wildcard subject, then records an ephemeral agent instance. Both local
-and federated access tokens are short-lived and DPoP-bound, so a stolen token
-cannot be used without its private proof key. Assertion and DPoP IDs are
-consumed once to reject replay.
+## API
 
-API keys remain an administrative compatibility path. Wallet ownership is tied
-to the organization and stable agent, so credential rotation never changes an
-agent's account.
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /register` | Public, protected self-service organization onboarding |
+| `GET /wallet` | Agent's dedicated Arc smart-account address and deployment state |
+| `GET /wallet/balance` | One USDC balance via Arc's six-decimal interface |
+| `POST /simulate` | Prepare sponsored call bundle without submitting |
+| `POST /execute` | Idempotently queue a sponsored execution |
+| `POST /x402/execute` | Optional facilitator-paid execution |
+| `GET /status/{id}` | Execution status and transaction hash |
+| `/protocols/uniswap-v4/*` | Arc testnet pool discovery, quotes, balances, simulation, and swaps |
+| `GET /admin/fee-recipient/status` | Fee recipient USDC balance and Arc sponsor configuration |
 
-## Execution Payments
-
-### Atomic stablecoin fee
-
-This is the default path. Jusso quotes the maximum expected native-gas cost,
-applies the configured gas markup and platform fee, converts the result to the
-execution token's smallest unit, and rounds upward to avoid undercharging.
-
-The fee transfer and requested action are separate phases of one native
-transaction. The infrastructure payer both sponsors native gas and receives the
-stablecoin execution fee.
-
-### x402 V2
-
-`POST /x402/execute` supports agents that pay through an external x402
-facilitator. The challenge locks the exact request, amount, asset, network,
-recipient, and idempotency key. Jusso re-simulates before settlement, rejects
-underpayment or replayed settlement transactions, and queues the action only
-after payment is verified.
-
-## API Surface
-
-| Endpoint | Purpose | Authentication |
-| --- | --- | --- |
-| `GET /health` | Database and Redis readiness | Public |
-| `GET /feed/recent` | Sanitized recent activity | Public |
-| `POST /register` | Self-service organization and agent registration | Public, protected in production |
-| `POST /agents/enroll` | Redeem a one-time child-agent enrollment grant | Public + one-time token |
-| `POST /oauth/token` | Short-lived local or federated token | DPoP + client assertion or workload JWT |
-| `GET, POST /agents` | List or create organization agents | `agent:manage` |
-| `/credential-bindings/*` | Rotate local public-key credentials | `credential:manage` |
-| `/federation-trusts/*` | Configure cloud workload identity | `trust:manage` |
-| `/authorization-policies/*` | Create and revoke agent policies | `policy:manage` |
-| `GET /wallet` | Resolve or provision an agent account | Protected |
-| `GET /wallet/balance` | Read native and execution-token balances | Protected |
-| `POST /simulate` | Simulate an action and quote its fee | Protected |
-| `POST /execute` | Atomic-fee sponsored execution | Protected + `Idempotency-Key` |
-| `POST /x402/execute` | x402 quote, settlement, and execution | Protected + `Idempotency-Key` |
-| `GET /status/:id` | Read organization-scoped execution status | Protected |
-| `/admin/*` | Emergency API keys, webhook rotation, payer status | Bootstrap admin token |
-| `/protocols/*` | Reserved typed protocol API | Temporarily disabled |
-
-Every execution request requires an `Idempotency-Key` between 8 and 128
-characters. Repeating the same key and payload returns the original request;
-reusing the key with a different payload returns a conflict.
-
-## Repository Layout
-
-```text
-jusso/
-├── src/
-│   ├── agent_wallet/       # organization-owned agent accounts
-│   ├── api/                # HTTP routes and orchestration
-│   ├── auth/               # OAuth, API keys, scopes, and policies
-│   ├── config/             # strict environment configuration
-│   ├── db/                 # PostgreSQL repositories and encryption
-│   ├── execution_engine/   # validation, simulation, and pricing
-│   ├── native_aa/          # Base native transaction encoding and execution
-│   ├── payments/           # atomic-fee records and x402 V2
-│   ├── protocols/          # preserved typed DeFi integration layers
-│   ├── queue/              # reliable Redis queue and recovery
-│   ├── wallet_provider/    # provider-neutral custody boundary and Turnkey
-│   ├── webhook/            # signed, SSRF-hardened callbacks
-│   └── worker/             # supervised execution workers
-├── migrations/             # clean Beta database schema
-├── contracts/              # local/VibeNet execution fixtures only
-├── tests/                  # live VibeNet and profile smoke tests
-└── .github/workflows/      # Rust, Solidity, and opt-in live checks
-```
-
-The `docs/` directory is intentionally frozen while the Beta runtime and API
-stabilize. It describes the previous public version and must not be used as the
-source of truth for this branch. This README reflects the current architecture.
+`POST /execute` and `POST /x402/execute` require `Idempotency-Key`. Agent
+authorization policies constrain chains, actions, contract targets, value,
+and maximum execution fees. All integrations other than Uniswap V4 remain
+outside the runtime.
 
 ## Local Setup
 
-### Requirements
+Requires Rust, PostgreSQL, Redis, a Turnkey parent organization with a P-256
+API key permitted to create tenant sub-organizations, an Alchemy app with Arc
+testnet Wallet API access and a funded gas sponsorship policy, and an Arc USDC
+fee-recipient address. Configure a fresh Beta database; `001_init.sql` is the
+undeployed Beta schema, not a migration from the previous Base prototype.
 
-- Rust 1.88 or newer
-- PostgreSQL 16
-- Redis 7
-- A Turnkey organization with a P-256 API key
-- Foundry, only for the local Solidity fixtures
+```dotenv
+ARC_NETWORK=arc-testnet
+ARC_RPC_URL=https://rpc.testnet.arc.io
+ALCHEMY_API_KEY=<Alchemy app key>
+ALCHEMY_GAS_POLICY_ID=<funded sponsorship policy ID>
+ARC_MAX_SPONSORED_GAS_UNITS=2000000
+ARC_MAX_SPONSORED_GAS_COST_WEI=100000000000000000
+EXECUTION_FEE_RECIPIENT=0x<Arc fee-recipient address>
+GAS_MARKUP_BPS=1000
+PLATFORM_FEE_USDC_RAW=10000
+TURNKEY_ORGANIZATION_ID=<parent organization ID>
+TURNKEY_API_PUBLIC_KEY=<P-256 public key>
+TURNKEY_API_PRIVATE_KEY=<P-256 private key>
+TURNKEY_CREDENTIAL_ENCRYPTION_KEY=<64 hex characters>
+AUTH_SECRET_ENCRYPTION_KEY=<64 hex characters>
+OAUTH_SIGNING_SECRET=<32+ random bytes>
+BOOTSTRAP_ADMIN_TOKEN=<32+ random bytes>
+DATABASE_URL=postgres://...
+REDIS_URL=redis://...
+```
 
-### Start dependencies
+Public registration outside localhost additionally requires a Turnstile secret
+and allowed hostnames. Review `src/config/mod.rs` for optional auth, rate-limit,
+webhook, and x402 settings. Do not commit `.env` or Turnkey credentials. Arc
+mainnet is disabled unless `ARC_NETWORK=arc` and `ARC_ENABLE_MAINNET=true`; do
+not enable it before the separate mainnet rollout gate.
 
 ```bash
-docker compose up -d postgres redis
-```
-
-### Configure the service
-
-Create an ignored `.env` file. Use independent, cryptographically random
-values for every secret.
-
-```env
-NETWORK_PROFILE=vibenet
-BASE_RPC_URL=https://rpc.vibes.base.org
-BASE_PRICE_FEED_URL=https://your-reliable-price-feed.example/eth-usd
-
-DATABASE_URL=postgres://postgres:postgres@localhost:5432/jusso
-REDIS_URL=redis://127.0.0.1:6379
-HOST=0.0.0.0
-PORT=8080
-PUBLIC_API_BASE_URL=http://localhost:8080
-CORS_ORIGIN=http://localhost:3000,http://localhost:5173
-
-TURNKEY_ORGANIZATION_ID=your_turnkey_organization_id
-TURNKEY_API_PUBLIC_KEY=your_turnkey_api_public_key
-TURNKEY_API_PRIVATE_KEY=your_turnkey_api_private_key
-TURNKEY_PAYER_WALLET_NAME=jusso-beta-payer
-TURNKEY_PAYER_EXPECTED_ADDRESS=0xYourPinnedPayerAddress
-
-AUTH_SECRET_ENCRYPTION_KEY=64_hex_characters
-OAUTH_SIGNING_SECRET=at_least_32_random_bytes
-BOOTSTRAP_ADMIN_TOKEN=at_least_32_random_bytes
-
-PUBLIC_REGISTRATION_ENABLED=true
-PER_PRINCIPAL_RATE_LIMIT_RPS=5
-PER_PRINCIPAL_RATE_LIMIT_BURST=10
-GAS_PRICE_MARKUP_PCT=10
-PLATFORM_FEE_USD=0.01
-```
-
-For a public deployment, also configure:
-
-```env
-OAUTH_ISSUER=https://api.your-domain.example
-OAUTH_AUDIENCE=https://api.your-domain.example
-REGISTRATION_TURNSTILE_SECRET=your_turnstile_secret
-REGISTRATION_ALLOWED_HOSTNAMES=your-domain.example
-REGISTRATION_CLIENT_IP_HEADER=x-forwarded-for
-X402_FACILITATOR_URL=https://your-facilitator.example
-```
-
-`TURNKEY_API_PRIVATE_KEY`, the auth encryption key, OAuth signing secret, and
-admin token belong in a managed secret store in deployed environments, not in
-repository or container-image layers.
-
-This Beta schema intentionally does not migrate legacy ERC-4337 wallets or
-credentials. Use a fresh PostgreSQL database when moving from the previous
-architecture.
-
-### Run
-
-```bash
+docker compose up -d
+cargo run --bin jusso-arc-probe
 cargo run --bin jusso-server
 ```
 
-The service starts only after it has reconciled the Turnkey payer, verified the
-configured native-account implementation and execution token, and checked the
-payer policy.
+Startup verifies Arc chain ID, USDC decimals, EntryPoint v0.7 bytecode,
+Alchemy bundler EntryPoint support, the fee-recipient token interface, and all
+pinned Uniswap V4 contracts.
+The probe is read-only and accepts `ARC_BALANCE_ADDRESS` or
+`ARC_BUNDLER_RPC_URL` for additional checks.
 
 ## Verification
 
-Run the local suite:
-
 ```bash
-cargo fmt --all -- --check
-cargo test --all-targets
+cargo fmt --check
+cargo check --all-targets
+cargo test arc:: --lib
+cargo test protocols:: --lib
 ```
 
-Run the Solidity fixture suite:
-
-```bash
-cd contracts
-forge fmt --check
-forge test --offline --force
-```
-
-The ignored live tests are stateful and use real provider wallets and VibeNet
-transactions:
-
-```bash
-cargo test --test vibenet_smoke -- --ignored --nocapture
-cargo test --test live_vibenet_e2e -- --ignored --nocapture
-```
-
-The end-to-end test covers registration, OAuth, wallet provisioning, VibeNet
-funding, simulation, Turnkey sender and payer signatures, execution-fee
-collection, confirmation, and idempotent replay.
-
-## Security Properties
-
-- No wallet private keys are stored by Jusso.
-- Turnkey responses are verified by recovering every signature locally.
-- Wallet creation is serialized and reconciled against provider state.
-- The configured payer can be pinned to an expected address.
-- Fee terms are bound to the execution payload and rechecked before signing.
-- Signed transactions are persisted before broadcast for crash-safe replay.
-- Per-account nonce preparation is serialized across workers with PostgreSQL
-  advisory locks.
-- Webhook destinations reject credentials, fragments, local addresses, private
-  networks, and unsafe DNS resolution.
-- OAuth assertions, DPoP proofs, enrollment grants, and x402 settlements have replay protection.
-- Every queued signing request carries an expiring execution permit bound to
-  the principal, agent, instance, policy version, payload, wallet, chain, and fee.
-- Secrets are redacted from debug output and configured RPC URLs.
-- Failed jobs retry with bounded attempts and move to a dead-letter queue.
-
-## Roadmap to Beta
-
-1. Continue VibeNet and local native-AA conformance testing as Base evolves the
-   Cobalt implementation.
-2. Deploy Jusso against Base Sepolia as soon as native accounts and payer
-   transactions are available there.
-3. Replace VibeNet USDV with verified Base Sepolia USDC configuration.
-4. Revalidate contract addresses and reconnect the preserved protocol layers,
-   beginning with the strongest Base test deployments.
-5. Update the frozen documentation and agent-integration packages only after
-   the Beta API is stable.
-6. Complete operational staging: managed secrets, production PostgreSQL and
-   Redis, Turnkey policies, monitoring, alerting, backups, and incident runbooks.
+The Arc testnet path has passed registration, tenant Turnkey signer creation,
+counterfactual account derivation, first-operation deployment, sponsored
+execution, and atomic fee settlement. Account loads now independently verify
+Alchemy's official MAv2 factory derivation, embedded owner, implementation, and
+EntryPoint. Crash recovery, sponsorship rejection, and protocol-specific Arc
+deployment tests remain release gates. The old Vibenet tests and Base native-AA
+executor have been removed. Other preserved adapters are intentionally not
+compiled or routed until they have a verified Arc deployment.
 
 ## License
 
 AGPL-3.0-only. See [LICENSE](LICENSE).
-
-Jusso is developed by Ardent Research.

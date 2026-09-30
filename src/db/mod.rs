@@ -33,245 +33,6 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-// ──────────────────────── API Keys ───────────────────────────────────
-
-/// Look up an API key by its raw value (hashed before query).
-pub async fn get_api_key_by_raw(pool: &PgPool, raw_key: &str) -> Result<Option<ApiKeyRow>> {
-    let hash = sha256_hex(raw_key);
-    let row = sqlx::query_as::<_, ApiKeyRow>(
-        r#"
-        SELECT ak.*
-        FROM api_keys ak
-        JOIN organizations o ON o.id = ak.organization_id
-        JOIN principals p ON p.id = ak.principal_id
-        WHERE ak.key_hash = $1
-          AND ak.is_active = TRUE
-          AND ak.revoked_at IS NULL
-          AND (ak.expires_at IS NULL OR ak.expires_at > now())
-          AND o.status = 'active'
-          AND p.status = 'active'
-        "#,
-    )
-    .bind(&hash)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row)
-}
-
-/// Insert a new API key. Returns the raw key (only time it's visible).
-pub struct CreateApiKeyOptions<'a> {
-    pub label: Option<&'a str>,
-    pub organization_id: Option<Uuid>,
-    pub principal_id: Option<Uuid>,
-    pub scopes: &'a [String],
-    pub environment: &'a str,
-    pub expires_at: Option<chrono::DateTime<Utc>>,
-}
-
-pub async fn create_api_key(
-    pool: &PgPool,
-    encryption_key_hex: &str,
-    options: CreateApiKeyOptions<'_>,
-) -> Result<(ApiKeyRow, String, Option<String>)> {
-    let mut transaction = pool.begin().await?;
-    let organization_id = options.organization_id.unwrap_or_else(Uuid::new_v4);
-    let principal_id = options.principal_id.unwrap_or_else(Uuid::new_v4);
-
-    let new_webhook_secret = options.organization_id.is_none().then(random_secret);
-    if options.organization_id.is_none() {
-        let encrypted_webhook_secret = encrypt_secret(
-            encryption_key_hex,
-            new_webhook_secret
-                .as_deref()
-                .expect("new organization secret"),
-        )?;
-        sqlx::query(
-            r#"
-            INSERT INTO organizations (id, name, webhook_secret_encrypted)
-            VALUES ($1, $2, $3)
-            "#,
-        )
-        .bind(organization_id)
-        .bind(options.label.unwrap_or("Jusso organization"))
-        .bind(encrypted_webhook_secret)
-        .execute(&mut *transaction)
-        .await?;
-    } else {
-        let active: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1 AND status = 'active')",
-        )
-        .bind(organization_id)
-        .fetch_one(&mut *transaction)
-        .await?;
-        if !active {
-            anyhow::bail!("active organization not found");
-        }
-    }
-    if options.principal_id.is_none() {
-        sqlx::query(
-            r#"
-            INSERT INTO principals (id, organization_id, display_name)
-            VALUES ($1, $2, $3)
-            "#,
-        )
-        .bind(principal_id)
-        .bind(organization_id)
-        .bind(options.label)
-        .execute(&mut *transaction)
-        .await?;
-    } else {
-        let belongs: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM principals WHERE id = $1 AND organization_id = $2 AND status = 'active')",
-        )
-        .bind(principal_id)
-        .bind(organization_id)
-        .fetch_one(&mut *transaction)
-        .await?;
-        if !belongs {
-            anyhow::bail!("principal does not belong to organization");
-        }
-    }
-
-    let mut secret = [0u8; 32];
-    OsRng.fill_bytes(&mut secret);
-    let environment = match options.environment {
-        "live" | "test" => options.environment,
-        _ => anyhow::bail!("environment must be live or test"),
-    };
-    let public_id = Uuid::new_v4().simple().to_string();
-    let raw_key = format!(
-        "jso_{}_{}_{}",
-        environment,
-        public_id,
-        URL_SAFE_NO_PAD.encode(secret)
-    );
-    let hash = sha256_hex(&raw_key);
-    let key_prefix = raw_key.chars().take(24).collect::<String>();
-    let scopes = if options.scopes.is_empty() {
-        crate::auth::DEFAULT_SCOPES
-            .iter()
-            .map(|scope| scope.to_string())
-            .collect()
-    } else {
-        options.scopes.to_vec()
-    };
-    let row = sqlx::query_as::<_, ApiKeyRow>(
-        r#"
-        INSERT INTO api_keys (
-            id, key_hash, label, is_active, created_at, organization_id,
-            principal_id, key_prefix, scopes, environment, expires_at
-        )
-        VALUES ($1, $2, $3, TRUE, now(), $4, $5, $6, $7, $8, $9)
-        RETURNING *
-        "#,
-    )
-    .bind(Uuid::new_v4())
-    .bind(&hash)
-    .bind(options.label)
-    .bind(organization_id)
-    .bind(principal_id)
-    .bind(key_prefix)
-    .bind(scopes)
-    .bind(environment)
-    .bind(options.expires_at)
-    .fetch_one(&mut *transaction)
-    .await?;
-    transaction.commit().await?;
-    Ok((row, raw_key, new_webhook_secret))
-}
-
-pub async fn touch_api_key(pool: &PgPool, id: Uuid) -> Result<()> {
-    sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-pub async fn list_api_keys(pool: &PgPool, organization_id: Uuid) -> Result<Vec<ApiKeyRow>> {
-    Ok(sqlx::query_as::<_, ApiKeyRow>(
-        "SELECT * FROM api_keys WHERE organization_id = $1 ORDER BY created_at DESC",
-    )
-    .bind(organization_id)
-    .fetch_all(pool)
-    .await?)
-}
-
-pub async fn revoke_api_key(pool: &PgPool, id: Uuid) -> Result<bool> {
-    let result = sqlx::query(
-        "UPDATE api_keys SET is_active = FALSE, revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
-    )
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() == 1)
-}
-
-pub async fn rotate_api_key(
-    pool: &PgPool,
-    id: Uuid,
-    revoke_old: bool,
-    expires_at: Option<chrono::DateTime<Utc>>,
-) -> Result<Option<(ApiKeyRow, String)>> {
-    let mut transaction = pool.begin().await?;
-    let old = sqlx::query_as::<_, ApiKeyRow>(
-        r#"
-        SELECT *
-        FROM api_keys
-        WHERE id = $1 AND is_active = TRUE AND revoked_at IS NULL
-        FOR UPDATE
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&mut *transaction)
-    .await?;
-    let Some(old) = old else {
-        transaction.rollback().await?;
-        return Ok(None);
-    };
-
-    let mut secret = [0u8; 32];
-    OsRng.fill_bytes(&mut secret);
-    let raw_key = format!(
-        "jso_{}_{}_{}",
-        old.environment,
-        Uuid::new_v4().simple(),
-        URL_SAFE_NO_PAD.encode(secret)
-    );
-    let key_hash = sha256_hex(&raw_key);
-    let key_prefix = raw_key.chars().take(24).collect::<String>();
-    let row = sqlx::query_as::<_, ApiKeyRow>(
-        r#"
-        INSERT INTO api_keys (
-            id, key_hash, label, is_active, created_at, organization_id,
-            principal_id, key_prefix, scopes, environment, expires_at
-        )
-        VALUES ($1, $2, $3, TRUE, now(), $4, $5, $6, $7, $8, $9)
-        RETURNING *
-        "#,
-    )
-    .bind(Uuid::new_v4())
-    .bind(key_hash)
-    .bind(&old.label)
-    .bind(old.organization_id)
-    .bind(old.principal_id)
-    .bind(key_prefix)
-    .bind(&old.scopes)
-    .bind(&old.environment)
-    .bind(expires_at.or(old.expires_at))
-    .fetch_one(&mut *transaction)
-    .await?;
-
-    if revoke_old {
-        sqlx::query("UPDATE api_keys SET is_active = FALSE, revoked_at = now() WHERE id = $1")
-            .bind(old.id)
-            .execute(&mut *transaction)
-            .await?;
-    }
-    transaction.commit().await?;
-    Ok(Some((row, raw_key)))
-}
-
 pub async fn list_credential_bindings(
     pool: &PgPool,
     organization_id: Uuid,
@@ -326,7 +87,7 @@ fn encryption_key(encryption_key_hex: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("encryption key must be exactly 32 bytes"))
 }
 
-fn encrypt_secret(encryption_key_hex: &str, plaintext: &str) -> Result<String> {
+pub(crate) fn encrypt_secret(encryption_key_hex: &str, plaintext: &str) -> Result<String> {
     let key = encryption_key(encryption_key_hex)?;
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|error| anyhow::anyhow!("failed to initialize secret cipher: {error}"))?;
@@ -342,7 +103,7 @@ fn encrypt_secret(encryption_key_hex: &str, plaintext: &str) -> Result<String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(encoded))
 }
 
-fn decrypt_secret(encryption_key_hex: &str, ciphertext: &str) -> Result<String> {
+pub(crate) fn decrypt_secret(encryption_key_hex: &str, ciphertext: &str) -> Result<String> {
     let key = encryption_key(encryption_key_hex)?;
     let encoded = base64::engine::general_purpose::STANDARD
         .decode(ciphertext)
@@ -359,44 +120,41 @@ fn decrypt_secret(encryption_key_hex: &str, ciphertext: &str) -> Result<String> 
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct SignedTransactionRow {
-    pub signed_transaction: String,
-    pub signed_transaction_hash: String,
-    pub transaction_phase_count: i16,
+pub struct SignedUserOperationRow {
+    pub signed_user_operation: serde_json::Value,
+    pub user_operation_hash: String,
+    pub provider_call_id: Option<String>,
 }
 
-pub async fn store_signed_transaction_and_consume_permit(
+pub async fn store_signed_user_operation_and_consume_permit(
     pool: &PgPool,
     request_id: Uuid,
     permit_id: Uuid,
-    raw_transaction: &str,
-    tx_hash: &str,
-    phase_count: i16,
+    signed_user_operation: &serde_json::Value,
+    user_operation_hash: &str,
 ) -> Result<()> {
-    if phase_count <= 0 {
-        anyhow::bail!("phase_count must be positive");
+    if user_operation_hash.len() != 66 || !user_operation_hash.starts_with("0x") {
+        anyhow::bail!("invalid UserOperation hash");
     }
     let mut transaction = pool.begin().await?;
     let stored = sqlx::query(
         r#"
         UPDATE execution_requests
-        SET signed_transaction = $2,
-            signed_transaction_hash = $3,
-            transaction_phase_count = $4,
-            tx_hash = $3,
+        SET signed_user_operation = $2,
+            user_operation_hash = $3,
             updated_at = now()
         WHERE id = $1
-          AND (signed_transaction_hash IS NULL OR signed_transaction_hash = $3)
+          AND (signed_user_operation IS NULL OR signed_user_operation = $2)
+          AND (user_operation_hash IS NULL OR user_operation_hash = $3)
         "#,
     )
     .bind(request_id)
-    .bind(raw_transaction)
-    .bind(tx_hash)
-    .bind(phase_count)
+    .bind(signed_user_operation)
+    .bind(user_operation_hash)
     .execute(&mut *transaction)
     .await?;
     if stored.rows_affected() != 1 {
-        anyhow::bail!("execution already contains a different signed transaction");
+        anyhow::bail!("execution already contains a different signed UserOperation");
     }
     let consumed = sqlx::query(
         r#"
@@ -423,20 +181,45 @@ pub async fn store_signed_transaction_and_consume_permit(
     Ok(())
 }
 
-pub async fn get_signed_transaction(
+pub async fn get_signed_user_operation(
     pool: &PgPool,
     request_id: Uuid,
-) -> Result<Option<SignedTransactionRow>> {
-    Ok(sqlx::query_as::<_, SignedTransactionRow>(
+) -> Result<Option<SignedUserOperationRow>> {
+    Ok(sqlx::query_as::<_, SignedUserOperationRow>(
         r#"
-        SELECT signed_transaction, signed_transaction_hash, transaction_phase_count
+        SELECT signed_user_operation, user_operation_hash, provider_call_id
         FROM execution_requests
-        WHERE id = $1 AND signed_transaction IS NOT NULL
+        WHERE id = $1 AND signed_user_operation IS NOT NULL
         "#,
     )
     .bind(request_id)
     .fetch_optional(pool)
     .await?)
+}
+
+pub async fn store_provider_call_id(
+    pool: &PgPool,
+    request_id: Uuid,
+    user_operation_hash: &str,
+    provider_call_id: &str,
+) -> Result<()> {
+    let changed = sqlx::query(
+        r#"
+        UPDATE execution_requests
+        SET provider_call_id = $3, updated_at = now()
+        WHERE id = $1 AND user_operation_hash = $2
+          AND (provider_call_id IS NULL OR provider_call_id = $3)
+        "#,
+    )
+    .bind(request_id)
+    .bind(user_operation_hash)
+    .bind(provider_call_id)
+    .execute(pool)
+    .await?;
+    if changed.rows_affected() != 1 {
+        anyhow::bail!("execution contains a different provider call ID");
+    }
+    Ok(())
 }
 
 pub async fn get_active_principal(pool: &PgPool, id: Uuid) -> Result<PrincipalRow> {
@@ -454,6 +237,7 @@ pub async fn get_active_principal(pool: &PgPool, id: Uuid) -> Result<PrincipalRo
 }
 
 pub struct SelfServiceRegistrationOptions<'a> {
+    pub chain: &'a str,
     pub organization_name: &'a str,
     pub display_name: &'a str,
     pub agent_external_id: &'a str,
@@ -461,6 +245,8 @@ pub struct SelfServiceRegistrationOptions<'a> {
     pub public_jwk_thumbprint: &'a str,
     pub credential_scopes: &'a [String],
     pub policy_actions: &'a [String],
+    pub policy_protocols: &'a [String],
+    pub max_execution_fee_usd: f64,
 }
 
 pub struct SelfServiceRegistrationResult {
@@ -500,20 +286,26 @@ pub async fn create_self_service_registration(
     .execute(&mut *transaction)
     .await?;
 
-    let allowed_chains = vec!["base".to_string()];
+    if !matches!(options.chain, "arc" | "arc-testnet") {
+        anyhow::bail!("self-service registration requires an Arc network");
+    }
+    let allowed_chains = vec![options.chain.to_string()];
     let policy = sqlx::query_as::<_, AuthorizationPolicyRow>(
         r#"
         INSERT INTO authorization_policies (
-            id, organization_id, name, allowed_chains, allowed_actions
+            id, organization_id, name, allowed_chains, allowed_protocols,
+            allowed_actions, max_value_wei, max_execution_fee_usd
         )
-        VALUES ($1, $2, 'default-autonomous', $3, $4)
+        VALUES ($1, $2, 'default-autonomous', $3, $4, $5, '0', $6)
         RETURNING *
         "#,
     )
     .bind(policy_id)
     .bind(organization_id)
     .bind(&allowed_chains)
+    .bind(options.policy_protocols)
     .bind(options.policy_actions)
+    .bind(options.max_execution_fee_usd)
     .fetch_one(&mut *transaction)
     .await?;
     let agent = sqlx::query_as::<_, AgentRow>(
@@ -1239,6 +1031,7 @@ pub struct CreateAuthorizationPolicyOptions<'a> {
     pub allowed_protocols: Option<&'a [String]>,
     pub allowed_actions: Option<&'a [String]>,
     pub allowed_targets: Option<&'a [String]>,
+    pub allow_raw_execution: bool,
     pub max_value_wei: Option<&'a str>,
     pub max_execution_fee_usd: Option<f64>,
 }
@@ -1277,9 +1070,9 @@ pub async fn create_authorization_policy(
         INSERT INTO authorization_policies (
             id, organization_id, name, allowed_chains,
             allowed_protocols, allowed_actions, allowed_targets,
-            max_value_wei, max_execution_fee_usd
+            allow_raw_execution, max_value_wei, max_execution_fee_usd
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(id)
@@ -1289,6 +1082,7 @@ pub async fn create_authorization_policy(
     .bind(options.allowed_protocols)
     .bind(options.allowed_actions)
     .bind(options.allowed_targets)
+    .bind(options.allow_raw_execution)
     .bind(options.max_value_wei)
     .bind(options.max_execution_fee_usd)
     .execute(pool)
@@ -1580,6 +1374,37 @@ pub async fn get_idempotent_execution_request(
     Ok(row)
 }
 
+/// Recover an already accepted typed execution before re-running mutable
+/// protocol discovery or quote resolution. Ownership checks prevent a key
+/// from revealing another agent's request.
+pub async fn get_execution_request_by_idempotency_key_for_agent(
+    pool: &PgPool,
+    context: &crate::types::AuthContext,
+    agent_external_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<ExecutionRequestRow>> {
+    validate_idempotency_key(idempotency_key)?;
+    let (agent, _) = authorize_execution_agent(pool, context, agent_external_id).await?;
+    let row = sqlx::query_as::<_, ExecutionRequestRow>(
+        r#"
+        SELECT * FROM execution_requests
+        WHERE organization_id = $1 AND idempotency_key = $2
+        "#,
+    )
+    .bind(context.organization_id)
+    .bind(idempotency_key)
+    .fetch_optional(pool)
+    .await?;
+    if row.as_ref().is_some_and(|existing| {
+        existing.principal_id != context.principal_id
+            || existing.agent_uuid != agent.id
+            || existing.instance_id != context.instance_id
+    }) {
+        anyhow::bail!("idempotency key belongs to a different authenticated identity");
+    }
+    Ok(row)
+}
+
 pub async fn fail_unfinished_idempotent_execution(
     pool: &PgPool,
     context: &crate::types::AuthContext,
@@ -1588,9 +1413,14 @@ pub async fn fail_unfinished_idempotent_execution(
     idempotency_key: &str,
     reason: &str,
 ) -> Result<()> {
-    let Some(row) =
-        get_idempotent_execution_request(pool, context, req, operation, idempotency_key).await?
-    else {
+    let row = match get_idempotent_execution_request(pool, context, req, operation, idempotency_key)
+        .await
+    {
+        Ok(row) => row,
+        Err(error) if is_idempotency_ownership_error(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Some(row) = row else {
         return Ok(());
     };
     sqlx::query(
@@ -1605,6 +1435,12 @@ pub async fn fail_unfinished_idempotent_execution(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+fn is_idempotency_ownership_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message == "idempotency key was already used for a different request"
+        || message == "idempotency key belongs to a different authenticated identity"
 }
 
 pub fn validate_idempotency_key(value: &str) -> Result<()> {
@@ -1753,8 +1589,10 @@ pub async fn claim_execution_permit(
           AND ap.id = ep.policy_id AND ap.organization_id = ep.organization_id
           AND a.id = ep.agent_id
           AND (
-            ep.expires_at > now()
-            OR (ep.consumed_at IS NOT NULL AND er.signed_transaction IS NOT NULL)
+            (ep.expires_at > now() AND ap.is_active = TRUE
+             AND ap.version = ep.policy_version
+             AND a.status = 'active' AND a.policy_id = ep.policy_id)
+            OR (ep.consumed_at IS NOT NULL AND er.signed_user_operation IS NOT NULL)
           )
           AND ep.organization_id = er.organization_id
           AND ep.principal_id = er.principal_id
@@ -1764,8 +1602,6 @@ pub async fn claim_execution_permit(
           AND ep.payload_hash = er.payload_hash
           AND ep.wallet_address = er.smart_wallet_address
           AND ep.chain = er.chain
-          AND ap.is_active = TRUE AND ap.version = ep.policy_version
-          AND a.status = 'active' AND a.policy_id = ep.policy_id
         RETURNING ep.*
         "#,
     )
@@ -1876,6 +1712,12 @@ pub async fn update_execution_status(
     gas_estimate: Option<i64>,
     cost_usd: Option<f64>,
 ) -> Result<()> {
+    if matches!(
+        status,
+        ExecutionStatus::Confirmed | ExecutionStatus::Reverted
+    ) {
+        anyhow::bail!("on-chain terminal results must use atomic Arc finalization");
+    }
     sqlx::query(
         r#"
         UPDATE execution_requests
@@ -1885,7 +1727,7 @@ pub async fn update_execution_status(
             gas_estimate = COALESCE($5, gas_estimate),
             cost_usd = COALESCE($6, cost_usd),
             updated_at = $7
-        WHERE id = $1
+        WHERE id = $1 AND status NOT IN ('confirmed', 'reverted', 'failed')
         "#,
     )
     .bind(id)
@@ -1900,36 +1742,203 @@ pub async fn update_execution_status(
     Ok(())
 }
 
-// ──────────────────────── Transactions ───────────────────────────────
+pub struct ArcExecutionFinalization<'a> {
+    pub request_id: Uuid,
+    pub chain: &'a str,
+    pub tx_hash: &'a str,
+    pub from_address: &'a str,
+    pub to_address: &'a str,
+    pub status: &'a ExecutionStatus,
+    pub error_message: Option<&'a str>,
+    pub gas_used: Option<i64>,
+    pub payment: Option<&'a crate::types::SettledExecutionPayment>,
+}
 
-pub async fn insert_transaction(
+/// Atomically persist the on-chain transaction, optional managed execution
+/// fee, and terminal request state. Replays with the same result are no-ops;
+/// conflicting transaction or payment attribution fails closed.
+pub async fn finalize_arc_execution(
     pool: &PgPool,
-    request_id: Uuid,
-    chain: &str,
-    tx_hash: &str,
-    from_addr: &str,
-    to_addr: &str,
-    status: &str,
-) -> Result<TransactionRow> {
-    let row = sqlx::query_as::<_, TransactionRow>(
+    finalization: ArcExecutionFinalization<'_>,
+) -> Result<bool> {
+    if !matches!(
+        finalization.status,
+        ExecutionStatus::Confirmed | ExecutionStatus::Reverted
+    ) {
+        anyhow::bail!("Arc execution finalization requires a confirmed or reverted status");
+    }
+    if let Some(payment) = finalization.payment {
+        if payment.quote_request_id != Some(finalization.request_id) {
+            anyhow::bail!("execution fee is not attributed to this request");
+        }
+        if payment.chain != finalization.chain {
+            anyhow::bail!("execution fee chain differs from the execution chain");
+        }
+        if !payment.tx_hash.eq_ignore_ascii_case(finalization.tx_hash) {
+            anyhow::bail!("execution fee transaction differs from the execution receipt");
+        }
+        if !payment.amount_usd.is_finite() || payment.amount_usd < 0.0 {
+            anyhow::bail!("execution fee amount_usd must be finite and non-negative");
+        }
+    }
+
+    let mut transaction = pool.begin().await?;
+    let current: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT status, tx_hash FROM execution_requests WHERE id = $1 FOR UPDATE")
+            .bind(finalization.request_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+    let Some((current_status, current_tx_hash)) = current else {
+        anyhow::bail!("execution request disappeared during finalization");
+    };
+    if matches!(current_status.as_str(), "confirmed" | "reverted" | "failed") {
+        if current_status != finalization.status.to_string()
+            || !current_tx_hash
+                .as_deref()
+                .is_some_and(|hash| hash.eq_ignore_ascii_case(finalization.tx_hash))
+        {
+            anyhow::bail!("execution already has a conflicting terminal result");
+        }
+        transaction.rollback().await?;
+        return Ok(false);
+    }
+
+    let inserted_transaction = sqlx::query_as::<_, TransactionRow>(
         r#"
-        INSERT INTO transactions
-            (id, request_id, chain, tx_hash, from_address, to_address, status, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO transactions (
+            id, request_id, chain, tx_hash, from_address, to_address, gas_used,
+            status, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+        ON CONFLICT (request_id) DO NOTHING
         RETURNING *
         "#,
     )
     .bind(Uuid::new_v4())
-    .bind(request_id)
-    .bind(chain)
-    .bind(tx_hash)
-    .bind(from_addr)
-    .bind(to_addr)
-    .bind(status)
-    .bind(Utc::now())
-    .fetch_one(pool)
+    .bind(finalization.request_id)
+    .bind(finalization.chain)
+    .bind(finalization.tx_hash)
+    .bind(finalization.from_address)
+    .bind(finalization.to_address)
+    .bind(finalization.gas_used)
+    .bind(finalization.status.to_string())
+    .fetch_optional(&mut *transaction)
     .await?;
-    Ok(row)
+    if inserted_transaction.is_none() {
+        let existing =
+            sqlx::query_as::<_, TransactionRow>("SELECT * FROM transactions WHERE request_id = $1")
+                .bind(finalization.request_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        if !existing.tx_hash.eq_ignore_ascii_case(finalization.tx_hash)
+            || existing.chain != finalization.chain
+            || !existing
+                .from_address
+                .eq_ignore_ascii_case(finalization.from_address)
+            || !existing
+                .to_address
+                .eq_ignore_ascii_case(finalization.to_address)
+        {
+            anyhow::bail!("execution transaction attribution conflicts with the receipt");
+        }
+        sqlx::query(
+            "UPDATE transactions SET status = $2, gas_used = COALESCE($3, gas_used) WHERE request_id = $1",
+        )
+            .bind(finalization.request_id)
+            .bind(finalization.status.to_string())
+            .bind(finalization.gas_used)
+            .execute(&mut *transaction)
+            .await?;
+    }
+
+    if let Some(payment) = finalization.payment {
+        let amount_raw = payment
+            .confirmed_amount_raw
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("verified payment is missing amount_raw"))?;
+        let token_contract = payment
+            .token_contract
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("verified payment is missing token_contract"))?;
+        let inserted_payment = sqlx::query_as::<_, PaymentRow>(
+            r#"
+            INSERT INTO payments (
+                id, request_id, payer, amount_usd, amount_raw, token, token_contract,
+                payment_chain, payment_tx_hash, verified, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE, now())
+            ON CONFLICT DO NOTHING
+            RETURNING *
+            "#,
+        )
+        .bind(payment.payment_id)
+        .bind(finalization.request_id)
+        .bind(&payment.payer)
+        .bind(payment.amount_usd)
+        .bind(amount_raw)
+        .bind(&payment.token)
+        .bind(token_contract)
+        .bind(&payment.chain)
+        .bind(&payment.tx_hash)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if inserted_payment.is_none() {
+            let existing = sqlx::query_as::<_, PaymentRow>(
+                "SELECT * FROM payments WHERE request_id = $1 OR payment_tx_hash = $2 LIMIT 1",
+            )
+            .bind(finalization.request_id)
+            .bind(&payment.tx_hash)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if existing.request_id != finalization.request_id
+                || !existing
+                    .payment_tx_hash
+                    .eq_ignore_ascii_case(&payment.tx_hash)
+                || existing.amount_raw != amount_raw
+                || !existing.payer.eq_ignore_ascii_case(&payment.payer)
+                || existing.token != payment.token
+                || !existing.token_contract.eq_ignore_ascii_case(token_contract)
+                || existing.payment_chain != payment.chain
+                || !existing.verified
+            {
+                anyhow::bail!("execution fee attribution conflicts with the receipt");
+            }
+        }
+    }
+
+    let updated = sqlx::query(
+        r#"
+        UPDATE execution_requests
+        SET status = $2, tx_hash = $3, error_message = $4,
+            gas_estimate = COALESCE($5, gas_estimate), updated_at = now()
+        WHERE id = $1 AND status NOT IN ('confirmed', 'reverted', 'failed')
+        "#,
+    )
+    .bind(finalization.request_id)
+    .bind(finalization.status.to_string())
+    .bind(finalization.tx_hash)
+    .bind(finalization.error_message)
+    .bind(finalization.gas_used)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        anyhow::bail!("execution became terminal during finalization");
+    }
+    transaction.commit().await?;
+    Ok(true)
+}
+
+pub async fn fail_arc_execution_status(pool: &PgPool, id: Uuid, reason: &str) -> Result<bool> {
+    let updated = sqlx::query(
+        r#"
+        UPDATE execution_requests
+        SET status = 'failed', error_message = $2, updated_at = now()
+        WHERE id = $1 AND status NOT IN ('confirmed', 'reverted', 'failed')
+        "#,
+    )
+    .bind(id)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() == 1)
 }
 
 // ──────────────────────── Payments ───────────────────────────────────
@@ -2060,7 +2069,7 @@ mod tests {
     fn sample_request(agent_id: &str) -> ExecutionRequest {
         ExecutionRequest {
             agent_id: agent_id.into(),
-            chain: "base".into(),
+            chain: "arc-testnet".into(),
             target_contract: "0x1234567890abcdef1234567890abcdef12345678".into(),
             calldata: "0xdeadbeef".into(),
             value: "0".into(),
@@ -2088,48 +2097,50 @@ mod tests {
 
     async fn create_test_auth_context(
         pool: &PgPool,
-        key: &ApiKeyRow,
         external_id: &str,
     ) -> crate::types::AuthContext {
-        let policy_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO authorization_policies (id, organization_id, name, allowed_chains, allowed_actions) VALUES ($1, $2, $3, $4, $5)",
+        let (public_jwk, thumbprint) = test_public_jwk();
+        let credential_scopes = crate::auth::DEFAULT_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect::<Vec<_>>();
+        let policy_actions = crate::auth::DEFAULT_POLICY_ACTIONS
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect::<Vec<_>>();
+        let policy_protocols = crate::auth::SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|protocol| (*protocol).to_string())
+            .collect::<Vec<_>>();
+        let organization_name = format!("Test organization {}", Uuid::new_v4().simple());
+        let registration = create_self_service_registration(
+            pool,
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            SelfServiceRegistrationOptions {
+                chain: "arc-testnet",
+                organization_name: &organization_name,
+                display_name: "Test owner",
+                agent_external_id: external_id,
+                public_jwk: &public_jwk,
+                public_jwk_thumbprint: &thumbprint,
+                credential_scopes: &credential_scopes,
+                policy_actions: &policy_actions,
+                policy_protocols: &policy_protocols,
+                max_execution_fee_usd: crate::auth::DEFAULT_MAX_EXECUTION_FEE_USD,
+            },
         )
-        .bind(policy_id)
-        .bind(key.organization_id)
-        .bind(format!("test-{external_id}"))
-        .bind(vec!["base".to_string()])
-        .bind(vec!["*".to_string()])
-        .execute(pool)
         .await
-        .expect("create policy");
-        let agent_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO agents (id, organization_id, external_id, display_name, policy_id) VALUES ($1, $2, $3, $3, $4)",
-        )
-        .bind(agent_id)
-        .bind(key.organization_id)
-        .bind(external_id)
-        .bind(policy_id)
-        .execute(pool)
-        .await
-        .expect("create agent");
-        sqlx::query("INSERT INTO principal_agent_grants (principal_id, agent_id) VALUES ($1, $2)")
-            .bind(key.principal_id)
-            .bind(agent_id)
-            .execute(pool)
-            .await
-            .expect("grant agent");
+        .expect("create test OAuth identity");
         crate::types::AuthContext {
-            organization_id: key.organization_id,
-            principal_id: key.principal_id,
-            credential_id: key.id,
-            credential_kind: crate::types::CredentialKind::ApiKey,
-            scopes: std::collections::BTreeSet::from(["*".to_string()]),
+            organization_id: registration.credential.organization_id,
+            principal_id: registration.credential.principal_id,
+            credential_id: registration.credential.id,
+            credential_kind: crate::types::CredentialKind::LocalJwk,
+            scopes: registration.credential.scopes.into_iter().collect(),
             agent_id: None,
             agent_external_id: None,
             instance_id: None,
-            dpop_jkt: None,
+            dpop_jkt: Some(thumbprint),
         }
     }
 
@@ -2161,7 +2172,7 @@ mod tests {
     fn test_execution_payload_hash_canonicalizes_chain_and_rejects_tampering() {
         let canonical = sample_request("payload-hash");
         let mut chain_alias = canonical.clone();
-        chain_alias.chain = "BASE".into();
+        chain_alias.chain = "ARC-TESTNET".into();
         assert_eq!(
             execution_payload_hash(&canonical).expect("canonical hash"),
             execution_payload_hash(&chain_alias).expect("alias hash")
@@ -2192,65 +2203,23 @@ mod tests {
             atomic,
             idempotency_fingerprint(&callback_changed, "execute:atomic-token").unwrap()
         );
-    }
 
-    #[tokio::test]
-    async fn test_db_api_key_create_and_lookup() {
-        let pool = setup_pool().await;
-
-        let (row, raw_key, webhook_secret) = create_api_key(
-            &pool,
-            "1111111111111111111111111111111111111111111111111111111111111111",
-            CreateApiKeyOptions {
-                label: Some("db-test"),
-                organization_id: None,
-                principal_id: None,
-                scopes: &[],
-                environment: "test",
-                expires_at: None,
-            },
-        )
-        .await
-        .expect("create api key");
-        assert!(raw_key.starts_with("jso_test_"));
-        assert!(webhook_secret.is_some());
-        assert!(row.is_active);
-
-        let found = get_api_key_by_raw(&pool, &raw_key)
-            .await
-            .expect("lookup api key")
-            .expect("api key exists");
-        assert_eq!(found.id, row.id);
-    }
-
-    #[tokio::test]
-    async fn test_db_api_key_wrong_key_returns_none() {
-        let pool = setup_pool().await;
-        let found = get_api_key_by_raw(&pool, "ak_does_not_exist")
-            .await
-            .expect("lookup non-existent key");
-        assert!(found.is_none());
+        assert!(is_idempotency_ownership_error(&anyhow::anyhow!(
+            "idempotency key was already used for a different request"
+        )));
+        assert!(is_idempotency_ownership_error(&anyhow::anyhow!(
+            "idempotency key belongs to a different authenticated identity"
+        )));
+        assert!(!is_idempotency_ownership_error(&anyhow::anyhow!(
+            "database unavailable"
+        )));
     }
 
     #[tokio::test]
     async fn test_db_execution_request_lifecycle() {
         let pool = setup_pool().await;
         let req = sample_request(&format!("lifecycle-{}", Uuid::new_v4().simple()));
-        let (key, _, _) = create_api_key(
-            &pool,
-            "1111111111111111111111111111111111111111111111111111111111111111",
-            CreateApiKeyOptions {
-                label: Some("lifecycle"),
-                organization_id: None,
-                principal_id: None,
-                scopes: &[],
-                environment: "test",
-                expires_at: None,
-            },
-        )
-        .await
-        .expect("create API key");
-        let context = create_test_auth_context(&pool, &key, &req.agent_id).await;
+        let context = create_test_auth_context(&pool, &req.agent_id).await;
 
         let row = insert_execution_request(
             &pool,
@@ -2294,21 +2263,7 @@ mod tests {
     async fn test_db_payment_replay_protection() {
         let pool = setup_pool().await;
         let req = sample_request(&format!("replay-{}", Uuid::new_v4().simple()));
-        let (key, _, _) = create_api_key(
-            &pool,
-            "1111111111111111111111111111111111111111111111111111111111111111",
-            CreateApiKeyOptions {
-                label: Some("replay"),
-                organization_id: None,
-                principal_id: None,
-                scopes: &[],
-                environment: "test",
-                expires_at: None,
-            },
-        )
-        .await
-        .expect("create API key");
-        let context = create_test_auth_context(&pool, &key, &req.agent_id).await;
+        let context = create_test_auth_context(&pool, &req.agent_id).await;
         let row = insert_execution_request(
             &pool,
             &context,
@@ -2355,14 +2310,19 @@ mod tests {
             .iter()
             .map(|scope| (*scope).to_string())
             .collect::<Vec<_>>();
-        let policy_actions = crate::auth::RUNTIME_SCOPES
+        let policy_actions = crate::auth::DEFAULT_POLICY_ACTIONS
             .iter()
             .map(|scope| (*scope).to_string())
+            .collect::<Vec<_>>();
+        let policy_protocols = crate::auth::SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|protocol| (*protocol).to_string())
             .collect::<Vec<_>>();
         let registration = create_self_service_registration(
             &pool,
             "1111111111111111111111111111111111111111111111111111111111111111",
             SelfServiceRegistrationOptions {
+                chain: "arc-testnet",
                 organization_name: "Jusso test organization",
                 display_name: "Test owner",
                 agent_external_id: &external_id,
@@ -2370,11 +2330,27 @@ mod tests {
                 public_jwk_thumbprint: &owner_thumbprint,
                 credential_scopes: &owner_scopes,
                 policy_actions: &policy_actions,
+                policy_protocols: &policy_protocols,
+                max_execution_fee_usd: crate::auth::DEFAULT_MAX_EXECUTION_FEE_USD,
             },
         )
         .await
         .expect("register organization");
         assert_eq!(registration.credential.agent_id, None);
+        assert_eq!(
+            registration.policy.allowed_chains.as_deref(),
+            Some(["arc-testnet".to_string()].as_slice())
+        );
+        assert_eq!(
+            registration.policy.allowed_protocols,
+            Some(policy_protocols)
+        );
+        assert!(!registration.policy.allow_raw_execution);
+        assert_eq!(registration.policy.max_value_wei.as_deref(), Some("0"));
+        assert_eq!(
+            registration.policy.max_execution_fee_usd,
+            Some(crate::auth::DEFAULT_MAX_EXECUTION_FEE_USD)
+        );
         assert!(principal_can_access_agent(
             &pool,
             registration.credential.principal_id,
@@ -2435,21 +2411,7 @@ mod tests {
     async fn signing_persistence_fails_atomically_when_policy_is_revoked() {
         let pool = setup_pool().await;
         let req = sample_request(&format!("permit-{}", Uuid::new_v4().simple()));
-        let (key, _, _) = create_api_key(
-            &pool,
-            "1111111111111111111111111111111111111111111111111111111111111111",
-            CreateApiKeyOptions {
-                label: Some("permit-race"),
-                organization_id: None,
-                principal_id: None,
-                scopes: &[],
-                environment: "test",
-                expires_at: None,
-            },
-        )
-        .await
-        .expect("create API key");
-        let context = create_test_auth_context(&pool, &key, &req.agent_id).await;
+        let context = create_test_auth_context(&pool, &req.agent_id).await;
         let row = insert_execution_request(
             &pool,
             &context,
@@ -2472,19 +2434,219 @@ mod tests {
             .await
             .expect("revoke policy during signing");
 
-        assert!(store_signed_transaction_and_consume_permit(
+        assert!(store_signed_user_operation_and_consume_permit(
             &pool,
             row.id,
             permit.id,
-            "0x01",
+            &serde_json::json!({"type": "user-operation-v070"}),
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            2,
         )
         .await
         .is_err());
-        assert!(get_signed_transaction(&pool, row.id)
+        assert!(get_signed_user_operation(&pool, row.id)
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn signed_arc_operation_remains_recoverable_after_policy_revocation() {
+        let pool = setup_pool().await;
+        let req = sample_request(&format!("recovery-{}", Uuid::new_v4().simple()));
+        let context = create_test_auth_context(&pool, &req.agent_id).await;
+        let row = insert_execution_request(
+            &pool,
+            &context,
+            &req,
+            &ExecutionStatus::PaymentVerified,
+            Some("0x1234567890abcdef1234567890abcdef12345678"),
+            None,
+        )
+        .await
+        .unwrap();
+        let permit = issue_execution_permit(&pool, row.id, Some("1000"), 300)
+            .await
+            .unwrap();
+        claim_execution_permit(&pool, permit.id, row.id)
+            .await
+            .unwrap();
+        store_signed_user_operation_and_consume_permit(
+            &pool,
+            row.id,
+            permit.id,
+            &serde_json::json!({"type": "user-operation-v070"}),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE authorization_policies SET is_active = FALSE WHERE id = $1")
+            .bind(row.policy_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(claim_execution_permit(&pool, permit.id, row.id)
+            .await
+            .unwrap()
+            .consumed_at
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn arc_finalization_is_atomic_and_exactly_once() {
+        let pool = setup_pool().await;
+        let req = sample_request(&format!("finalize-{}", Uuid::new_v4().simple()));
+        let context = create_test_auth_context(&pool, &req.agent_id).await;
+        let row = insert_execution_request(
+            &pool,
+            &context,
+            &req,
+            &ExecutionStatus::Queued,
+            Some("0x1234567890abcdef1234567890abcdef12345678"),
+            None,
+        )
+        .await
+        .unwrap();
+        let hash = format!("0x{}", hex::encode(Uuid::new_v4().as_bytes().repeat(2)));
+        let payment = SettledExecutionPayment {
+            payment_id: Uuid::new_v4(),
+            quote_request_id: Some(row.id),
+            payer: "0x1234567890abcdef1234567890abcdef12345678".into(),
+            amount_usd: 0.01,
+            token: "USDC".into(),
+            chain: "arc-testnet".into(),
+            tx_hash: hash.clone(),
+            confirmed_amount_raw: Some("10000".into()),
+            token_contract: Some("0x3600000000000000000000000000000000000000".into()),
+        };
+
+        assert!(update_execution_status(
+            &pool,
+            row.id,
+            &ExecutionStatus::Confirmed,
+            Some(&hash),
+            None,
+            Some(125_000),
+            None,
+        )
+        .await
+        .is_err());
+
+        let finalization = || ArcExecutionFinalization {
+            request_id: row.id,
+            chain: "arc-testnet",
+            tx_hash: &hash,
+            from_address: "0x1234567890abcdef1234567890abcdef12345678",
+            to_address: &req.target_contract,
+            status: &ExecutionStatus::Confirmed,
+            error_message: None,
+            gas_used: Some(125_000),
+            payment: Some(&payment),
+        };
+        assert!(finalize_arc_execution(&pool, finalization()).await.unwrap());
+        assert!(!finalize_arc_execution(&pool, finalization()).await.unwrap());
+
+        let transaction: TransactionRow =
+            sqlx::query_as("SELECT * FROM transactions WHERE request_id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(transaction.tx_hash, hash);
+        assert_eq!(transaction.gas_used, Some(125_000));
+        let payment_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE request_id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(payment_count, 1);
+        let stored = get_execution_request(&pool, row.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "confirmed");
+        assert_eq!(stored.tx_hash.as_deref(), Some(hash.as_str()));
+
+        let conflicting_hash = format!("0x{}", hex::encode(Uuid::new_v4().as_bytes().repeat(2)));
+        let conflicting = ArcExecutionFinalization {
+            tx_hash: &conflicting_hash,
+            ..finalization()
+        };
+        assert!(finalize_arc_execution(&pool, conflicting).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn arc_finalization_rolls_back_on_conflicting_payment() {
+        let pool = setup_pool().await;
+        let first_req = sample_request(&format!("paid-{}", Uuid::new_v4().simple()));
+        let first_context = create_test_auth_context(&pool, &first_req.agent_id).await;
+        let first_row = insert_execution_request(
+            &pool,
+            &first_context,
+            &first_req,
+            &ExecutionStatus::PaymentRequired,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let hash = format!("0x{}", hex::encode(Uuid::new_v4().as_bytes().repeat(2)));
+        let existing_payment = SettledExecutionPayment {
+            payment_id: Uuid::new_v4(),
+            quote_request_id: Some(first_row.id),
+            payer: "0x0000000000000000000000000000000000000001".into(),
+            amount_usd: 0.01,
+            token: "USDC".into(),
+            chain: "arc-testnet".into(),
+            tx_hash: hash.clone(),
+            confirmed_amount_raw: Some("10000".into()),
+            token_contract: Some("0x3600000000000000000000000000000000000000".into()),
+        };
+        insert_payment(&pool, first_row.id, &existing_payment)
+            .await
+            .unwrap()
+            .expect("seed conflicting payment");
+
+        let req = sample_request(&format!("rollback-{}", Uuid::new_v4().simple()));
+        let context = create_test_auth_context(&pool, &req.agent_id).await;
+        let row = insert_execution_request(
+            &pool,
+            &context,
+            &req,
+            &ExecutionStatus::Queued,
+            Some("0x1234567890abcdef1234567890abcdef12345678"),
+            None,
+        )
+        .await
+        .unwrap();
+        let conflicting_payment = SettledExecutionPayment {
+            payment_id: Uuid::new_v4(),
+            quote_request_id: Some(row.id),
+            ..existing_payment
+        };
+        let result = finalize_arc_execution(
+            &pool,
+            ArcExecutionFinalization {
+                request_id: row.id,
+                chain: "arc-testnet",
+                tx_hash: &hash,
+                from_address: "0x1234567890abcdef1234567890abcdef12345678",
+                to_address: &req.target_contract,
+                status: &ExecutionStatus::Confirmed,
+                error_message: None,
+                gas_used: Some(125_000),
+                payment: Some(&conflicting_payment),
+            },
+        )
+        .await;
+        assert!(result.is_err());
+
+        let transaction_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE request_id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(transaction_count, 0);
+        let stored = get_execution_request(&pool, row.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "queued");
+        assert!(stored.tx_hash.is_none());
     }
 }

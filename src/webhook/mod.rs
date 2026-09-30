@@ -8,9 +8,9 @@
 //!
 //! Every webhook request carries an `X-Webhook-Signature` header containing
 //! an HMAC-SHA256 signature of the JSON body, keyed with an organization-owned
-//! webhook secret that is independent from its API and OAuth credentials.
-//! This lets agents verify that the webhook came from the platform (and not
-//! a spoofed source) without exposing the raw API key.
+//! webhook secret that is independent from its OAuth credentials. This lets
+//! agents verify that the webhook came from the platform without exposing
+//! authentication key material.
 //!
 //! ## Reliability
 //!

@@ -5,25 +5,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-// ──────────────────────────── api_keys ───────────────────────────────
-
-#[derive(Clone, FromRow)]
-pub struct ApiKeyRow {
-    pub id: Uuid,
-    pub key_hash: String,
-    pub label: Option<String>,
-    pub is_active: bool,
-    pub created_at: DateTime<Utc>,
-    pub organization_id: Uuid,
-    pub principal_id: Uuid,
-    pub key_prefix: String,
-    pub scopes: Vec<String>,
-    pub environment: String,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub revoked_at: Option<DateTime<Utc>>,
-    pub last_used_at: Option<DateTime<Utc>>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct PrincipalRow {
     pub id: Uuid,
@@ -63,6 +44,7 @@ pub struct AuthorizationPolicyRow {
     pub allowed_protocols: Option<Vec<String>>,
     pub allowed_actions: Option<Vec<String>>,
     pub allowed_targets: Option<Vec<String>>,
+    pub allow_raw_execution: bool,
     pub max_value_wei: Option<String>,
     pub max_execution_fee_usd: Option<f64>,
     pub is_active: bool,

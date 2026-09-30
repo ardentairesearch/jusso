@@ -31,6 +31,7 @@ CREATE TABLE authorization_policies (
     allowed_protocols TEXT[],
     allowed_actions TEXT[],
     allowed_targets TEXT[],
+    allow_raw_execution BOOLEAN NOT NULL DEFAULT FALSE,
     max_value_wei TEXT CHECK (max_value_wei IS NULL OR max_value_wei ~ '^[0-9]+$'),
     max_execution_fee_usd DOUBLE PRECISION
         CHECK (max_execution_fee_usd IS NULL OR max_execution_fee_usd >= 0),
@@ -51,7 +52,8 @@ CREATE TABLE agents (
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (organization_id, external_id)
+    UNIQUE (organization_id, external_id),
+    UNIQUE (id, organization_id)
 );
 CREATE INDEX idx_agents_organization ON agents(organization_id);
 CREATE INDEX idx_agents_parent ON agents(parent_agent_id);
@@ -63,24 +65,6 @@ CREATE TABLE principal_agent_grants (
     PRIMARY KEY (principal_id, agent_id)
 );
 CREATE INDEX idx_principal_agent_grants_agent ON principal_agent_grants(agent_id);
-
-CREATE TABLE api_keys (
-    id UUID PRIMARY KEY,
-    organization_id UUID NOT NULL REFERENCES organizations(id),
-    principal_id UUID NOT NULL REFERENCES principals(id),
-    key_hash TEXT NOT NULL UNIQUE,
-    key_prefix TEXT NOT NULL,
-    label TEXT,
-    scopes TEXT[] NOT NULL,
-    environment TEXT NOT NULL CHECK (environment IN ('live', 'test')),
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    expires_at TIMESTAMPTZ,
-    revoked_at TIMESTAMPTZ,
-    last_used_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_api_keys_organization ON api_keys(organization_id);
-CREATE INDEX idx_api_keys_principal ON api_keys(principal_id);
 
 CREATE TABLE credential_bindings (
     id UUID PRIMARY KEY,
@@ -160,32 +144,86 @@ CREATE TABLE oauth_proof_jtis (
 );
 CREATE INDEX idx_oauth_proof_jtis_expiry ON oauth_proof_jtis(expires_at);
 
+CREATE TABLE turnkey_organization_bindings (
+    organization_id UUID PRIMARY KEY REFERENCES organizations(id),
+    provider_organization_id TEXT UNIQUE,
+    sub_organization_name TEXT NOT NULL UNIQUE,
+    api_public_key TEXT NOT NULL,
+    api_private_key_encrypted TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('provisioning', 'active', 'failed')),
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (
+        (status = 'active') = (provider_organization_id IS NOT NULL)
+    ),
+    CHECK (api_public_key ~ '^(02|03)[0-9a-f]{64}$'),
+    CHECK (btrim(api_private_key_encrypted) <> ''),
+    CHECK (provider_organization_id IS NULL OR btrim(provider_organization_id) <> ''),
+    UNIQUE (organization_id, provider_organization_id)
+);
+
 CREATE TABLE managed_wallets (
     id UUID PRIMARY KEY,
     wallet_provider TEXT NOT NULL,
+    provider_organization_id TEXT NOT NULL,
     provider_wallet_id TEXT NOT NULL,
     provider_account_id TEXT NOT NULL,
     provider_external_id TEXT NOT NULL,
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('infrastructure', 'organization')),
+    scope_organization_id UUID REFERENCES organizations(id),
     address TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (
+        (scope_kind = 'organization' AND scope_organization_id IS NOT NULL)
+        OR (scope_kind = 'infrastructure' AND scope_organization_id IS NULL)
+    ),
+    CHECK (btrim(provider_organization_id) <> ''),
+    CHECK (btrim(provider_wallet_id) <> ''),
+    CHECK (btrim(provider_account_id) <> ''),
+    CHECK (btrim(provider_external_id) <> ''),
     UNIQUE (wallet_provider, provider_wallet_id),
     UNIQUE (wallet_provider, provider_account_id),
-    UNIQUE (wallet_provider, provider_external_id),
-    UNIQUE (address)
+    UNIQUE (address),
+    UNIQUE (id, scope_organization_id)
 );
+CREATE UNIQUE INDEX managed_wallets_infrastructure_external_id_key
+    ON managed_wallets (wallet_provider, provider_external_id)
+    WHERE scope_kind = 'infrastructure';
+CREATE UNIQUE INDEX managed_wallets_organization_external_id_key
+    ON managed_wallets (wallet_provider, scope_organization_id, provider_external_id)
+    WHERE scope_kind = 'organization';
+CREATE INDEX managed_wallets_scope_organization_idx
+    ON managed_wallets (scope_organization_id)
+    WHERE scope_kind = 'organization';
 
 CREATE TABLE agent_wallets (
     id UUID PRIMARY KEY,
     organization_id UUID NOT NULL REFERENCES organizations(id),
-    agent_uuid UUID NOT NULL UNIQUE REFERENCES agents(id),
-    managed_wallet_id UUID NOT NULL UNIQUE REFERENCES managed_wallets(id),
+    agent_uuid UUID NOT NULL UNIQUE,
+    managed_wallet_id UUID NOT NULL UNIQUE,
     agent_id TEXT NOT NULL,
     address TEXT NOT NULL UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (organization_id, agent_id)
+    UNIQUE (organization_id, agent_id),
+    FOREIGN KEY (agent_uuid, organization_id)
+        REFERENCES agents(id, organization_id),
+    FOREIGN KEY (managed_wallet_id, organization_id)
+        REFERENCES managed_wallets(id, scope_organization_id)
 );
 CREATE INDEX idx_agent_wallets_organization ON agent_wallets(organization_id);
 CREATE INDEX idx_agent_wallets_address ON agent_wallets(address);
+
+CREATE TABLE agent_smart_accounts (
+    agent_wallet_id UUID NOT NULL REFERENCES agent_wallets(id),
+    chain_id BIGINT NOT NULL CHECK (chain_id IN (5042, 5042002)),
+    account_address TEXT NOT NULL,
+    account_provider TEXT NOT NULL CHECK (length(trim(account_provider)) > 0),
+    provider_account_id TEXT NOT NULL CHECK (length(trim(provider_account_id)) > 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (agent_wallet_id, chain_id),
+    UNIQUE (chain_id, account_address)
+);
 
 CREATE TABLE auth_audit_events (
     id UUID PRIMARY KEY,
@@ -228,10 +266,9 @@ CREATE TABLE execution_requests (
     status TEXT NOT NULL DEFAULT 'pending',
     tx_hash TEXT,
     error_message TEXT,
-    signed_transaction TEXT,
-    signed_transaction_hash TEXT,
-    transaction_phase_count SMALLINT
-        CHECK (transaction_phase_count IS NULL OR transaction_phase_count > 0),
+    signed_user_operation JSONB,
+    user_operation_hash TEXT,
+    provider_call_id TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT execution_requests_idempotency_pair CHECK (
@@ -273,7 +310,7 @@ CREATE INDEX idx_execution_permits_expiry ON execution_permits(expires_at);
 
 CREATE TABLE transactions (
     id UUID PRIMARY KEY,
-    request_id UUID NOT NULL REFERENCES execution_requests(id),
+    request_id UUID NOT NULL UNIQUE REFERENCES execution_requests(id),
     chain TEXT NOT NULL,
     tx_hash TEXT NOT NULL,
     from_address TEXT NOT NULL,
@@ -286,7 +323,7 @@ CREATE INDEX idx_tx_request ON transactions(request_id);
 
 CREATE TABLE payments (
     id UUID PRIMARY KEY,
-    request_id UUID NOT NULL REFERENCES execution_requests(id),
+    request_id UUID NOT NULL UNIQUE REFERENCES execution_requests(id),
     payer TEXT NOT NULL,
     amount_usd DOUBLE PRECISION NOT NULL,
     amount_raw TEXT NOT NULL CHECK (amount_raw ~ '^[0-9]+$'),

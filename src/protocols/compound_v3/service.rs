@@ -989,18 +989,4 @@ mod tests {
             "3.1536"
         );
     }
-
-    #[tokio::test]
-    #[ignore = "requires configured Base Sepolia RPC"]
-    async fn live_verifies_both_registered_comets() {
-        dotenvy::dotenv().ok();
-        let config = crate::config::AppConfig::from_env().unwrap();
-        let engine = ExecutionEngine::new(config.runtime_config().unwrap()).unwrap();
-        for market in compound_v3::CompoundMarket::ALL {
-            assert_eq!(
-                verify_market(&engine, &Chain::Base, market).await.unwrap(),
-                market.base_token()
-            );
-        }
-    }
 }

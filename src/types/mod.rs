@@ -17,6 +17,9 @@ pub enum Chain {
     Ethereum,
     Base,
     Arbitrum,
+    Arc,
+    #[serde(rename = "arc-testnet")]
+    ArcTestnet,
 }
 
 impl std::fmt::Display for Chain {
@@ -25,6 +28,8 @@ impl std::fmt::Display for Chain {
             Chain::Ethereum => write!(f, "ethereum"),
             Chain::Base => write!(f, "base"),
             Chain::Arbitrum => write!(f, "arbitrum"),
+            Chain::Arc => write!(f, "arc"),
+            Chain::ArcTestnet => write!(f, "arc-testnet"),
         }
     }
 }
@@ -35,6 +40,8 @@ impl Chain {
             "ethereum" | "eth" | "mainnet" => Some(Chain::Ethereum),
             "base" => Some(Chain::Base),
             "arbitrum" | "arb" => Some(Chain::Arbitrum),
+            "arc" | "arc-mainnet" => Some(Chain::Arc),
+            "arc-testnet" => Some(Chain::ArcTestnet),
             _ => None,
         }
     }
@@ -45,6 +52,8 @@ impl Chain {
             Chain::Ethereum => 1,
             Chain::Base => 8453,
             Chain::Arbitrum => 42161,
+            Chain::Arc => crate::arc::ARC_MAINNET_CHAIN_ID,
+            Chain::ArcTestnet => crate::arc::ARC_TESTNET_CHAIN_ID,
         }
     }
 }
@@ -79,7 +88,7 @@ impl std::fmt::Display for ExecutionStatus {
 /// A single call within a batch transaction.
 ///
 /// When sent inside `ExecutionRequest.batch_calls`, each entry becomes one
-/// leg of the protocol phase in a native Base transaction.
+/// call in one atomic ERC-4337 UserOperation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchCall {
     pub target_contract: String,
@@ -92,9 +101,8 @@ pub struct BatchCall {
 ///
 /// Supports two modes:
 ///   1. **Single call** — populate `target_contract` / `calldata` / `value`
-///      directly. Maps to `BaseAccount.execute()`.
-///   2. **Batch call** — populate `batch_calls` (2+). Maps to
-///      `BaseAccount.executeBatch(Call[])` (v0.9). When `batch_calls` is
+///      directly.
+///   2. **Batch call** — populate `batch_calls` (1+). When `batch_calls` is
 ///      present, `target_contract` / `calldata` / `value` are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRequest {
@@ -127,13 +135,12 @@ pub struct ExecutionRequest {
 pub struct ExecutionResponse {
     pub request_id: Uuid,
     pub status: ExecutionStatus,
-    /// The agent's Base account address.
+    /// The agent's dedicated Arc smart-account address.
     /// Always included so the agent knows where to send tokens before executing.
     pub smart_wallet_address: Option<String>,
     pub estimated_gas: Option<u64>,
     pub estimated_cost_usd: Option<f64>,
-    /// Stablecoin symbol charged for execution when the fee is collected
-    /// atomically in phase zero.
+    /// Stablecoin symbol charged in the atomic UserOperation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_fee_token: Option<String>,
     /// Exact execution fee in the token's smallest unit.
@@ -148,10 +155,9 @@ pub struct ExecutionResponse {
 pub struct WalletResponse {
     /// The agent-supplied identifier.
     pub agent_id: String,
-    /// The provider-backed Base account address.
+    /// The dedicated Arc ERC-4337 smart-account address.
     pub smart_wallet_address: String,
-    /// Whether the canonical native-account delegation is installed.
-    /// The EOA can receive assets regardless of this value.
+    /// Whether the smart-account contract has deployed onchain.
     pub deployed: bool,
     /// Human-readable note explaining wallet funding.
     pub message: String,
@@ -172,7 +178,7 @@ pub struct StatusResponse {
 /// A single token balance entry in a wallet balance response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenBalance {
-    /// Token symbol, e.g. `"USDV"` or `"USDC"`.
+    /// Token symbol, e.g. `"USDC"`.
     pub symbol: String,
     /// Token contract address on the queried chain.
     pub contract_address: String,
@@ -190,11 +196,7 @@ pub struct WalletBalanceResponse {
     pub agent_id: String,
     pub smart_wallet_address: String,
     pub chain: String,
-    /// Native token balance (ETH / ARB etc.) in wei as a decimal string.
-    pub native_balance_wei: String,
-    /// Native balance formatted in the chain's base unit (e.g. ETH).
-    pub native_balance_formatted: String,
-    /// Balances for each accepted payment token configured on this chain.
+    /// Arc USDC is shown once, through its six-decimal ERC-20 interface.
     pub tokens: Vec<TokenBalance>,
 }
 
@@ -211,7 +213,7 @@ pub struct ExecutionJob {
     pub execution_permit_id: Uuid,
     /// The agent-supplied ID (not namespaced; organization ownership is resolved before queuing).
     pub agent_id: String,
-    /// The agent's Base account address.
+    /// The agent's dedicated Arc smart-account address.
     pub smart_wallet_address: String,
     pub chain: Chain,
     pub target_contract: String,
@@ -222,14 +224,13 @@ pub struct ExecutionJob {
     /// Defaults to 0 for newly enqueued jobs.
     #[serde(default)]
     pub attempt_count: u32,
-    /// When present, the worker uses `executeBatch` instead of `execute`.
-    /// Each entry maps to one leg of the batch.
+    /// When present, the worker executes all calls atomically in order.
     #[serde(default)]
     pub batch_calls: Option<Vec<BatchCall>>,
     /// Agent-supplied webhook URL.  The worker POSTs the result here on completion.
     #[serde(default)]
     pub callback_url: Option<String>,
-    /// Stablecoin fee transfer included in phase zero of the same transaction.
+    /// Stablecoin fee transfer prepended to the same atomic UserOperation.
     #[serde(default)]
     pub execution_fee: Option<ExecutionFeeCharge>,
 }
@@ -278,7 +279,6 @@ pub struct SettledExecutionPayment {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialKind {
-    ApiKey,
     LocalJwk,
     WorkloadIdentity,
 }
@@ -326,6 +326,11 @@ mod tests {
         assert_eq!(Chain::from_str_loose("base"), Some(Chain::Base));
         assert_eq!(Chain::from_str_loose("arbitrum"), Some(Chain::Arbitrum));
         assert_eq!(Chain::from_str_loose("arb"), Some(Chain::Arbitrum));
+        assert_eq!(Chain::from_str_loose("arc"), Some(Chain::Arc));
+        assert_eq!(
+            Chain::from_str_loose("ARC-TESTNET"),
+            Some(Chain::ArcTestnet)
+        );
         assert_eq!(Chain::from_str_loose("solana"), None);
         assert_eq!(Chain::from_str_loose("polygon"), None);
         assert_eq!(Chain::from_str_loose(""), None);
@@ -336,6 +341,12 @@ mod tests {
         assert_eq!(Chain::Ethereum.to_string(), "ethereum");
         assert_eq!(Chain::Base.to_string(), "base");
         assert_eq!(Chain::Arbitrum.to_string(), "arbitrum");
+        assert_eq!(Chain::Arc.to_string(), "arc");
+        assert_eq!(Chain::ArcTestnet.to_string(), "arc-testnet");
+        assert_eq!(
+            serde_json::to_string(&Chain::ArcTestnet).unwrap(),
+            "\"arc-testnet\""
+        );
     }
 
     #[test]
@@ -343,6 +354,11 @@ mod tests {
         assert_eq!(Chain::Ethereum.chain_id(), 1);
         assert_eq!(Chain::Base.chain_id(), 8453);
         assert_eq!(Chain::Arbitrum.chain_id(), 42161);
+        assert_eq!(Chain::Arc.chain_id(), crate::arc::ARC_MAINNET_CHAIN_ID);
+        assert_eq!(
+            Chain::ArcTestnet.chain_id(),
+            crate::arc::ARC_TESTNET_CHAIN_ID
+        );
     }
 
     #[test]
@@ -370,7 +386,7 @@ mod tests {
             organization_id: Uuid::new_v4(),
             principal_id: Uuid::new_v4(),
             credential_id: Uuid::new_v4(),
-            credential_kind: CredentialKind::ApiKey,
+            credential_kind: CredentialKind::LocalJwk,
             scopes: BTreeSet::new(),
             agent_id: Some(bound_agent),
             agent_external_id: Some("agent-a".into()),

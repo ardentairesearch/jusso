@@ -21,14 +21,16 @@ use super::adapter::{
     UniswapTokenBalance,
 };
 use crate::agent_wallet::AgentWalletRegistry;
-use crate::api::services::{handle_execute, handle_simulate, resolve_chain_smart_wallet_address};
+use crate::api::services::{
+    handle_execute_idempotent, handle_simulate_authenticated, resolve_chain_smart_wallet_address,
+};
 use crate::execution_engine::ExecutionEngine;
-use crate::types::{Chain, ExecutionResponse};
+use crate::types::{AuthContext, Chain, ExecutionResponse};
 
 const DEFAULT_DEADLINE_SECS: u64 = 20 * 60;
 const BPS_SCALE: u64 = 10_000;
-const POOL_MANAGER_START_BLOCK: u64 = 19_088_197;
-const BLOCKSCOUT_LOGS_URL: &str = "https://base-sepolia.blockscout.com/api";
+const POOL_MANAGER_START_BLOCK: u64 = 62_417_020;
+const BLOCKSCOUT_LOGS_URL: &str = "https://testnet.arcscan.app/api";
 const INITIALIZE_EVENT_TOPIC: &str =
     "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -48,40 +50,35 @@ pub async fn handle_swap(
     pool: &PgPool,
     redis_conn: &mut ConnectionManager,
     wallet_registry: &AgentWalletRegistry,
-    organization_id: Uuid,
+    auth_context: &AuthContext,
     req: &UniswapSwapRequest,
+    idempotency_key: &str,
 ) -> Result<ExecutionResponse> {
-    let resolved = resolve_swap(engine, wallet_registry, organization_id, req).await?;
+    let resolved = resolve_swap(engine, wallet_registry, auth_context.organization_id, req).await?;
     let execution_req = uniswap_v4::compile_swap(&resolved.request)?;
-    handle_execute(
+    handle_execute_idempotent(
         engine,
         pool,
         redis_conn,
         wallet_registry,
-        organization_id,
+        auth_context,
         &execution_req,
+        idempotency_key,
     )
     .await
-    .map_err(|e| anyhow!("Uniswap V4 swap on Base Sepolia failed: {e}"))
+    .map_err(|e| anyhow!("Uniswap V4 swap on Arc testnet failed: {e}"))
 }
 
 pub async fn handle_swap_simulate(
     engine: &ExecutionEngine,
     pool: &PgPool,
     wallet_registry: &AgentWalletRegistry,
-    organization_id: Uuid,
+    auth_context: &AuthContext,
     req: &UniswapSwapRequest,
 ) -> Result<ExecutionResponse> {
-    let resolved = resolve_swap(engine, wallet_registry, organization_id, req).await?;
+    let resolved = resolve_swap(engine, wallet_registry, auth_context.organization_id, req).await?;
     let execution_req = uniswap_v4::compile_swap(&resolved.request)?;
-    handle_simulate(
-        engine,
-        pool,
-        wallet_registry,
-        organization_id,
-        &execution_req,
-    )
-    .await
+    handle_simulate_authenticated(engine, pool, wallet_registry, auth_context, &execution_req).await
 }
 
 pub async fn handle_quote(
@@ -95,7 +92,7 @@ pub async fn handle_quote(
     let token_out = uniswap_v4::parse_request_address(&req.token_out, "token_out")?;
     Ok(UniswapQuoteResponse {
         agent_id: req.agent_id.clone(),
-        chain: "base".to_string(),
+        chain: parse_chain(&req.chain)?.to_string(),
         smart_wallet_address: format!("{:?}", resolved.smart_wallet_address),
         pool_id: format!("{:?}", uniswap_v4::pool_id(resolved.pool_key)),
         pool_selection: resolved.pool_selection,
@@ -127,7 +124,7 @@ pub async fn handle_pool(
     let state = load_pool_state(engine, &chain, id).await?;
 
     Ok(UniswapPoolResponse {
-        chain: "base".to_string(),
+        chain: chain.to_string(),
         pool_id: format!("{id:?}"),
         currency0: format!("{:?}", key.currency0),
         currency1: format!("{:?}", key.currency1),
@@ -177,7 +174,7 @@ pub async fn handle_pools(
         ))
     });
     Ok(UniswapPoolsResponse {
-        chain: "base".to_string(),
+        chain: chain.to_string(),
         token_a: format!("{token_a:?}"),
         token_b: format!("{token_b:?}"),
         include_hooked_pools: query.include_hooked_pools,
@@ -206,7 +203,7 @@ pub async fn handle_balances(
     }
     Ok(UniswapBalancesResponse {
         agent_id: query.agent_id.clone(),
-        chain: "base".to_string(),
+        chain: chain.to_string(),
         smart_wallet_address: format!("{smart_wallet_address:?}"),
         tokens,
     })
@@ -302,7 +299,7 @@ async fn validate_pool_for_swap(
     let state = load_pool_state(engine, chain, uniswap_v4::pool_id(key)).await?;
     if state.sqrt_price_x96.is_zero() {
         return Err(anyhow!(
-            "Uniswap V4 swap rejected: the supplied pool key is not initialized on Base Sepolia"
+            "Uniswap V4 swap rejected: the supplied pool key is not initialized on Arc testnet"
         ));
     }
     Ok(())
@@ -404,7 +401,7 @@ async fn quote_swap(
         Some(sender),
     )
     .await
-    .map_err(|e| anyhow!("Uniswap V4 quote rejected by the Base Sepolia Quoter: {e}"))?;
+    .map_err(|e| anyhow!("Uniswap V4 quote rejected by the Arc testnet Quoter: {e}"))?;
     uniswap_v4::decode_quote(&raw)
 }
 
@@ -437,7 +434,14 @@ fn discovered_pool_response(key: PoolKey, state: PoolState) -> UniswapDiscovered
 struct BlockscoutLogsResponse {
     status: String,
     message: String,
-    result: Option<Vec<BlockscoutLog>>,
+    result: Option<BlockscoutLogsResult>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BlockscoutLogsResult {
+    Logs(Vec<BlockscoutLog>),
+    Message(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -492,6 +496,8 @@ async fn fetch_pool_keys_from_blockscout(
             ("action", "getLogs".to_string()),
             ("fromBlock", POOL_MANAGER_START_BLOCK.to_string()),
             ("toBlock", "latest".to_string()),
+            ("page", "1".to_string()),
+            ("offset", MAX_DISCOVERED_POOLS.to_string()),
             (
                 "address",
                 format!("{:?}", uniswap_v4::pool_manager_address()),
@@ -512,11 +518,29 @@ async fn fetch_pool_keys_from_blockscout(
         .await
         .map_err(|e| anyhow!("failed to decode Uniswap V4 pool discovery response: {e}"))?;
 
-    let logs = response.result.unwrap_or_default();
-    if response.status != "1" && !logs.is_empty() {
+    let mut result_message = None;
+    let logs = match response.result {
+        Some(BlockscoutLogsResult::Logs(logs)) => logs,
+        Some(BlockscoutLogsResult::Message(message)) => {
+            result_message = Some(message);
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    let valid_empty_response = response.status == "0"
+        && logs.is_empty()
+        && (is_no_logs_message(&response.message)
+            || result_message.as_deref().is_some_and(is_no_logs_message));
+    if (response.status == "1" && result_message.is_some())
+        || (response.status != "1" && !valid_empty_response)
+    {
         return Err(anyhow!(
-            "Uniswap V4 pool discovery failed: {}",
-            response.message
+            "Uniswap V4 pool discovery failed: {}{}",
+            response.message,
+            result_message
+                .as_deref()
+                .map(|message| format!(" ({message})"))
+                .unwrap_or_default()
         ));
     }
     if logs.len() >= MAX_DISCOVERED_POOLS {
@@ -554,6 +578,11 @@ async fn fetch_pool_keys_from_blockscout(
         pools_by_id.insert(event_pool_id, key);
     }
     Ok(pools_by_id.into_values().collect())
+}
+
+fn is_no_logs_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("no records") || normalized.contains("no logs")
 }
 
 fn address_topic(address: Address) -> String {
@@ -609,8 +638,8 @@ async fn load_token_balance(
         let balance = provider.get_balance(owner, None).await?;
         return Ok(UniswapTokenBalance {
             address: format!("{token:?}"),
-            symbol: "ETH".to_string(),
-            name: "Ether".to_string(),
+            symbol: "USDC".to_string(),
+            name: "USD Coin (native)".to_string(),
             decimals: 18,
             balance_raw: balance.to_string(),
             balance_formatted: format_token_units(balance, 18)?,
@@ -772,9 +801,9 @@ fn format_token_units(amount: U256, decimals: u8) -> Result<String> {
 
 fn parse_chain(chain: &str) -> Result<Chain> {
     match chain.trim().to_ascii_lowercase().as_str() {
-        "base" | "base-sepolia" | "base_sepolia" => Ok(Chain::Base),
+        "arc-testnet" => Ok(Chain::ArcTestnet),
         other => Err(anyhow!(
-            "unsupported chain for Uniswap V4: {other}; use base"
+            "unsupported chain for Uniswap V4: {other}; use arc-testnet"
         )),
     }
 }
@@ -863,56 +892,18 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires the public Base Sepolia Blockscout API"]
-    async fn live_discovers_official_base_sepolia_usdc_weth_pools() {
-        let usdc = "0x036cbd53842c5426634e7929541ec2318f3dcf7e"
+    #[ignore = "requires the public Arc testnet Blockscout API"]
+    async fn live_discovers_official_arc_testnet_pools() {
+        let usdc = "0x3600000000000000000000000000000000000000"
             .parse::<Address>()
             .unwrap();
-        let weth = "0x4200000000000000000000000000000000000006"
+        let paired_token = "0x99f5ef58ecf20f4b8ec8c4af451a74045aa40573"
             .parse::<Address>()
             .unwrap();
-        let pools = fetch_pool_keys_from_blockscout(usdc, weth).await.unwrap();
+        let pools = fetch_pool_keys_from_blockscout(usdc, paired_token)
+            .await
+            .unwrap();
         assert!(!pools.is_empty());
         assert!(pools.iter().any(|pool| pool.hooks == Address::zero()));
-    }
-
-    #[tokio::test]
-    #[ignore = "requires configured Base Sepolia RPC and public Blockscout"]
-    async fn live_automatically_quotes_official_base_sepolia_usdc_weth() {
-        dotenvy::dotenv().ok();
-        let config = crate::config::AppConfig::from_env().unwrap();
-        let engine = ExecutionEngine::new(config.runtime_config().unwrap()).unwrap();
-        let usdc = "0x036cbd53842c5426634e7929541ec2318f3dcf7e"
-            .parse::<Address>()
-            .unwrap();
-        let weth = "0x4200000000000000000000000000000000000006"
-            .parse::<Address>()
-            .unwrap();
-        let request = UniswapSwapRequest {
-            agent_id: "live-discovery-test".to_string(),
-            chain: "base".to_string(),
-            token_in: format!("{usdc:?}"),
-            token_out: format!("{weth:?}"),
-            fee: None,
-            tick_spacing: None,
-            hooks: None,
-            include_hooked_pools: false,
-            hook_data: "0x".to_string(),
-            swap_kind: UniswapSwapKind::ExactIn,
-            amount_raw: "1000000".to_string(),
-            limit_raw: None,
-            slippage_bps: 100,
-            deadline: None,
-            strategy_id: None,
-            callback_url: None,
-        };
-        let (key, quote, _, selection, discovered, quoted) =
-            select_best_pool(&engine, &Chain::Base, &request, Address::zero(), usdc, weth)
-                .await
-                .unwrap();
-        assert_eq!(selection, UniswapPoolSelection::Automatic);
-        assert_eq!(key.hooks, Address::zero());
-        assert!(!quote.is_zero());
-        assert!(discovered >= quoted && quoted > 0);
     }
 }

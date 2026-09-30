@@ -6,8 +6,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::Utc;
-use ethers::types::{Address, U256};
+use ethers::{
+    providers::Middleware,
+    types::{Address, U256},
+};
 use hmac::{Hmac, Mac};
 use redis::aio::ConnectionManager;
 use sha2::Sha256;
@@ -25,6 +27,10 @@ use crate::db;
 use crate::execution_engine::ExecutionEngine;
 use crate::payments::x402::{
     self, FacilitatorClient, PaymentRequired, PaymentRequirements, ResourceInfo,
+};
+use crate::protocols::uniswap_v4::{
+    service as uniswap_v4_service, UniswapBalancesQuery, UniswapPoolQuery, UniswapPoolsQuery,
+    UniswapSwapRequest,
 };
 use crate::types::*;
 
@@ -60,7 +66,8 @@ fn short_hash(value: &str) -> String {
 
 fn chain_display(chain: &str) -> String {
     match chain.to_lowercase().as_str() {
-        "base" => "Base".to_string(),
+        "arc" => "Arc".to_string(),
+        "arc-testnet" => "Arc Testnet".to_string(),
         other => {
             let mut chars = other.chars();
             match chars.next() {
@@ -85,8 +92,8 @@ mod feed_tests {
     use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
-    fn chain_display_names_base() {
-        assert_eq!(chain_display("base"), "Base");
+    fn chain_display_names_arc_testnet() {
+        assert_eq!(chain_display("arc-testnet"), "Arc Testnet");
     }
 
     #[test]
@@ -151,12 +158,12 @@ fn required_idempotency_key(headers: &HeaderMap) -> Result<&str, RequestValidati
     Ok(value)
 }
 
-pub async fn protocol_routes_disabled_handler() -> Response {
+pub async fn protocol_not_enabled_handler() -> Response {
     (
-        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::NOT_FOUND,
         Json(serde_json::json!({
-            "error": "protocol_integrations_temporarily_disabled",
-            "message": "Typed protocol routes will reopen when native AA is available on a persistent Base test network."
+            "error": "protocol_not_enabled",
+            "message": "Only the Uniswap V4 protocol routes are enabled on Arc testnet."
         })),
     )
         .into_response()
@@ -167,14 +174,44 @@ pub struct AdminAuthState {
     token: Arc<Zeroizing<String>>,
 }
 
-pub async fn validate_beta_runtime_startup(
-    engine: &ExecutionEngine,
-    config: &AppConfig,
-    payer: Address,
-) -> anyhow::Result<()> {
-    services::validate_native_aa_deployment(engine).await?;
+pub async fn validate_beta_runtime_startup(engine: &ExecutionEngine) -> anyhow::Result<()> {
     services::validate_execution_token(engine).await?;
-    services::native_payer_status(engine, payer, config.payer_low_balance_wei).await?;
+    services::arc_fee_recipient_status(engine).await?;
+    validate_protocol_deployments(engine).await?;
+    Ok(())
+}
+
+async fn validate_protocol_deployments(engine: &ExecutionEngine) -> anyhow::Result<()> {
+    if engine.config.arc_network != crate::arc::ArcNetwork::Testnet {
+        return Ok(());
+    }
+    let provider = engine.provider_for_chain(&Chain::ArcTestnet)?;
+    for (name, address) in [
+        (
+            "Uniswap V4 PoolManager",
+            crate::protocols::uniswap_v4::adapter::pool_manager_address(),
+        ),
+        (
+            "Uniswap V4 Universal Router",
+            crate::protocols::uniswap_v4::adapter::universal_router_address(),
+        ),
+        (
+            "Uniswap V4 StateView",
+            crate::protocols::uniswap_v4::adapter::state_view_address(),
+        ),
+        (
+            "Uniswap V4 Quoter",
+            crate::protocols::uniswap_v4::adapter::quoter_address(),
+        ),
+        (
+            "Permit2",
+            crate::protocols::uniswap_v4::adapter::permit2_address(),
+        ),
+    ] {
+        if provider.get_code(address, None).await?.is_empty() {
+            anyhow::bail!("{name} has no code at the pinned Arc testnet address {address:?}");
+        }
+    }
     Ok(())
 }
 
@@ -289,7 +326,7 @@ pub async fn x402_execute_handler(
                     Err(error) => protocol_error_to_http(error),
                 }
             }
-            Ok(resp) => execution_response_to_http(&state, &req.chain, resp),
+            Ok(resp) => execution_response_to_http(resp),
             Err(error) => protocol_error_to_http(error),
         };
     }
@@ -356,7 +393,7 @@ pub async fn x402_execute_handler(
             &state,
             chain_id,
             &token_address,
-            &format!("{:?}", required_native_payer(&state.config)?),
+            &format!("{:?}", state.config.execution_fee_recipient),
             usd_to_raw_amount_ceil(quoted_usd, execution_token.decimals)
                 .ok_or_else(|| anyhow::anyhow!("invalid locked x402 quote amount"))?,
         );
@@ -379,18 +416,17 @@ pub async fn x402_execute_handler(
             let preflight_fee_cap = preflight
                 .max_fee_per_gas_wei
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("native preflight omitted max fee per gas"))
+                .ok_or_else(|| anyhow::anyhow!("Arc preflight omitted max fee per gas"))
                 .and_then(|raw| {
-                    U256::from_dec_str(raw).map_err(|_| {
-                        anyhow::anyhow!("native preflight returned an invalid fee cap")
-                    })
+                    U256::from_dec_str(raw)
+                        .map_err(|_| anyhow::anyhow!("Arc preflight returned an invalid fee cap"))
                 })?;
             let current_cost = state
                 .engine
-                .estimate_native_cost(&chain, preflight.gas_estimate, preflight_fee_cap, true)
+                .estimate_arc_cost(&chain, preflight.gas_estimate, preflight_fee_cap, true)
                 .await?;
             let current_amount = usd_to_raw_amount_ceil(current_cost, execution_token.decimals)
-                .ok_or_else(|| anyhow::anyhow!("invalid native preflight cost"))?;
+                .ok_or_else(|| anyhow::anyhow!("invalid Arc preflight cost"))?;
             if U256::from_dec_str(&current_amount)? > U256::from_dec_str(&expected.amount)? {
                 anyhow::bail!(
                     "x402 quote no longer covers current execution cost; request a new quote"
@@ -522,7 +558,7 @@ pub async fn x402_execute_handler(
                 Ok(value) => value,
                 Err(error) => return protocol_error_to_http(error),
             };
-            let mut response = execution_response_to_http(&state, &req.chain, execution);
+            let mut response = execution_response_to_http(execution);
             response.headers_mut().insert(
                 HeaderName::from_static(x402::PAYMENT_RESPONSE_HEADER),
                 HeaderValue::from_str(&encoded).expect("base64 is a valid header value"),
@@ -559,7 +595,7 @@ async fn build_x402_payment_required(
         state,
         chain_id,
         &token_address,
-        &format!("{:?}", required_native_payer(&state.config)?),
+        &format!("{:?}", state.config.execution_fee_recipient),
         amount,
     )];
     let mut extensions = serde_json::Map::new();
@@ -593,16 +629,10 @@ fn x402_requirement(
     }
 }
 
-fn required_native_payer(config: &AppConfig) -> anyhow::Result<Address> {
-    config
-        .native_payer_address
-        .ok_or_else(|| anyhow::anyhow!("native payer is not initialized"))
-}
-
 fn x402_resource(state: &AppState) -> ResourceInfo {
     ResourceInfo {
         url: format!("{}/x402/execute", state.config.public_api_base_url),
-        description: "Run one Jusso payer-funded Base native-AA transaction".into(),
+        description: "Run one sponsored Jusso Arc UserOperation".into(),
         mime_type: "application/json".into(),
     }
 }
@@ -645,11 +675,7 @@ pub async fn simulate_handler(
     }
 }
 
-fn execution_response_to_http(
-    _state: &AppState,
-    _chain: &str,
-    response: ExecutionResponse,
-) -> Response {
+fn execution_response_to_http(response: ExecutionResponse) -> Response {
     let status = if response.status == ExecutionStatus::PaymentRequired {
         StatusCode::PAYMENT_REQUIRED
     } else {
@@ -661,8 +687,10 @@ fn execution_response_to_http(
 fn protocol_error_to_http(error: anyhow::Error) -> Response {
     error!(%error, "execution request failed");
     let message = error.to_string();
-    let status = if message.contains("idempotency key was already used") {
+    let status = if message.contains("idempotency key") {
         StatusCode::CONFLICT
+    } else if message.contains("authorization policy") {
+        StatusCode::FORBIDDEN
     } else if [
         "unsupported",
         "required",
@@ -682,6 +710,153 @@ fn protocol_error_to_http(error: anyhow::Error) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR
     };
     (status, Json(serde_json::json!({"error": message}))).into_response()
+}
+
+async fn existing_protocol_execution_response(
+    state: &AppState,
+    auth_context: &AuthContext,
+    agent_id: &str,
+    idempotency_key: &str,
+) -> anyhow::Result<Option<Response>> {
+    Ok(services::handle_existing_protocol_execution(
+        &state.engine,
+        &state.db_pool,
+        auth_context,
+        agent_id,
+        idempotency_key,
+    )
+    .await?
+    .map(execution_response_to_http))
+}
+
+pub async fn uniswap_v4_swap_handler(
+    State(state): State<AppState>,
+    Extension(auth_context): Extension<AuthContext>,
+    headers: HeaderMap,
+    Json(request): Json<UniswapSwapRequest>,
+) -> Response {
+    let idempotency_key = match required_idempotency_key(&headers) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    match existing_protocol_execution_response(
+        &state,
+        &auth_context,
+        &request.agent_id,
+        idempotency_key,
+    )
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return protocol_error_to_http(error),
+    }
+    let mut redis = state.redis_conn.clone();
+    match uniswap_v4_service::handle_swap(
+        &state.engine,
+        &state.db_pool,
+        &mut redis,
+        &state.wallet_registry,
+        &auth_context,
+        &request,
+        idempotency_key,
+    )
+    .await
+    {
+        Ok(response) => execution_response_to_http(response),
+        Err(error) if error.to_string().contains("idempotency key") => {
+            match existing_protocol_execution_response(
+                &state,
+                &auth_context,
+                &request.agent_id,
+                idempotency_key,
+            )
+            .await
+            {
+                Ok(Some(response)) => response,
+                Ok(None) => protocol_error_to_http(error),
+                Err(recovery_error) => protocol_error_to_http(recovery_error),
+            }
+        }
+        Err(error) => protocol_error_to_http(error),
+    }
+}
+
+pub async fn uniswap_v4_swap_simulate_handler(
+    State(state): State<AppState>,
+    Extension(auth_context): Extension<AuthContext>,
+    Json(request): Json<UniswapSwapRequest>,
+) -> Response {
+    match uniswap_v4_service::handle_swap_simulate(
+        &state.engine,
+        &state.db_pool,
+        &state.wallet_registry,
+        &auth_context,
+        &request,
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => protocol_error_to_http(error),
+    }
+}
+
+pub async fn uniswap_v4_quote_handler(
+    State(state): State<AppState>,
+    Extension(auth_context): Extension<AuthContext>,
+    Json(request): Json<UniswapSwapRequest>,
+) -> Response {
+    match uniswap_v4_service::handle_quote(
+        &state.engine,
+        &state.wallet_registry,
+        auth_context.organization_id,
+        &request,
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => protocol_error_to_http(error),
+    }
+}
+
+pub async fn uniswap_v4_pool_handler(
+    State(state): State<AppState>,
+    Extension(_auth_context): Extension<AuthContext>,
+    Query(query): Query<UniswapPoolQuery>,
+) -> Response {
+    match uniswap_v4_service::handle_pool(&state.engine, &query).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => protocol_error_to_http(error),
+    }
+}
+
+pub async fn uniswap_v4_pools_handler(
+    State(state): State<AppState>,
+    Extension(_auth_context): Extension<AuthContext>,
+    Query(query): Query<UniswapPoolsQuery>,
+) -> Response {
+    match uniswap_v4_service::handle_pools(&state.engine, &query).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => protocol_error_to_http(error),
+    }
+}
+
+pub async fn uniswap_v4_balances_handler(
+    State(state): State<AppState>,
+    Extension(auth_context): Extension<AuthContext>,
+    Query(query): Query<UniswapBalancesQuery>,
+) -> Response {
+    match uniswap_v4_service::handle_balances(
+        &state.engine,
+        &state.wallet_registry,
+        auth_context.organization_id,
+        &query,
+    )
+    .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => protocol_error_to_http(error),
+    }
 }
 
 // ────────────────────── GET /status/:id ──────────────────────────────
@@ -911,19 +1086,40 @@ pub async fn public_feed_handler(
 pub struct WalletQuery {
     /// The agent identifier (same as used in /execute).
     pub agent_id: String,
-    /// The blockchain to check native-account status on (default: "base").
-    #[serde(default = "default_chain")]
-    pub chain: String,
+    /// Defaults to the configured Arc network.
+    pub chain: Option<String>,
 }
 
-fn default_chain() -> String {
-    "base".to_string()
+fn wallet_error_response(error: &anyhow::Error) -> Response {
+    let message = error.to_string();
+    if message.contains("active agent is not registered") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "agent_not_found"})),
+        )
+            .into_response();
+    }
+    if message.starts_with("unsupported chain:")
+        || (message.starts_with("chain ") && message.ends_with(" is not configured"))
+        || message.starts_with("agent_id ")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": message})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "wallet_temporarily_unavailable"})),
+    )
+        .into_response()
 }
 
 /// Look up (or provision) the agent's smart wallet address.
 ///
 /// This is a lightweight, free endpoint that returns the agent's provider-backed
-/// Base account address. The agent should fund this address with whatever
+/// Arc smart-account address. The agent should fund this address with whatever
 /// tokens their strategy needs before calling `/execute`.
 ///
 /// No payment or simulation is performed.
@@ -932,30 +1128,25 @@ pub async fn wallet_handler(
     Extension(api_ctx): Extension<AuthContext>,
     Query(params): Query<WalletQuery>,
 ) -> impl IntoResponse {
-    info!(agent_id = %params.agent_id, chain = %params.chain, "GET /wallet");
+    let chain = params
+        .chain
+        .as_deref()
+        .unwrap_or(state.config.arc_network.name());
+    info!(agent_id = %params.agent_id, chain, "GET /wallet");
 
     match services::handle_get_wallet(
         &state.engine,
         &state.wallet_registry,
         api_ctx.organization_id,
         &params.agent_id,
-        &params.chain,
+        chain,
     )
     .await
     {
         Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
         Err(e) => {
             error!(error = ?e, "wallet lookup failed");
-            let err_str = e.to_string();
-            let is_client_error = err_str.contains("unsupported chain")
-                || err_str.contains("not configured")
-                || err_str.contains("agent_id");
-            let status = if is_client_error {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status, Json(serde_json::json!({ "error": err_str }))).into_response()
+            wallet_error_response(&e)
         }
     }
 }
@@ -966,40 +1157,34 @@ pub async fn wallet_handler(
 #[derive(Debug, serde::Deserialize)]
 pub struct WalletBalanceQuery {
     pub agent_id: String,
-    #[serde(default = "default_chain")]
-    pub chain: String,
+    pub chain: Option<String>,
 }
 
-/// Return native + ERC-20 token balances for the agent's smart wallet.
+/// Return the agent smart account's single Arc USDC balance.
 pub async fn wallet_balance_handler(
     State(state): State<AppState>,
     Extension(api_ctx): Extension<AuthContext>,
     Query(params): Query<WalletBalanceQuery>,
 ) -> impl IntoResponse {
-    info!(agent_id = %params.agent_id, chain = %params.chain, "GET /wallet/balance");
+    let chain = params
+        .chain
+        .as_deref()
+        .unwrap_or(state.config.arc_network.name());
+    info!(agent_id = %params.agent_id, chain, "GET /wallet/balance");
 
     match services::handle_get_wallet_balance(
         &state.engine,
         &state.wallet_registry,
         api_ctx.organization_id,
         &params.agent_id,
-        &params.chain,
+        chain,
     )
     .await
     {
         Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
         Err(e) => {
-            error!(error = %e, "wallet balance lookup failed");
-            let err_str = e.to_string();
-            let is_client_error = err_str.contains("unsupported chain")
-                || err_str.contains("not configured")
-                || err_str.contains("agent_id");
-            let status = if is_client_error {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status, Json(serde_json::json!({ "error": err_str }))).into_response()
+            error!(error = ?e, "wallet balance lookup failed");
+            wallet_error_response(&e)
         }
     }
 }
@@ -1130,14 +1315,19 @@ pub async fn self_service_registration_handler(
         .iter()
         .map(|scope| (*scope).to_string())
         .collect::<Vec<_>>();
-    let policy_actions = crate::auth::RUNTIME_SCOPES
+    let policy_actions = crate::auth::DEFAULT_POLICY_ACTIONS
         .iter()
         .map(|scope| (*scope).to_string())
+        .collect::<Vec<_>>();
+    let policy_protocols = crate::auth::SUPPORTED_PROTOCOLS
+        .iter()
+        .map(|protocol| (*protocol).to_string())
         .collect::<Vec<_>>();
     match db::create_self_service_registration(
         &state.db_pool,
         &state.config.auth_secret_encryption_key,
         db::SelfServiceRegistrationOptions {
+            chain: state.config.arc_network.name(),
             organization_name,
             display_name,
             agent_external_id: agent_id,
@@ -1145,6 +1335,8 @@ pub async fn self_service_registration_handler(
             public_jwk_thumbprint: &jwk_thumbprint,
             credential_scopes: &credential_scopes,
             policy_actions: &policy_actions,
+            policy_protocols: &policy_protocols,
+            max_execution_fee_usd: crate::auth::DEFAULT_MAX_EXECUTION_FEE_USD,
         },
     )
     .await
@@ -1239,218 +1431,6 @@ fn registration_client_fingerprint(secret: &str, ip: std::net::IpAddr) -> String
         .expect("HMAC accepts arbitrary key lengths");
     mac.update(ip.to_string().as_bytes());
     hex::encode(mac.finalize().into_bytes())
-}
-
-// ────────────────────── POST /admin/api-keys ─────────────────────────
-
-/// Request body for API key creation.
-#[derive(Debug, serde::Deserialize)]
-pub struct CreateApiKeyRequest {
-    /// Optional human-readable label for the API key.
-    pub label: Option<String>,
-    /// Existing organization to attach the credential to. Omit to create one.
-    pub organization_id: Option<Uuid>,
-    /// Existing principal in the selected organization. Omit to create one.
-    pub principal_id: Option<Uuid>,
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    #[serde(default = "default_api_key_environment")]
-    pub environment: String,
-    pub expires_at: Option<chrono::DateTime<Utc>>,
-}
-
-fn default_api_key_environment() -> String {
-    "live".into()
-}
-
-/// Create a new API key (admin-only).
-///
-/// Protected by the `BOOTSTRAP_ADMIN_TOKEN` env var — callers must send
-/// `Authorization: Bearer <token>`.  Returns the raw API key exactly once;
-/// it is never stored in plaintext.
-pub async fn create_api_key_handler(
-    State(state): State<AppState>,
-    Json(body): Json<CreateApiKeyRequest>,
-) -> impl IntoResponse {
-    info!("POST /admin/api-keys");
-    if let Err(error) = crate::auth::validate_scopes(&body.scopes) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": error.to_string()})),
-        )
-            .into_response();
-    }
-    if body
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= Utc::now())
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "expires_at must be in the future"})),
-        )
-            .into_response();
-    }
-
-    match db::create_api_key(
-        &state.db_pool,
-        &state.config.auth_secret_encryption_key,
-        db::CreateApiKeyOptions {
-            label: body.label.as_deref(),
-            organization_id: body.organization_id,
-            principal_id: body.principal_id,
-            scopes: &body.scopes,
-            environment: &body.environment,
-            expires_at: body.expires_at,
-        },
-    )
-    .await
-    {
-        Ok((row, raw_key, webhook_secret)) => {
-            info!(api_key_id = %row.id, "new API key created");
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({
-                    "api_key_id": row.id,
-                    "organization_id": row.organization_id,
-                    "principal_id": row.principal_id,
-                    "api_key": raw_key,
-                    "key_prefix": row.key_prefix,
-                    "label": row.label,
-                    "scopes": row.scopes,
-                    "environment": row.environment,
-                    "expires_at": row.expires_at,
-                    "webhook_signing_secret": webhook_secret,
-                    "created_at": row.created_at,
-                    "message": "Store this API key securely — it will not be shown again."
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            error!(error = %e, "failed to create API key");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "failed to create API key" })),
-            )
-                .into_response()
-        }
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct ListApiKeysQuery {
-    pub organization_id: Uuid,
-}
-
-pub async fn list_api_keys_handler(
-    State(state): State<AppState>,
-    Query(query): Query<ListApiKeysQuery>,
-) -> impl IntoResponse {
-    match db::list_api_keys(&state.db_pool, query.organization_id).await {
-        Ok(rows) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "api_keys": rows.into_iter().map(|row| serde_json::json!({
-                    "id": row.id,
-                    "organization_id": row.organization_id,
-                    "principal_id": row.principal_id,
-                    "key_prefix": row.key_prefix,
-                    "label": row.label,
-                    "scopes": row.scopes,
-                    "environment": row.environment,
-                    "is_active": row.is_active,
-                    "expires_at": row.expires_at,
-                    "revoked_at": row.revoked_at,
-                    "last_used_at": row.last_used_at,
-                    "created_at": row.created_at
-                })).collect::<Vec<_>>()
-            })),
-        )
-            .into_response(),
-        Err(error) => {
-            error!(%error, "failed to list API keys");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to list API keys"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-pub async fn revoke_api_key_handler(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> impl IntoResponse {
-    match db::revoke_api_key(&state.db_pool, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "API key not found or already revoked"})),
-        )
-            .into_response(),
-        Err(error) => {
-            error!(%error, "failed to revoke API key");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to revoke API key"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct RotateApiKeyRequest {
-    #[serde(default = "default_true")]
-    pub revoke_old: bool,
-    pub expires_at: Option<chrono::DateTime<Utc>>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-pub async fn rotate_api_key_handler(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(body): Json<RotateApiKeyRequest>,
-) -> impl IntoResponse {
-    match db::rotate_api_key(
-        &state.db_pool,
-        id,
-        body.revoke_old,
-        body.expires_at,
-    )
-    .await
-    {
-        Ok(Some((new_key, raw_key))) => (
-                StatusCode::CREATED,
-                Json(serde_json::json!({
-                    "api_key_id": new_key.id,
-                    "organization_id": new_key.organization_id,
-                    "principal_id": new_key.principal_id,
-                    "api_key": raw_key,
-                    "key_prefix": new_key.key_prefix,
-                    "old_api_key_revoked": body.revoke_old,
-                    "message": "The wallet namespace is unchanged. Store this key securely; it is shown once."
-                })),
-            )
-            .into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "active API key not found"})),
-        )
-            .into_response(),
-        Err(error) => {
-            error!(%error, "failed to rotate API key");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to rotate API key"})),
-            )
-                .into_response()
-        }
-    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1858,6 +1838,8 @@ pub struct CreateAuthorizationPolicyRequest {
     pub allowed_protocols: Option<Vec<String>>,
     pub allowed_actions: Option<Vec<String>>,
     pub allowed_targets: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_raw_execution: bool,
     pub max_value_wei: Option<String>,
     pub max_execution_fee_usd: Option<f64>,
 }
@@ -1867,15 +1849,6 @@ pub async fn create_authorization_policy_handler(
     Extension(context): Extension<AuthContext>,
     Json(body): Json<CreateAuthorizationPolicyRequest>,
 ) -> impl IntoResponse {
-    const CHAINS: &[&str] = &["base"];
-    const PROTOCOLS: &[&str] = &[
-        "aave-v3",
-        "balancer-v3",
-        "compound-v3",
-        "gmx-v2",
-        "morpho",
-        "uniswap-v4",
-    ];
     if body.allowed_chains.is_none()
         && body.allowed_protocols.is_none()
         && body.allowed_actions.is_none()
@@ -1891,11 +1864,12 @@ pub async fn create_authorization_policy_handler(
         )
             .into_response();
     }
-    if body
-        .allowed_chains
-        .as_ref()
-        .is_some_and(|values| values.iter().any(|value| !CHAINS.contains(&value.as_str())))
-    {
+    if body.allowed_chains.as_ref().is_some_and(|values| {
+        values.is_empty()
+            || values
+                .iter()
+                .any(|value| value != state.config.arc_network.name())
+    }) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "allowed_chains contains an unsupported chain"})),
@@ -1905,7 +1879,7 @@ pub async fn create_authorization_policy_handler(
     if body.allowed_protocols.as_ref().is_some_and(|values| {
         values
             .iter()
-            .any(|value| !PROTOCOLS.contains(&value.as_str()))
+            .any(|value| !crate::auth::SUPPORTED_PROTOCOLS.contains(&value.as_str()))
     }) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1944,6 +1918,7 @@ pub async fn create_authorization_policy_handler(
             allowed_protocols: body.allowed_protocols.as_deref(),
             allowed_actions: body.allowed_actions.as_deref(),
             allowed_targets: body.allowed_targets.as_deref(),
+            allow_raw_execution: body.allow_raw_execution,
             max_value_wei: body.max_value_wei.as_deref(),
             max_execution_fee_usd: body.max_execution_fee_usd,
         },
@@ -1985,6 +1960,7 @@ pub async fn list_authorization_policies_handler(
             "allowed_protocols": row.allowed_protocols,
             "allowed_actions": row.allowed_actions,
             "allowed_targets": row.allowed_targets,
+            "allow_raw_execution": row.allow_raw_execution,
             "max_value_wei": row.max_value_wei,
             "max_execution_fee_usd": row.max_execution_fee_usd,
             "is_active": row.is_active,
@@ -2125,20 +2101,11 @@ pub async fn revoke_federation_trust_handler(
     }
 }
 
-pub async fn payer_status_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let Some(payer) = state.config.native_payer_address else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "native payer is not initialized"})),
-        )
-            .into_response();
-    };
-    match services::native_payer_status(&state.engine, payer, state.config.payer_low_balance_wei)
-        .await
-    {
+pub async fn fee_recipient_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match services::arc_fee_recipient_status(&state.engine).await {
         Ok(status) => (StatusCode::OK, Json(status)).into_response(),
         Err(error) => {
-            error!(%error, "failed to inspect payer operations");
+            error!(%error, "failed to inspect Arc execution fee recipient");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": error.to_string()})),

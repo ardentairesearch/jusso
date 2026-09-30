@@ -1,4 +1,4 @@
-//! Uniswap V4 typed swaps and pool reads on Base Sepolia.
+//! Uniswap V4 typed swaps and pool reads on Arc.
 
 pub mod adapter;
 pub mod service;

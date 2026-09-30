@@ -1,8 +1,8 @@
 //! Provider-backed agent wallet registry.
 //!
 //! Jusso persists only provider references and public addresses. The wallet
-//! provider owns the private keys. On Base native AA, one address is both the
-//! signer and the programmable account.
+//! provider owns the private keys. This registry holds the Turnkey signer;
+//! the agent's fundable Arc smart account is resolved separately.
 
 use anyhow::{anyhow, Context, Result};
 use ethers::types::Address;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::wallet_provider::{
     deterministic_wallet_name, validate_provider_wallet, ManagedWallet, ProviderWallet,
-    WalletManager, WalletProviderKind,
+    WalletManager, WalletProviderKind, WalletScope,
 };
 
 #[derive(Clone)]
@@ -104,9 +104,12 @@ impl AgentWalletRegistry {
                 aw.address,
                 mw.id AS managed_wallet_id,
                 mw.wallet_provider,
+                mw.provider_organization_id,
                 mw.provider_wallet_id,
                 mw.provider_account_id,
                 mw.provider_external_id,
+                mw.scope_kind,
+                mw.scope_organization_id,
                 mw.address AS managed_wallet_address
             FROM agent_wallets aw
             JOIN agents a ON a.id = aw.agent_uuid
@@ -132,7 +135,10 @@ impl AgentWalletRegistry {
                 .id;
         let managed_wallet = self
             .wallet_manager
-            .get_or_create(&provider_external_id)
+            .get_or_create(
+                WalletScope::Organization(organization_id),
+                &provider_external_id,
+            )
             .await
             .context("managed wallet provisioning failed")?;
 
@@ -183,10 +189,15 @@ impl TryFrom<AgentWalletRow> for AgentWallet {
         if row.wallet_provider != WalletProviderKind::Turnkey.as_str() {
             anyhow::bail!("unsupported wallet provider in database");
         }
+        if row.scope_kind != "organization"
+            || row.scope_organization_id != Some(row.organization_id)
+        {
+            anyhow::bail!("agent wallet is bound to the wrong custody scope");
+        }
         let address: Address = row
             .address
             .parse()
-            .context("corrupt native account address in database")?;
+            .context("corrupt Turnkey signer address in database")?;
         let managed_wallet_address: Address = row
             .managed_wallet_address
             .parse()
@@ -198,6 +209,8 @@ impl TryFrom<AgentWalletRow> for AgentWallet {
             id: row.managed_wallet_id,
             provider_wallet: ProviderWallet {
                 provider: WalletProviderKind::Turnkey,
+                scope: WalletScope::Organization(row.organization_id),
+                provider_organization_id: row.provider_organization_id,
                 provider_wallet_id: row.provider_wallet_id,
                 provider_account_id: row.provider_account_id,
                 external_id: row.provider_external_id,
@@ -207,6 +220,7 @@ impl TryFrom<AgentWalletRow> for AgentWallet {
         validate_provider_wallet(
             &managed_wallet.provider_wallet,
             WalletProviderKind::Turnkey,
+            WalletScope::Organization(row.organization_id),
             &managed_wallet.provider_wallet.external_id,
         )?;
         Ok(Self {
@@ -229,9 +243,12 @@ struct AgentWalletRow {
     address: String,
     managed_wallet_id: Uuid,
     wallet_provider: String,
+    provider_organization_id: String,
     provider_wallet_id: String,
     provider_account_id: String,
     provider_external_id: String,
+    scope_kind: String,
+    scope_organization_id: Option<Uuid>,
     managed_wallet_address: String,
 }
 
@@ -264,13 +281,23 @@ mod tests {
             WalletProviderKind::Turnkey
         }
 
-        async fn find_wallet(&self, _external_id: &str) -> Result<Option<ProviderWallet>> {
+        async fn find_wallet(
+            &self,
+            _scope: WalletScope,
+            _external_id: &str,
+        ) -> Result<Option<ProviderWallet>> {
             Ok(None)
         }
 
-        async fn create_wallet(&self, external_id: &str) -> Result<ProviderWallet> {
+        async fn create_wallet(
+            &self,
+            scope: WalletScope,
+            external_id: &str,
+        ) -> Result<ProviderWallet> {
             Ok(ProviderWallet {
                 provider: WalletProviderKind::Turnkey,
+                scope,
+                provider_organization_id: "11111111-1111-1111-1111-111111111111".into(),
                 provider_wallet_id: format!("provider-wallet-{external_id}"),
                 provider_account_id: format!("provider-account-{external_id}"),
                 external_id: external_id.to_string(),
@@ -298,7 +325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provisions_and_reloads_one_organization_owned_native_account() {
+    async fn provisions_and_reloads_one_organization_owned_signer() {
         dotenvy::dotenv().ok();
         let Ok(database_url) = std::env::var("DATABASE_URL") else {
             return;

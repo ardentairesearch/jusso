@@ -9,17 +9,12 @@ use serde::{Deserialize, Serialize};
 use super::super::serde_utils::deserialize_optional_decimal;
 use crate::types::{BatchCall, ExecutionRequest};
 
-pub const MORPHO_ADDRESS: &str = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb";
-pub const DEFAULT_MARKET_ID: &str =
-    "0x6143c1e52ed45fb9a0551b349abb4a1b8c5962dd39545ac235a9c98610bf97da";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MorphoActionRequest {
     pub agent_id: String,
     #[serde(default = "default_chain")]
     pub chain: String,
-    /// Morpho Blue market ID. Defaults to Jusso's preconfigured Base Sepolia USDC/WETH 86% LLTV test market.
-    #[serde(default = "default_market_id")]
+    /// Market ID on the operator-pinned Arc Morpho deployment.
     pub market_id: String,
     /// Human-readable token amount. `max` is supported where documented.
     #[serde(default, deserialize_with = "deserialize_optional_decimal")]
@@ -40,7 +35,6 @@ pub struct MorphoActionRequest {
 pub struct MorphoMarketQuery {
     #[serde(default = "default_chain")]
     pub chain: String,
-    #[serde(default = "default_market_id")]
     pub market_id: String,
 }
 
@@ -49,7 +43,6 @@ pub struct MorphoPositionQuery {
     pub agent_id: String,
     #[serde(default = "default_chain")]
     pub chain: String,
-    #[serde(default = "default_market_id")]
     pub market_id: String,
 }
 
@@ -127,11 +120,7 @@ pub enum ResolvedAmount {
 }
 
 fn default_chain() -> String {
-    "base".to_string()
-}
-
-fn default_market_id() -> String {
-    DEFAULT_MARKET_ID.to_string()
+    "arc-testnet".to_string()
 }
 
 fn default_require_available_oracle() -> bool {
@@ -140,12 +129,6 @@ fn default_require_available_oracle() -> bool {
 
 fn default_markets_limit() -> usize {
     20
-}
-
-pub fn morpho_address() -> Address {
-    MORPHO_ADDRESS
-        .parse()
-        .expect("hardcoded Morpho address must be valid")
 }
 
 pub fn validate_action_request(req: &MorphoActionRequest) -> Result<()> {
@@ -260,12 +243,12 @@ pub fn parse_request_amount(req: &MorphoActionRequest, decimals: u8) -> Result<U
 pub fn compile_action(
     req: &MorphoActionRequest,
     action: MorphoAction,
+    morpho: Address,
     params: &MorphoMarketParams,
     wallet: Address,
     amount: ResolvedAmount,
 ) -> Result<ExecutionRequest> {
     validate_action_request(req)?;
-    let morpho = morpho_address();
     let market_tokens = market_param_tokens(params);
 
     let (target_contract, calldata, batch_calls) = match action {
@@ -401,7 +384,7 @@ pub fn compile_action(
         value: "0".to_string(),
         strategy_id: req.strategy_id.clone().or_else(|| {
             Some(format!(
-                "morpho-blue-base-sepolia-{}-{}",
+                "morpho-blue-arc-{}-{}",
                 action.slug(),
                 market_suffix
             ))
@@ -561,9 +544,9 @@ fn validate_agent_and_chain(agent_id: &str, chain: &str) -> Result<()> {
 }
 
 fn validate_chain(chain: &str) -> Result<()> {
-    if !chain.trim().eq_ignore_ascii_case("base") {
+    if !chain.trim().eq_ignore_ascii_case("arc-testnet") {
         return Err(anyhow!(
-            "Morpho Blue integration currently supports Base Sepolia only; use chain=base"
+            "Morpho Blue integration is enabled on Arc testnet only; use chain=arc-testnet"
         ));
     }
     Ok(())
@@ -676,11 +659,19 @@ fn token_uint(token: &Token) -> Result<U256> {
 mod tests {
     use super::*;
 
+    fn test_morpho() -> Address {
+        Address::from_low_u64_be(99)
+    }
+
+    fn market_id() -> String {
+        format!("{:?}", derive_market_id(&market_params()))
+    }
+
     fn request(amount: &str) -> MorphoActionRequest {
         MorphoActionRequest {
             agent_id: "agent".to_string(),
-            chain: "base".to_string(),
-            market_id: DEFAULT_MARKET_ID.to_string(),
+            chain: "arc-testnet".to_string(),
+            market_id: market_id(),
             amount: Some(amount.to_string()),
             amount_raw: None,
             strategy_id: None,
@@ -708,17 +699,17 @@ mod tests {
     }
 
     #[test]
-    fn default_market_is_usdc_weth_86_percent() {
+    fn market_id_is_derived_from_immutable_parameters() {
         let derived_id = H256::from(ethers::utils::keccak256(abi::encode(&market_param_tokens(
             &market_params(),
         ))));
-        assert_eq!(parse_market_id(DEFAULT_MARKET_ID).unwrap(), derived_id);
+        assert_eq!(parse_market_id(&market_id()).unwrap(), derived_id);
     }
 
     #[test]
     fn market_discovery_requires_a_token_filter() {
         let query = MorphoMarketsQuery {
-            chain: "base".to_string(),
+            chain: "arc-testnet".to_string(),
             loan_token: None,
             collateral_token: None,
             max_lltv_raw: None,
@@ -740,7 +731,7 @@ mod tests {
         assert_eq!(decoded, params);
         assert_eq!(
             derive_market_id(&decoded),
-            parse_market_id(DEFAULT_MARKET_ID).unwrap()
+            parse_market_id(&market_id()).unwrap()
         );
     }
 
@@ -750,6 +741,7 @@ mod tests {
         let execution = compile_action(
             &req,
             MorphoAction::SupplyCollateral,
+            test_morpho(),
             &market_params(),
             Address::from_low_u64_be(7),
             ResolvedAmount::Assets(U256::exp10(18)),
@@ -770,6 +762,7 @@ mod tests {
         let execution = compile_action(
             &req,
             MorphoAction::Repay,
+            test_morpho(),
             &market_params(),
             Address::from_low_u64_be(7),
             ResolvedAmount::Shares(U256::from(123u64)),
@@ -861,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_base_chain() {
+    fn rejects_non_arc_testnet_chain() {
         let mut req = request("1");
         req.chain = "ethereum".to_string();
         assert!(validate_action_request(&req).is_err());
@@ -878,6 +871,7 @@ mod tests {
     fn action_request_accepts_numeric_human_amounts() {
         let integer: MorphoActionRequest = serde_json::from_value(serde_json::json!({
             "agent_id": "agent",
+            "market_id": market_id(),
             "amount": 5
         }))
         .unwrap();
@@ -885,6 +879,7 @@ mod tests {
 
         let decimal: MorphoActionRequest = serde_json::from_value(serde_json::json!({
             "agent_id": "agent",
+            "market_id": market_id(),
             "amount": 0.125,
             "min_health_factor": 1.1
         }))
@@ -897,6 +892,7 @@ mod tests {
     fn raw_amount_remains_string_only_to_preserve_precision() {
         let result = serde_json::from_value::<MorphoActionRequest>(serde_json::json!({
             "agent_id": "agent",
+            "market_id": market_id(),
             "amount_raw": 1000000
         }));
         assert!(result.is_err());
@@ -904,8 +900,9 @@ mod tests {
 
     #[test]
     fn market_id_requires_prefix_and_exact_length() {
-        assert!(parse_market_id(DEFAULT_MARKET_ID).is_ok());
-        assert!(parse_market_id(DEFAULT_MARKET_ID.trim_start_matches("0x")).is_err());
+        let market_id = market_id();
+        assert!(parse_market_id(&market_id).is_ok());
+        assert!(parse_market_id(market_id.trim_start_matches("0x")).is_err());
         assert!(parse_market_id("0x01").is_err());
     }
 }

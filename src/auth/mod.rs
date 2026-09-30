@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::{
     db,
-    types::{AuthContext, BatchCall, CredentialKind},
+    types::{AuthContext, BatchCall, CredentialKind, ExecutionRequest},
 };
 
 pub const RUNTIME_SCOPES: &[&str] = &[
@@ -36,6 +36,21 @@ pub const RUNTIME_SCOPES: &[&str] = &[
     "transaction:simulate",
     "transaction:execute",
 ];
+
+pub const SUPPORTED_PROTOCOLS: &[&str] = &["uniswap-v4"];
+
+pub const SUPPORTED_PROTOCOL_ACTIONS: &[&str] = &["protocol:uniswap-v4:swap"];
+
+pub const DEFAULT_POLICY_ACTIONS: &[&str] = &[
+    "wallet:read",
+    "protocol:read",
+    "execution:read",
+    "transaction:simulate",
+    "transaction:execute",
+    "protocol:uniswap-v4:swap",
+];
+
+pub const DEFAULT_MAX_EXECUTION_FEE_USD: f64 = 1.0;
 
 pub const MANAGEMENT_SCOPES: &[&str] = &[
     "agent:manage",
@@ -78,13 +93,67 @@ pub fn validate_runtime_scopes(scopes: &[String]) -> Result<()> {
 }
 
 pub fn validate_policy_actions(actions: &[String]) -> Result<()> {
-    if let Some(action) = actions
-        .iter()
-        .find(|action| action.as_str() != "*" && !RUNTIME_SCOPES.contains(&action.as_str()))
-    {
+    if let Some(action) = actions.iter().find(|action| {
+        action.as_str() != "*"
+            && !RUNTIME_SCOPES.contains(&action.as_str())
+            && !SUPPORTED_PROTOCOL_ACTIONS.contains(&action.as_str())
+    }) {
         anyhow::bail!("unknown runtime policy action: {action}");
     }
     Ok(())
+}
+
+/// Enforce limits that can only be evaluated after a typed protocol request
+/// has been compiled into its exact onchain calls.
+pub fn enforce_compiled_execution_limits(
+    policy: &db::models::AuthorizationPolicyRow,
+    request: &ExecutionRequest,
+) -> Result<()> {
+    let targets = request.batch_calls.as_ref().map_or_else(
+        || vec![request.target_contract.as_str()],
+        |calls| {
+            calls
+                .iter()
+                .map(|call| call.target_contract.as_str())
+                .collect()
+        },
+    );
+    if let Some(allowed) = &policy.allowed_targets {
+        for target in targets {
+            if !allowed
+                .iter()
+                .any(|candidate| candidate == "*" || candidate.eq_ignore_ascii_case(target))
+            {
+                anyhow::bail!("target contract is denied by authorization policy");
+            }
+        }
+    }
+
+    if let Some(maximum) = policy.max_value_wei.as_deref() {
+        let maximum = U256::from_dec_str(maximum)?;
+        let total = request.batch_calls.as_ref().map_or_else(
+            || parse_policy_value(&request.value),
+            |calls| {
+                calls.iter().try_fold(U256::zero(), |total, call| {
+                    total
+                        .checked_add(parse_policy_value(&call.value)?)
+                        .ok_or_else(|| anyhow!("batch value overflow"))
+                })
+            },
+        )?;
+        if total > maximum {
+            anyhow::bail!("transaction value exceeds authorization policy");
+        }
+    }
+    Ok(())
+}
+
+fn parse_policy_value(value: &str) -> Result<U256> {
+    if value.is_empty() {
+        Ok(U256::zero())
+    } else {
+        U256::from_dec_str(value).map_err(Into::into)
+    }
 }
 
 pub fn allowed_assertion_algorithm(algorithm: &str) -> bool {
@@ -347,43 +416,15 @@ impl AuthService {
         method: &Method,
         uri: &Uri,
     ) -> Result<AuthContext> {
-        let api_key = headers
-            .get("x-api-key")
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| !value.is_empty());
         let bearer = headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
-            .filter(|value| !value.is_empty());
-        match (api_key, bearer) {
-            (Some(_), Some(_)) => anyhow::bail!("send exactly one authentication credential"),
-            (Some(raw), None) => self.authenticate_api_key(raw).await,
-            (None, Some(token)) => {
-                let proof = dpop_header(headers)?;
-                self.authenticate_access_token(token, proof, method, uri)
-                    .await
-            }
-            (None, None) => anyhow::bail!("missing X-API-Key or Bearer access token"),
-        }
-    }
-
-    async fn authenticate_api_key(&self, raw_key: &str) -> Result<AuthContext> {
-        let row = db::get_api_key_by_raw(&self.pool, raw_key)
-            .await?
-            .ok_or_else(|| anyhow!("invalid API key"))?;
-        db::touch_api_key(&self.pool, row.id).await.ok();
-        Ok(AuthContext {
-            organization_id: row.organization_id,
-            principal_id: row.principal_id,
-            credential_id: row.id,
-            credential_kind: CredentialKind::ApiKey,
-            scopes: row.scopes.into_iter().collect(),
-            agent_id: None,
-            agent_external_id: None,
-            instance_id: None,
-            dpop_jkt: None,
-        })
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("missing Bearer access token"))?;
+        let proof = dpop_header(headers)?;
+        self.authenticate_access_token(bearer, proof, method, uri)
+            .await
     }
 
     async fn authenticate_access_token(
@@ -764,6 +805,9 @@ impl AuthService {
         input: &AuthorizationInput,
         protocol: Option<&str>,
     ) -> Result<()> {
+        if action.starts_with("transaction:") && protocol.is_none() && !policy.allow_raw_execution {
+            anyhow::bail!("raw transaction routes require an explicit policy opt-in");
+        }
         if let Some(allowed) = &policy.allowed_chains {
             if let Some(chain) = input.chain.as_deref() {
                 if !allowed
@@ -793,6 +837,18 @@ impl AuthService {
                 .any(|candidate| candidate == "*" || candidate == action)
             {
                 anyhow::bail!("action is denied by authorization policy");
+            }
+            if action == "transaction:execute" {
+                if let Some(protocol_action) = protocol_action_from_path(resource) {
+                    if !allowed
+                        .iter()
+                        .any(|candidate| candidate == "*" || candidate == protocol_action)
+                    {
+                        anyhow::bail!(
+                            "protocol action requires explicit authorization: {protocol_action}"
+                        );
+                    }
+                }
             }
         }
         if let Some(allowed) = &policy.allowed_targets {
@@ -1098,16 +1154,28 @@ pub async fn authorization_middleware(
                 .into_response()
         }
     };
-    let input = if parts.method == Method::GET {
-        parts
-            .uri
-            .query()
-            .and_then(|query| serde_urlencoded::from_str::<AuthorizationInput>(query).ok())
-            .unwrap_or_default()
+    let input_result: std::result::Result<AuthorizationInput, ()> = if parts.method == Method::GET {
+        parts.uri.query().map_or_else(
+            || Ok(AuthorizationInput::default()),
+            |query| serde_urlencoded::from_str::<AuthorizationInput>(query).map_err(|_| ()),
+        )
     } else if bytes.is_empty() {
-        AuthorizationInput::default()
+        Ok(AuthorizationInput::default())
     } else {
-        serde_json::from_slice::<AuthorizationInput>(&bytes).unwrap_or_default()
+        serde_json::from_slice::<AuthorizationInput>(&bytes).map_err(|_| ())
+    };
+    let input = match input_result {
+        Ok(input) => input,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_authorization_input",
+                    "message": "request contains malformed authorization fields"
+                })),
+            )
+                .into_response()
+        }
     };
 
     if !MANAGEMENT_SCOPES.contains(&required_scope) {
@@ -1221,6 +1289,13 @@ fn protocol_from_path(path: &str) -> Option<&str> {
         .filter(|protocol| !protocol.is_empty())
 }
 
+fn protocol_action_from_path(path: &str) -> Option<&'static str> {
+    match path {
+        "/protocols/uniswap-v4/swap" => Some("protocol:uniswap-v4:swap"),
+        _ => None,
+    }
+}
+
 fn scope_for(method: &Method, path: &str) -> &'static str {
     if path.starts_with("/agents") {
         "agent:manage"
@@ -1316,13 +1391,88 @@ mod tests {
         assert_eq!(scope_for(&Method::GET, "/wallet"), "wallet:read");
         assert_eq!(scope_for(&Method::POST, "/agents"), "agent:manage");
         assert_eq!(
-            scope_for(&Method::POST, "/protocols/aave-v3/supply/simulate"),
+            scope_for(&Method::POST, "/protocols/uniswap-v4/swap/simulate"),
             "transaction:simulate"
         );
         assert_eq!(
-            scope_for(&Method::POST, "/protocols/aave-v3/supply"),
+            scope_for(&Method::POST, "/protocols/uniswap-v4/swap"),
             "transaction:execute"
         );
+    }
+
+    #[test]
+    fn uniswap_protocol_action_is_exact() {
+        assert_eq!(
+            protocol_action_from_path("/protocols/uniswap-v4/swap"),
+            Some("protocol:uniswap-v4:swap")
+        );
+        assert_eq!(
+            protocol_action_from_path("/protocols/uniswap-v4/swap/simulate"),
+            None
+        );
+        assert_eq!(protocol_action_from_path("/protocols/morpho/borrow"), None);
+        assert!(DEFAULT_POLICY_ACTIONS.contains(&"protocol:uniswap-v4:swap"));
+    }
+
+    #[test]
+    fn compiled_protocol_calls_obey_target_and_native_value_limits() {
+        let now = Utc::now();
+        let policy = db::models::AuthorizationPolicyRow {
+            id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            name: "test".into(),
+            version: 1,
+            allowed_chains: Some(vec!["arc-testnet".into()]),
+            allowed_protocols: Some(vec!["uniswap-v4".into()]),
+            allowed_actions: Some(vec!["protocol:uniswap-v4:swap".into()]),
+            allowed_targets: Some(vec!["0x0000000000000000000000000000000000000001".into()]),
+            allow_raw_execution: false,
+            max_value_wei: Some("0".into()),
+            max_execution_fee_usd: Some(1.0),
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let allowed = ExecutionRequest {
+            agent_id: "agent-1".into(),
+            chain: "arc-testnet".into(),
+            target_contract: "0x0000000000000000000000000000000000000001".into(),
+            calldata: "0x".into(),
+            value: "0".into(),
+            strategy_id: None,
+            batch_calls: None,
+            callback_url: None,
+        };
+        assert!(enforce_compiled_execution_limits(&policy, &allowed).is_ok());
+
+        let mut denied_target = allowed.clone();
+        denied_target.target_contract = "0x0000000000000000000000000000000000000002".into();
+        assert!(enforce_compiled_execution_limits(&policy, &denied_target).is_err());
+
+        let mut denied_value = allowed;
+        denied_value.value = "1".into();
+        assert!(enforce_compiled_execution_limits(&policy, &denied_value).is_err());
+    }
+
+    #[test]
+    fn authorization_input_rejects_malformed_values_and_sums_batches() {
+        assert!(
+            serde_json::from_value::<AuthorizationInput>(serde_json::json!({
+                "agent_id": "agent-1",
+                "value": 1
+            }))
+            .is_err()
+        );
+        let input: AuthorizationInput = serde_json::from_value(serde_json::json!({
+            "agent_id": "agent-1",
+            "batch_calls": [
+                {"target_contract": "0x0000000000000000000000000000000000000001", "calldata": "0x", "value": "2"},
+                {"target_contract": "0x0000000000000000000000000000000000000002", "calldata": "0x", "value": "3"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(input.total_value().unwrap(), U256::from(5));
+        assert_eq!(input.targets().len(), 2);
     }
 
     #[test]
@@ -1375,14 +1525,19 @@ mod tests {
             .iter()
             .map(|scope| (*scope).to_string())
             .collect::<Vec<_>>();
-        let actions = RUNTIME_SCOPES
+        let actions = DEFAULT_POLICY_ACTIONS
             .iter()
             .map(|scope| (*scope).to_string())
+            .collect::<Vec<_>>();
+        let protocols = SUPPORTED_PROTOCOLS
+            .iter()
+            .map(|protocol| (*protocol).to_string())
             .collect::<Vec<_>>();
         let registration = db::create_self_service_registration(
             &pool,
             "1111111111111111111111111111111111111111111111111111111111111111",
             db::SelfServiceRegistrationOptions {
+                chain: "arc-testnet",
                 organization_name: "OAuth integration test",
                 display_name: "OAuth owner",
                 agent_external_id: &format!("oauth-agent-{}", Uuid::new_v4().simple()),
@@ -1390,6 +1545,8 @@ mod tests {
                 public_jwk_thumbprint: &thumbprint,
                 credential_scopes: &scopes,
                 policy_actions: &actions,
+                policy_protocols: &protocols,
+                max_execution_fee_usd: DEFAULT_MAX_EXECUTION_FEE_USD,
             },
         )
         .await

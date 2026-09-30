@@ -1,8 +1,4 @@
-//! Execution Engine — the brain of the platform.
-//!
-//! Orchestrates: validation → simulation → pricing → payment check → queue.
-//! Agents are identified by `agent_id` and execute through provider-backed Base
-//! native accounts.
+//! Execution request validation and Arc RPC access.
 
 pub mod pricing;
 
@@ -12,26 +8,47 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
 
+use crate::arc::{execution::ArcExecutionClient, smart_account::SmartAccountRegistry};
+use crate::arc::{quote_execution_fee_usdc_raw, ARC_MIN_GAS_PRICE_WEI};
 use crate::config::RuntimeConfig;
 use crate::types::{Chain, ExecutionRequest};
-use pricing::NativeTokenPriceCache;
 
-/// Shared state for the execution engine, holding per-chain providers
-/// and native-token/USD price caches.
+fn validate_sponsorship_budget(
+    gas_limit: U256,
+    fee_per_gas: U256,
+    max_gas_units: u64,
+    max_gas_cost_wei: U256,
+) -> Result<()> {
+    if gas_limit > U256::from(max_gas_units) {
+        return Err(anyhow!(
+            "Arc operation exceeds the sponsored gas-unit limit"
+        ));
+    }
+    let sponsored_cost = gas_limit
+        .checked_mul(fee_per_gas)
+        .ok_or_else(|| anyhow!("Arc sponsored gas cost overflow"))?;
+    if sponsored_cost > max_gas_cost_wei {
+        return Err(anyhow!(
+            "Arc operation exceeds the sponsored gas-cost limit"
+        ));
+    }
+    Ok(())
+}
+
+/// Shared state for Arc execution.
 #[derive(Clone)]
 pub struct ExecutionEngine {
     pub config: RuntimeConfig,
+    pub smart_accounts: SmartAccountRegistry,
+    pub arc_client: ArcExecutionClient,
     /// Per-chain JSON-RPC providers.
     providers: HashMap<Chain, Arc<Provider<Http>>>,
-    /// Per-chain native-token/USD price caches.
-    price_caches: HashMap<Chain, Arc<NativeTokenPriceCache>>,
 }
 
 impl ExecutionEngine {
     /// Boot the execution engine for all configured chains.
-    pub fn new(config: RuntimeConfig) -> Result<Self> {
+    pub fn new(config: RuntimeConfig, smart_accounts: SmartAccountRegistry) -> Result<Self> {
         let mut providers = HashMap::new();
-        let mut price_caches = HashMap::new();
 
         for (chain, chain_cfg) in &config.chains {
             let provider = Provider::<Http>::try_from(&chain_cfg.rpc_url)
@@ -39,20 +56,21 @@ impl ExecutionEngine {
             let provider = Arc::new(provider);
             providers.insert(chain.clone(), provider.clone());
 
-            let cache = Arc::new(NativeTokenPriceCache::new(
-                chain_cfg.price_feed_url.clone(),
-                config.price_cache_ttl_secs,
-                provider,
-            ));
-            price_caches.insert(chain.clone(), cache);
-
             info!(chain = %chain, "provider initialized");
         }
 
+        let arc_client = ArcExecutionClient::new(
+            &config.alchemy_api_key,
+            config.arc_network,
+            &config.alchemy_gas_policy_id,
+            std::time::Duration::from_secs(config.receipt_timeout_seconds),
+            config.arc_max_sponsored_gas_units,
+        )?;
         Ok(Self {
             config,
+            smart_accounts,
+            arc_client,
             providers,
-            price_caches,
         })
     }
 
@@ -62,14 +80,6 @@ impl ExecutionEngine {
             .get(chain)
             .cloned()
             .ok_or_else(|| anyhow!("chain {chain} is not configured"))
-    }
-
-    /// Resolve the price cache for a given chain.
-    pub fn price_cache_for_chain(&self, chain: &Chain) -> Result<Arc<NativeTokenPriceCache>> {
-        self.price_caches
-            .get(chain)
-            .cloned()
-            .ok_or_else(|| anyhow!("price cache not configured for chain {chain}"))
     }
 
     // ────────────────────── Validation ────────────────────────────────
@@ -93,9 +103,7 @@ impl ExecutionEngine {
         // Verify the chain is actually configured (has an RPC URL)
         if !self.providers.contains_key(&chain) {
             return Err(anyhow!(
-                "chain '{}' is recognized but not configured — set {}_RPC_URL to enable it",
-                chain,
-                chain.to_string().to_uppercase()
+                "chain '{chain}' is recognized but not configured for this Arc runtime"
             ));
         }
 
@@ -117,7 +125,7 @@ impl ExecutionEngine {
             }
             if batch_calls.len() > 16 {
                 return Err(anyhow!(
-                    "batch_calls has {} entries — max 16 protocol calls per native transaction",
+                    "batch_calls has {} entries — max 16 protocol calls per UserOperation",
                     batch_calls.len()
                 ));
             }
@@ -165,28 +173,92 @@ impl ExecutionEngine {
 
     // ────────────────────── Pricing ──────────────────────────────────
 
-    /// Price a native EIP-8130 transaction from Base RPC gas prices. The gas
-    /// The estimate already includes native-AA validation and transaction overhead.
-    /// is added here.
-    pub async fn estimate_native_cost(
+    /// Quote the sponsored Arc gas cap and platform fee in USD-denominated USDC.
+    pub async fn estimate_arc_cost(
         &self,
         chain: &Chain,
         gas_estimate: u64,
         max_fee_per_gas: U256,
         include_platform_fee: bool,
     ) -> Result<f64> {
-        let price_cache = self.price_cache_for_chain(chain)?;
-        pricing::calculate_cost(
-            max_fee_per_gas,
-            gas_estimate,
-            self.config.gas_price_markup_pct,
+        let raw = self
+            .quote_arc_fee_raw(
+                chain,
+                U256::from(gas_estimate),
+                max_fee_per_gas,
+                include_platform_fee,
+            )
+            .await?;
+        Ok(raw.as_u128() as f64 / 1_000_000.0)
+    }
+
+    pub async fn quote_arc_fee_raw(
+        &self,
+        chain: &Chain,
+        gas_limit: U256,
+        max_fee_per_gas: U256,
+        include_platform_fee: bool,
+    ) -> Result<U256> {
+        self.config.chain_config(chain)?;
+        // Alchemy's provider-sponsored Arc operations currently carry a zero
+        // signed fee cap. Price those operations from Arc's live gas market;
+        // the account still signs and submits the exact zero-fee operation.
+        let pricing_fee_per_gas = if max_fee_per_gas.is_zero() {
+            self.provider_for_chain(chain)?
+                .get_gas_price()
+                .await
+                .map_err(|error| anyhow!("failed to fetch Arc gas price: {error}"))?
+                .max(U256::from(ARC_MIN_GAS_PRICE_WEI))
+        } else {
+            max_fee_per_gas
+        };
+        validate_sponsorship_budget(
+            gas_limit,
+            pricing_fee_per_gas,
+            self.config.arc_max_sponsored_gas_units,
+            self.config.arc_max_sponsored_gas_cost_wei,
+        )?;
+        let raw = quote_execution_fee_usdc_raw(
+            gas_limit,
+            pricing_fee_per_gas,
+            self.config.gas_markup_basis_points,
             if include_platform_fee {
-                self.config.platform_fee_usd
+                self.config.platform_fee_usdc_raw
             } else {
-                0.0
+                U256::zero()
             },
-            &price_cache,
+        )?;
+        if raw > U256::from(1_000_000_000_000u64) {
+            return Err(anyhow!("Arc fee exceeds supported reporting range"));
+        }
+        Ok(raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sponsorship_budget_enforces_units_cost_and_overflow() {
+        let max_cost = U256::from(100_000u64);
+        assert!(validate_sponsorship_budget(
+            U256::from(100u64),
+            U256::from(1_000u64),
+            100,
+            max_cost
         )
-        .await
+        .is_ok());
+        assert!(
+            validate_sponsorship_budget(U256::from(101u64), U256::one(), 100, max_cost).is_err()
+        );
+        assert!(validate_sponsorship_budget(
+            U256::from(100u64),
+            U256::from(1_001u64),
+            100,
+            max_cost
+        )
+        .is_err());
+        assert!(validate_sponsorship_budget(U256::MAX, U256::MAX, u64::MAX, U256::MAX).is_err());
     }
 }

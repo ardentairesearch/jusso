@@ -393,7 +393,7 @@ async fn finish_onboarding(
     )?;
     let wallet = json_response(
         http.get(format!("{api_url}{wallet_path}"))
-            .query(&[("agent_id", agent_id.as_str()), ("chain", "base")])
+            .query(&[("agent_id", agent_id.as_str())])
             .header("Authorization", format!("Bearer {access_token}"))
             .header("DPoP", wallet_dpop)
             .send()

@@ -1,4 +1,4 @@
-//! Uniswap V4 typed single-pool swap adapter for Base Sepolia.
+//! Uniswap V4 typed single-pool swap adapter for Arc.
 
 use anyhow::{anyhow, Result};
 use ethers::abi::{self, ParamType, Token};
@@ -8,15 +8,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{BatchCall, ExecutionRequest};
 
-const POOL_MANAGER: &str = "0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408";
-const UNIVERSAL_ROUTER: &str = "0x492e6456D9528771018DeB9E87ef7750EF184104";
-const STATE_VIEW: &str = "0x571291b572Ed32ce6751a2Cb2486EbEe8DEfB9B4";
-const QUOTER: &str = "0x4A6513c898fe1B2d0E78D3b0e0A4a151589B1cBa";
+const POOL_MANAGER: &str = "0x8366a39CC670B4001A1121B8F6A443A643e40951";
+const UNIVERSAL_ROUTER: &str = "0x4fcA4a51Ab4F23A7447b3284fBd7D73289A89Fb1";
+const STATE_VIEW: &str = "0xF3334192d15450cDD385C8b70e03f9A6bD9e673B";
+const QUOTER: &str = "0x8Dc178eFB8111bb0973Dd9D722eBeFF267C98F94";
 const PERMIT2: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 const V4_SWAP_COMMAND: u8 = 0x10;
-const SWEEP_COMMAND: u8 = 0x04;
 const SWAP_EXACT_IN_SINGLE: u8 = 0x06;
 const SWAP_EXACT_OUT_SINGLE: u8 = 0x08;
 const SETTLE_ALL: u8 = 0x0c;
@@ -50,9 +49,10 @@ pub struct UniswapSwapRequest {
     pub agent_id: String,
     #[serde(default = "default_chain")]
     pub chain: String,
-    /// Input currency. Use the zero address for native ETH.
+    /// Input ERC-20 currency. Native Arc USDC input is deliberately disabled;
+    /// use its ERC-20 interface at 0x3600000000000000000000000000000000000000.
     pub token_in: String,
-    /// Output currency. Use the zero address for native ETH.
+    /// Output currency. The zero address represents native Arc USDC.
     pub token_out: String,
     /// Omit with `tick_spacing` and `hooks` to discover and select the best pool.
     #[serde(default)]
@@ -239,6 +239,11 @@ pub fn validate_swap_request(req: &UniswapSwapRequest) -> Result<()> {
         return Err(anyhow!("agent_id is required"));
     }
     validate_currency_pair(&req.token_in, &req.token_out)?;
+    if parse_address(&req.token_in, "token_in")? == Address::zero() {
+        return Err(anyhow!(
+            "native Arc USDC input is not enabled; use the USDC ERC-20 interface at 0x3600000000000000000000000000000000000000"
+        ));
+    }
     explicit_pool_key(req)?;
     parse_positive_u256(&req.amount_raw, "amount_raw")?;
     if let Some(limit) = req.limit_raw.as_deref() {
@@ -297,12 +302,10 @@ pub fn compile_swap(req: &UniswapSwapRequest) -> Result<ExecutionRequest> {
     validate_permit2_amount(max_input, "Uniswap V4 maximum input")?;
 
     let router = universal_router_address();
-    let native_input = token_in == Address::zero();
-    let refund_native = native_input && req.swap_kind == UniswapSwapKind::ExactOut;
-    let router_calldata = encode_router_execute(req, refund_native)?;
+    let router_calldata = encode_router_execute(req)?;
     let strategy_id = req.strategy_id.clone().or_else(|| {
         Some(format!(
-            "uniswap-v4-sepolia-swap-{}",
+            "uniswap-v4-arc-swap-{}",
             match req.swap_kind {
                 UniswapSwapKind::ExactIn => "exact-in",
                 UniswapSwapKind::ExactOut => "exact-out",
@@ -310,47 +313,39 @@ pub fn compile_swap(req: &UniswapSwapRequest) -> Result<ExecutionRequest> {
         ))
     });
 
-    let batch_calls = if native_input {
-        vec![BatchCall {
+    let permit2 = permit2_address();
+    let batch_calls = vec![
+        BatchCall {
+            target_contract: format!("{token_in:?}"),
+            calldata: encode_erc20_approve(permit2, U256::zero()),
+            value: "0".to_string(),
+        },
+        BatchCall {
+            target_contract: format!("{token_in:?}"),
+            calldata: encode_erc20_approve(permit2, max_input),
+            value: "0".to_string(),
+        },
+        BatchCall {
+            target_contract: format!("{permit2:?}"),
+            calldata: encode_permit2_approve(token_in, router, max_input, deadline)?,
+            value: "0".to_string(),
+        },
+        BatchCall {
             target_contract: format!("{router:?}"),
             calldata: router_calldata,
-            value: max_input.to_string(),
-        }]
-    } else {
-        let permit2 = permit2_address();
-        vec![
-            BatchCall {
-                target_contract: format!("{token_in:?}"),
-                calldata: encode_erc20_approve(permit2, U256::zero()),
-                value: "0".to_string(),
-            },
-            BatchCall {
-                target_contract: format!("{token_in:?}"),
-                calldata: encode_erc20_approve(permit2, max_input),
-                value: "0".to_string(),
-            },
-            BatchCall {
-                target_contract: format!("{permit2:?}"),
-                calldata: encode_permit2_approve(token_in, router, max_input, deadline)?,
-                value: "0".to_string(),
-            },
-            BatchCall {
-                target_contract: format!("{router:?}"),
-                calldata: router_calldata,
-                value: "0".to_string(),
-            },
-            BatchCall {
-                target_contract: format!("{permit2:?}"),
-                calldata: encode_permit2_approve(token_in, router, U256::zero(), deadline)?,
-                value: "0".to_string(),
-            },
-            BatchCall {
-                target_contract: format!("{token_in:?}"),
-                calldata: encode_erc20_approve(permit2, U256::zero()),
-                value: "0".to_string(),
-            },
-        ]
-    };
+            value: "0".to_string(),
+        },
+        BatchCall {
+            target_contract: format!("{permit2:?}"),
+            calldata: encode_permit2_approve(token_in, router, U256::zero(), deadline)?,
+            value: "0".to_string(),
+        },
+        BatchCall {
+            target_contract: format!("{token_in:?}"),
+            calldata: encode_erc20_approve(permit2, U256::zero()),
+            value: "0".to_string(),
+        },
+    ];
 
     Ok(ExecutionRequest {
         agent_id: req.agent_id.clone(),
@@ -620,7 +615,7 @@ pub fn discovered_pool_key(
     })
 }
 
-fn encode_router_execute(req: &UniswapSwapRequest, refund_native: bool) -> Result<String> {
+fn encode_router_execute(req: &UniswapSwapRequest) -> Result<String> {
     let key = request_pool_key(req)?;
     let token_in = parse_address(&req.token_in, "token_in")?;
     let token_out = parse_address(&req.token_out, "token_out")?;
@@ -637,8 +632,8 @@ fn encode_router_execute(req: &UniswapSwapRequest, refund_native: bool) -> Resul
         UniswapSwapKind::ExactOut => (SWAP_EXACT_OUT_SINGLE, amount, limit),
     };
 
-    // The deployed Universal Router uses the original V4 single-swap
-    // parameter layout, which predates the later minHopPriceX36 field.
+    // Arc's deployed Universal Router includes the per-hop price field. The
+    // quote-derived aggregate limit remains the authoritative slippage guard.
     let swap_params = abi::encode(&[
         Token::Address(key.currency0),
         Token::Address(key.currency1),
@@ -651,6 +646,7 @@ fn encode_router_execute(req: &UniswapSwapRequest, refund_native: bool) -> Resul
             UniswapSwapKind::ExactIn => limit,
             UniswapSwapKind::ExactOut => max_input,
         }),
+        Token::Uint(U256::zero()),
         Token::Bytes(parse_hex_bytes(&req.hook_data, "hook_data")?),
     ]);
     let settle_params = abi::encode(&[Token::Address(token_in), Token::Uint(max_input)]);
@@ -664,21 +660,11 @@ fn encode_router_execute(req: &UniswapSwapRequest, refund_native: bool) -> Resul
         ]),
     ]);
 
-    let mut commands = vec![V4_SWAP_COMMAND];
-    let mut inputs = vec![Token::Bytes(v4_input)];
-    if refund_native {
-        commands.push(SWEEP_COMMAND);
-        inputs.push(Token::Bytes(abi::encode(&[
-            Token::Address(Address::zero()),
-            Token::Address(Address::from_low_u64_be(1)),
-            Token::Uint(U256::zero()),
-        ])));
-    }
     Ok(encode_call(
         selector("execute(bytes,bytes[],uint256)"),
         &[
-            Token::Bytes(commands),
-            Token::Array(inputs),
+            Token::Bytes(vec![V4_SWAP_COMMAND]),
+            Token::Array(vec![Token::Bytes(v4_input)]),
             Token::Uint(U256::from(deadline)),
         ],
     ))
@@ -769,9 +755,9 @@ fn pool_key_tokens(key: PoolKey) -> Vec<Token> {
 
 fn validate_chain(chain: &str) -> Result<()> {
     match chain.trim().to_ascii_lowercase().as_str() {
-        "base" | "base-sepolia" | "base_sepolia" => Ok(()),
+        "arc-testnet" => Ok(()),
         other => Err(anyhow!(
-            "Uniswap V4 typed adapter currently supports Base Sepolia only; use chain \"base\", got \"{other}\""
+            "Uniswap V4 typed adapter is enabled on Arc testnet only; use chain \"arc-testnet\", got \"{other}\""
         )),
     }
 }
@@ -842,7 +828,7 @@ fn uint160_max() -> U256 {
 }
 
 fn default_chain() -> String {
-    "base".to_string()
+    "arc-testnet".to_string()
 }
 
 fn default_slippage_bps() -> u16 {
@@ -862,9 +848,9 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
 
-    async fn base_sepolia_rpc(method: &str, params: Value) -> Value {
+    async fn arc_testnet_rpc(method: &str, params: Value) -> Value {
         let response = reqwest::Client::new()
-            .post("https://sepolia.base.org")
+            .post("https://rpc.testnet.arc.network")
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -873,9 +859,9 @@ mod tests {
             }))
             .send()
             .await
-            .expect("Base Sepolia RPC request");
+            .expect("Arc testnet RPC request");
         assert!(response.status().is_success());
-        let body: Value = response.json().await.expect("Base Sepolia RPC JSON");
+        let body: Value = response.json().await.expect("Arc testnet RPC JSON");
         assert!(body.get("error").is_none(), "RPC error: {body}");
         body["result"].clone()
     }
@@ -883,11 +869,11 @@ mod tests {
     fn request() -> UniswapSwapRequest {
         UniswapSwapRequest {
             agent_id: "agent-1".to_string(),
-            chain: "base".to_string(),
-            token_in: zero_address(),
-            token_out: "0x5af8fb9d724518fcdc026928ed65ee84241f1871".to_string(),
-            fee: Some(10_000),
-            tick_spacing: Some(200),
+            chain: "arc-testnet".to_string(),
+            token_in: "0x3600000000000000000000000000000000000000".to_string(),
+            token_out: "0x99f5ef58ecf20f4b8ec8c4af451a74045aa40573".to_string(),
+            fee: Some(3_000),
+            tick_spacing: Some(60),
             hooks: Some(zero_address()),
             include_hooked_pools: false,
             hook_data: "0x".to_string(),
@@ -906,27 +892,27 @@ mod tests {
         let key = request_pool_key(&request()).unwrap();
         assert_eq!(
             format!("{:?}", pool_id(key)),
-            "0xac5e868201b2b743cbafe1f04dea7aae0828309c6607bc50bf4c4579fa11a6b4"
+            "0x8cc7a0e4633bfbe1d12fe0bd8b52459c830b0a9c52fdbfb06b1f2da152fd12ae"
         );
     }
 
     #[test]
-    fn base_sepolia_registry_matches_the_official_deployment() {
+    fn arc_registry_matches_the_official_deployment() {
         assert_eq!(
             format!("{:?}", pool_manager_address()),
-            "0x05e73354cfdd6745c338b50bcfdfa3aa6fa03408"
+            "0x8366a39cc670b4001a1121b8f6a443a643e40951"
         );
         assert_eq!(
             format!("{:?}", universal_router_address()),
-            "0x492e6456d9528771018deb9e87ef7750ef184104"
+            "0x4fca4a51ab4f23a7447b3284fbd7d73289a89fb1"
         );
         assert_eq!(
             format!("{:?}", state_view_address()),
-            "0x571291b572ed32ce6751a2cb2486ebee8defb9b4"
+            "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b"
         );
         assert_eq!(
             format!("{:?}", quoter_address()),
-            "0x4a6513c898fe1b2d0e78d3b0e0a4a151589b1cba"
+            "0x8dc178efb8111bb0973dd9d722ebeff267c98f94"
         );
         assert_eq!(
             format!("{:?}", permit2_address()),
@@ -935,8 +921,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires the public Base Sepolia RPC"]
-    async fn live_base_sepolia_registry_contains_contract_code() {
+    #[ignore = "requires the public Arc testnet RPC"]
+    async fn live_arc_testnet_registry_contains_contract_code() {
         for address in [
             pool_manager_address(),
             universal_router_address(),
@@ -945,7 +931,7 @@ mod tests {
             permit2_address(),
         ] {
             let code =
-                base_sepolia_rpc("eth_getCode", json!([format!("{address:?}"), "latest"])).await;
+                arc_testnet_rpc("eth_getCode", json!([format!("{address:?}"), "latest"])).await;
             assert!(
                 code.as_str().is_some_and(|value| value.len() > 2),
                 "missing contract code at {address:?}"
@@ -953,17 +939,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "requires the public Arc testnet RPC and an active pool"]
+    async fn live_arc_testnet_quoter_accepts_the_encoded_tuple() {
+        let mut req = request();
+        req.amount_raw = "1000000".to_string();
+        let calldata = encode_quote(&req).unwrap();
+        let result = arc_testnet_rpc(
+            "eth_call",
+            json!([{
+                "to": format!("{:?}", quoter_address()),
+                "data": calldata,
+            }, "latest"]),
+        )
+        .await;
+        let raw = hex::decode(
+            result
+                .as_str()
+                .expect("quoter result is hex")
+                .trim_start_matches("0x"),
+        )
+        .unwrap();
+        let (amount, gas) = decode_quote(&raw).unwrap();
+        assert!(!amount.is_zero());
+        assert!(!gas.is_zero());
+    }
+
     #[test]
-    fn compiles_native_exact_in_without_approvals() {
+    fn compiles_erc20_input_with_arc_router_layout() {
         let compiled = compile_swap(&request()).unwrap();
         let calls = compiled.batch_calls.unwrap();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 6);
         assert_eq!(
-            calls[0].target_contract,
+            calls[3].target_contract,
             format!("{:?}", universal_router_address())
         );
-        assert_eq!(calls[0].value, "1000000000000000");
-        assert!(calls[0].calldata.starts_with("0x3593564c"));
+        assert_eq!(calls[3].value, "0");
+        assert!(calls[3].calldata.starts_with("0x3593564c"));
 
         let outer = abi::decode(
             &[
@@ -971,7 +983,7 @@ mod tests {
                 ParamType::Array(Box::new(ParamType::Bytes)),
                 ParamType::Uint(256),
             ],
-            &hex::decode(&calls[0].calldata[10..]).unwrap(),
+            &hex::decode(&calls[3].calldata[10..]).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -1005,6 +1017,7 @@ mod tests {
                 ParamType::Bool,
                 ParamType::Uint(128),
                 ParamType::Uint(128),
+                ParamType::Uint(256),
                 ParamType::Bytes,
             ],
             &swap_params,
@@ -1012,7 +1025,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             decoded_swap[1].clone().into_address().unwrap(),
-            "0x5af8fb9d724518fcdc026928ed65ee84241f1871"
+            "0x99f5ef58ecf20f4b8ec8c4af451a74045aa40573"
                 .parse::<Address>()
                 .unwrap()
         );
@@ -1023,30 +1036,18 @@ mod tests {
     }
 
     #[test]
-    fn exact_output_native_input_adds_refund_command() {
+    fn rejects_native_input_until_native_value_policy_is_enabled() {
         let mut req = request();
-        req.swap_kind = UniswapSwapKind::ExactOut;
-        req.amount_raw = "100".to_string();
-        req.limit_raw = Some("1000".to_string());
-        let compiled = compile_swap(&req).unwrap();
-        let calldata = &compiled.batch_calls.unwrap()[0].calldata;
-        let decoded = abi::decode(
-            &[
-                ParamType::Bytes,
-                ParamType::Array(Box::new(ParamType::Bytes)),
-                ParamType::Uint(256),
-            ],
-            &hex::decode(&calldata[10..]).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(decoded[0].clone().into_bytes().unwrap(), vec![0x10, 0x04]);
+        req.token_in = zero_address();
+        assert!(validate_swap_request(&req)
+            .unwrap_err()
+            .to_string()
+            .contains("native Arc USDC input is not enabled"));
     }
 
     #[test]
     fn compiles_erc20_input_with_temporary_permit2_approval() {
-        let mut req = request();
-        req.token_in = "0x036cbd53842c5426634e7929541ec2318f3dcf7e".to_string();
-        req.token_out = "0x4200000000000000000000000000000000000006".to_string();
+        let req = request();
         let compiled = compile_swap(&req).unwrap();
         assert_eq!(compiled.batch_calls.unwrap().len(), 6);
     }
@@ -1058,7 +1059,7 @@ mod tests {
         assert!(validate_swap_request(&req)
             .unwrap_err()
             .to_string()
-            .contains("Base Sepolia only"));
+            .contains("Arc testnet only"));
     }
 
     #[test]
@@ -1085,8 +1086,8 @@ mod tests {
     fn deserializes_minimal_automatic_swap_request() {
         let req: UniswapSwapRequest = serde_json::from_value(serde_json::json!({
             "agent_id": "agent-1",
-            "token_in": ZERO_ADDRESS,
-            "token_out": "0x5af8fb9d724518fcdc026928ed65ee84241f1871",
+            "token_in": "0x3600000000000000000000000000000000000000",
+            "token_out": "0x99f5ef58ecf20f4b8ec8c4af451a74045aa40573",
             "amount_raw": "1000"
         }))
         .unwrap();
