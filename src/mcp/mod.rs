@@ -446,6 +446,67 @@ struct CreatePolicyApprovalParams {
     max_value_wei: Option<String>,
     /// Maximum execution fee in USDC-denominated dollars.
     max_execution_fee_usd: Option<f64>,
+    /// Token-specific raw-unit spending limits. Empty means token spending is denied.
+    #[serde(default)]
+    token_spend_limits: Vec<crate::policy::TokenSpendLimit>,
+    /// Explicit high-risk permissions such as borrowing or leverage.
+    #[serde(default)]
+    risk_permissions: Vec<String>,
+    /// Rolling budget window in seconds. Defaults to 24 hours.
+    rolling_window_seconds: Option<i64>,
+    /// Maximum cumulative execution fees in the rolling window.
+    max_rolling_execution_fee_usd: Option<f64>,
+    /// Maximum sponsored gas units in one execution.
+    max_sponsored_gas_units: Option<i64>,
+    /// Maximum sponsored gas units in the rolling window.
+    max_rolling_sponsored_gas_units: Option<i64>,
+    /// Maximum borrowed USD value in one execution.
+    max_borrowed_value_usd: Option<f64>,
+    /// Maximum borrowed USD value in the rolling window.
+    max_rolling_borrowed_value_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct UpdatePolicyApprovalParams {
+    /// Authorization policy UUID returned by list_authorization_policies.
+    policy_id: String,
+    /// Current policy version returned by list_authorization_policies.
+    expected_version: i64,
+    /// Human-readable policy name.
+    name: String,
+    /// Allowed Arc network names. Use the configured Arc network only.
+    allowed_chains: Option<Vec<String>>,
+    /// Allowed protocol identifiers, currently uniswap-v4.
+    allowed_protocols: Option<Vec<String>>,
+    /// Allowed runtime and typed protocol actions.
+    allowed_actions: Option<Vec<String>>,
+    /// Allowed EVM target addresses. A wildcard is an explicit dangerous opt-in.
+    allowed_targets: Option<Vec<String>>,
+    /// Explicitly permit raw transaction routes.
+    #[serde(default)]
+    allow_raw_execution: bool,
+    /// Maximum native value in wei.
+    max_value_wei: Option<String>,
+    /// Maximum execution fee in USDC-denominated dollars.
+    max_execution_fee_usd: Option<f64>,
+    /// Token-specific raw-unit spending limits. Empty means token spending is denied.
+    #[serde(default)]
+    token_spend_limits: Vec<crate::policy::TokenSpendLimit>,
+    /// Explicit high-risk permissions such as borrowing or leverage.
+    #[serde(default)]
+    risk_permissions: Vec<String>,
+    /// Rolling budget window in seconds.
+    rolling_window_seconds: i64,
+    /// Maximum cumulative execution fees in the rolling window.
+    max_rolling_execution_fee_usd: Option<f64>,
+    /// Maximum sponsored gas units in one execution.
+    max_sponsored_gas_units: Option<i64>,
+    /// Maximum sponsored gas units in the rolling window.
+    max_rolling_sponsored_gas_units: Option<i64>,
+    /// Maximum borrowed USD value in one execution.
+    max_borrowed_value_usd: Option<f64>,
+    /// Maximum borrowed USD value in the rolling window.
+    max_rolling_borrowed_value_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -506,6 +567,28 @@ struct RotateAgentCredentialApprovalParams {
     scopes: Vec<String>,
     /// Lifetime of the one-time enrollment token. Defaults to 15 minutes.
     enrollment_ttl_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct OwnerPasskeyEnrollmentParams {
+    /// Human-readable name for the new passkey, such as "Office laptop".
+    label: String,
+    /// Credential role: standard or recovery.
+    purpose: String,
+    /// Active passkey UUID to replace atomically after the new passkey is created.
+    replaces_passkey_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct OwnerPasskeyEnrollmentStatusParams {
+    /// Enrollment request UUID returned by request_add_or_replace_owner_passkey.
+    enrollment_request_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct RevokeOwnerPasskeyApprovalParams {
+    /// Active owner passkey UUID returned by list_owner_passkeys.
+    passkey_id: String,
 }
 
 impl ControlMcp {
@@ -607,6 +690,14 @@ impl ControlMcp {
                     "allow_raw_execution": row.allow_raw_execution,
                     "max_value_wei": row.max_value_wei,
                     "max_execution_fee_usd": row.max_execution_fee_usd,
+                    "token_spend_limits": row.token_spend_limits,
+                    "risk_permissions": row.risk_permissions,
+                    "rolling_window_seconds": row.rolling_window_seconds,
+                    "max_rolling_execution_fee_usd": row.max_rolling_execution_fee_usd,
+                    "max_sponsored_gas_units": row.max_sponsored_gas_units,
+                    "max_rolling_sponsored_gas_units": row.max_rolling_sponsored_gas_units,
+                    "max_borrowed_value_usd": row.max_borrowed_value_usd,
+                    "max_rolling_borrowed_value_usd": row.max_rolling_borrowed_value_usd,
                     "is_active": row.is_active
                 })
             })
@@ -634,7 +725,63 @@ impl ControlMcp {
                 allowed_targets: params.allowed_targets,
                 allow_raw_execution: params.allow_raw_execution,
                 max_value_wei: params.max_value_wei,
+                max_execution_fee_usd: params
+                    .max_execution_fee_usd
+                    .or(Some(crate::auth::DEFAULT_MAX_EXECUTION_FEE_USD)),
+                token_spend_limits: serde_json::to_value(params.token_spend_limits)
+                    .map_err(tool_error)?,
+                risk_permissions: params.risk_permissions,
+                rolling_window_seconds: params
+                    .rolling_window_seconds
+                    .unwrap_or(crate::auth::DEFAULT_ROLLING_WINDOW_SECONDS),
+                max_rolling_execution_fee_usd: params
+                    .max_rolling_execution_fee_usd
+                    .or(Some(crate::auth::DEFAULT_MAX_ROLLING_EXECUTION_FEE_USD)),
+                max_sponsored_gas_units: params
+                    .max_sponsored_gas_units
+                    .or(Some(crate::auth::DEFAULT_MAX_SPONSORED_GAS_UNITS)),
+                max_rolling_sponsored_gas_units: params
+                    .max_rolling_sponsored_gas_units
+                    .or(Some(crate::auth::DEFAULT_MAX_ROLLING_SPONSORED_GAS_UNITS)),
+                max_borrowed_value_usd: params.max_borrowed_value_usd.or(Some(0.0)),
+                max_rolling_borrowed_value_usd: params.max_rolling_borrowed_value_usd.or(Some(0.0)),
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Create an owner passkey approval for a full policy replacement. The expected version prevents overwriting a concurrent change, and approval revokes unsigned work pinned to the old version."
+    )]
+    async fn request_update_policy_approval(
+        &self,
+        Parameters(params): Parameters<UpdatePolicyApprovalParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "policy:manage")?;
+        self.request_owner_approval(
+            &auth,
+            db::OwnerApprovalAction::UpdatePolicy {
+                policy_id: Uuid::parse_str(&params.policy_id).map_err(tool_error)?,
+                expected_version: params.expected_version,
+                name: params.name,
+                allowed_chains: params.allowed_chains,
+                allowed_protocols: params.allowed_protocols,
+                allowed_actions: params.allowed_actions,
+                allowed_targets: params.allowed_targets,
+                allow_raw_execution: params.allow_raw_execution,
+                max_value_wei: params.max_value_wei,
                 max_execution_fee_usd: params.max_execution_fee_usd,
+                token_spend_limits: serde_json::to_value(params.token_spend_limits)
+                    .map_err(tool_error)?,
+                risk_permissions: params.risk_permissions,
+                rolling_window_seconds: params.rolling_window_seconds,
+                max_rolling_execution_fee_usd: params.max_rolling_execution_fee_usd,
+                max_sponsored_gas_units: params.max_sponsored_gas_units,
+                max_rolling_sponsored_gas_units: params.max_rolling_sponsored_gas_units,
+                max_borrowed_value_usd: params.max_borrowed_value_usd,
+                max_rolling_borrowed_value_usd: params.max_rolling_borrowed_value_usd,
             },
         )
         .await
@@ -930,9 +1077,12 @@ impl ControlMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<McpJson<serde_json::Value>, ErrorData> {
         let auth = request_auth(&context)?;
-        if !auth.allows_scope("policy:manage") && !auth.allows_scope("agent:manage") {
+        if !auth.allows_scope("policy:manage")
+            && !auth.allows_scope("agent:manage")
+            && !auth.allows_scope("credential:manage")
+        {
             return Err(tool_error(
-                "access token must grant policy:manage or agent:manage",
+                "access token must grant policy:manage, agent:manage, or credential:manage",
             ));
         }
         let id = Uuid::parse_str(&params.approval_request_id).map_err(tool_error)?;
@@ -941,6 +1091,155 @@ impl ControlMcp {
             .map_err(tool_error)?
             .ok_or_else(|| tool_error("owner approval request was not found"))?;
         json_output(approval)
+    }
+
+    #[tool(
+        description = "List the owner's passkeys and recovery readiness. Credential material is never returned."
+    )]
+    async fn list_owner_passkeys(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "credential:manage")?;
+        let rows = sqlx::query_as::<_, OwnerPasskeyView>(
+            r#"SELECT op.id, op.label, op.purpose, op.status, op.created_at,
+                      op.last_used_at, op.revoked_at,
+                      op.id = c.passkey_id AS is_current_connection
+               FROM owner_passkeys op
+               JOIN oauth_connections c ON c.id = $3
+                 AND c.organization_id = op.organization_id
+                 AND c.principal_id = op.principal_id
+               WHERE op.organization_id = $1 AND op.principal_id = $2
+               ORDER BY
+                 CASE op.status WHEN 'active' THEN 0 ELSE 1 END,
+                 op.created_at"#,
+        )
+        .bind(auth.organization_id)
+        .bind(auth.principal_id)
+        .bind(auth.credential_id)
+        .fetch_all(&self.state.db_pool)
+        .await
+        .map_err(tool_error)?;
+        let active_count = rows.iter().filter(|row| row.status == "active").count();
+        let recovery_count = rows
+            .iter()
+            .filter(|row| row.status == "active" && row.purpose == "recovery")
+            .count();
+        json_output(serde_json::json!({
+            "passkeys": rows,
+            "active_count": active_count,
+            "active_recovery_count": recovery_count,
+            "recovery_ready": recovery_count > 0
+        }))
+    }
+
+    #[tool(
+        description = "Create a 10-minute browser ceremony to add an owner passkey or atomically replace an existing one. The owner confirms with an active passkey before creating the new credential."
+    )]
+    async fn request_add_or_replace_owner_passkey(
+        &self,
+        Parameters(params): Parameters<OwnerPasskeyEnrollmentParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "credential:manage")?;
+        let replaces_passkey_id = params
+            .replaces_passkey_id
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(tool_error)?;
+        let raw_token = db::random_secret();
+        let token_hash = hex::encode(Sha256::digest(raw_token.as_bytes()));
+        let request = db::create_owner_passkey_enrollment_request(
+            &self.state.db_pool,
+            &auth,
+            db::CreateOwnerPasskeyEnrollmentOptions {
+                token_hash: &token_hash,
+                label: &params.label,
+                purpose: &params.purpose,
+                replaces_passkey_id,
+                expires_at: Utc::now() + Duration::minutes(10),
+            },
+        )
+        .await
+        .map_err(tool_error)?;
+        json_output(serde_json::json!({
+            "enrollment_request_id": request.id,
+            "status": request.status,
+            "label": request.label,
+            "purpose": request.purpose,
+            "replaces_passkey_id": request.replaces_passkey_id,
+            "expires_at": request.expires_at,
+            "enrollment_url": format!(
+                "{}/passkeys/enroll/{}",
+                self.state.config.public_api_base_url.trim_end_matches('/'),
+                raw_token
+            ),
+            "message": "Open the enrollment URL, confirm with an active owner passkey, then create the new passkey."
+        }))
+    }
+
+    #[tool(
+        description = "Check whether an owner passkey enrollment is pending, completed, or expired."
+    )]
+    async fn get_owner_passkey_enrollment_status(
+        &self,
+        Parameters(params): Parameters<OwnerPasskeyEnrollmentStatusParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "credential:manage")?;
+        let id = Uuid::parse_str(&params.enrollment_request_id).map_err(tool_error)?;
+        let request = db::get_owner_passkey_enrollment_request(&self.state.db_pool, &auth, id)
+            .await
+            .map_err(tool_error)?
+            .ok_or_else(|| tool_error("passkey enrollment request was not found"))?;
+        json_output(serde_json::json!({
+            "enrollment_request_id": request.id,
+            "status": request.status,
+            "label": request.label,
+            "purpose": request.purpose,
+            "replaces_passkey_id": request.replaces_passkey_id,
+            "created_passkey_id": request.created_passkey_id,
+            "expires_at": request.expires_at,
+            "created_at": request.created_at,
+            "completed_at": request.completed_at
+        }))
+    }
+
+    #[tool(
+        description = "Request revocation of an owner passkey. A different active owner passkey must approve it, and the final active or final recovery passkey cannot be removed."
+    )]
+    async fn request_revoke_owner_passkey_approval(
+        &self,
+        Parameters(params): Parameters<RevokeOwnerPasskeyApprovalParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "credential:manage")?;
+        let passkey_id = Uuid::parse_str(&params.passkey_id).map_err(tool_error)?;
+        let credential_id = sqlx::query_scalar::<_, String>(
+            r#"SELECT credential_id FROM owner_passkeys
+               WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+                 AND status = 'active'"#,
+        )
+        .bind(passkey_id)
+        .bind(auth.organization_id)
+        .bind(auth.principal_id)
+        .fetch_optional(&self.state.db_pool)
+        .await
+        .map_err(tool_error)?
+        .ok_or_else(|| tool_error("active owner passkey was not found"))?;
+        self.request_owner_approval(
+            &auth,
+            db::OwnerApprovalAction::RevokeOwnerPasskey {
+                passkey_id,
+                expected_credential_id: credential_id,
+            },
+        )
+        .await
     }
 
     #[tool(description = "List active and revoked remote MCP connections for this owner.")]
@@ -1011,6 +1310,18 @@ struct OAuthConnectionView {
     revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct OwnerPasskeyView {
+    id: Uuid,
+    label: String,
+    purpose: String,
+    status: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    is_current_connection: bool,
+}
+
 #[tool_handler]
 impl ServerHandler for ControlMcp {
     fn get_info(&self) -> ServerConfig {
@@ -1056,6 +1367,9 @@ mod tests {
             ControlMcp::request_create_policy_approval_tool_attr()
                 .name
                 .to_string(),
+            ControlMcp::request_update_policy_approval_tool_attr()
+                .name
+                .to_string(),
             ControlMcp::request_assign_policy_approval_tool_attr()
                 .name
                 .to_string(),
@@ -1083,6 +1397,16 @@ mod tests {
             ControlMcp::get_owner_approval_status_tool_attr()
                 .name
                 .to_string(),
+            ControlMcp::list_owner_passkeys_tool_attr().name.to_string(),
+            ControlMcp::request_add_or_replace_owner_passkey_tool_attr()
+                .name
+                .to_string(),
+            ControlMcp::get_owner_passkey_enrollment_status_tool_attr()
+                .name
+                .to_string(),
+            ControlMcp::request_revoke_owner_passkey_approval_tool_attr()
+                .name
+                .to_string(),
         ];
         assert!(runtime.iter().any(|name| name == "execute_uniswap_v4_swap"));
         assert!(control.iter().all(|name| !name.contains("execute")));
@@ -1095,6 +1419,9 @@ mod tests {
         assert!(control
             .iter()
             .any(|name| name == "get_agent_onchain_signer_rotation_status"));
+        assert!(control
+            .iter()
+            .any(|name| name == "request_revoke_owner_passkey_approval"));
         assert!(runtime.iter().all(|name| !control.contains(name)));
     }
 }

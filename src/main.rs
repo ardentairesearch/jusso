@@ -336,6 +336,22 @@ async fn main() -> anyhow::Result<()> {
             "/connect/:token/authenticate/finish",
             post(connect::authentication_finish_handler),
         )
+        .route(
+            "/passkeys/enroll/:token",
+            get(connect::owner_passkey_enrollment_page_handler),
+        )
+        .route(
+            "/passkeys/enroll/:token/authenticate/start",
+            post(connect::owner_passkey_enrollment_auth_start_handler),
+        )
+        .route(
+            "/passkeys/enroll/:token/authenticate/finish",
+            post(connect::owner_passkey_enrollment_auth_finish_handler),
+        )
+        .route(
+            "/passkeys/enroll/:token/register/finish",
+            post(connect::owner_passkey_enrollment_register_finish_handler),
+        )
         .route("/approve/:token", get(connect::owner_approval_page_handler))
         .route(
             "/approve/:token/start",

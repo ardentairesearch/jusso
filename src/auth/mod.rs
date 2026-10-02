@@ -52,6 +52,10 @@ pub const DEFAULT_POLICY_ACTIONS: &[&str] = &[
 ];
 
 pub const DEFAULT_MAX_EXECUTION_FEE_USD: f64 = 1.0;
+pub const DEFAULT_ROLLING_WINDOW_SECONDS: i64 = 86_400;
+pub const DEFAULT_MAX_ROLLING_EXECUTION_FEE_USD: f64 = 10.0;
+pub const DEFAULT_MAX_SPONSORED_GAS_UNITS: i64 = 2_000_000;
+pub const DEFAULT_MAX_ROLLING_SPONSORED_GAS_UNITS: i64 = 10_000_000;
 const OAUTH_REFRESH_TOKEN_TTL_DAYS: i64 = 30;
 
 pub const MANAGEMENT_SCOPES: &[&str] = &[
@@ -111,6 +115,8 @@ pub fn enforce_compiled_execution_limits(
     policy: &db::models::AuthorizationPolicyRow,
     request: &ExecutionRequest,
 ) -> Result<()> {
+    enforce_policy_impact(policy, &request.policy_impact)?;
+
     let targets = request.batch_calls.as_ref().map_or_else(
         || vec![request.target_contract.as_str()],
         |calls| {
@@ -147,6 +153,54 @@ pub fn enforce_compiled_execution_limits(
             anyhow::bail!("transaction value exceeds authorization policy");
         }
     }
+    Ok(())
+}
+
+pub fn enforce_policy_impact(
+    policy: &db::models::AuthorizationPolicyRow,
+    impact: &crate::policy::ExecutionPolicyImpact,
+) -> Result<()> {
+    impact.validate()?;
+    for risk in &impact.risks {
+        if !policy
+            .risk_permissions
+            .iter()
+            .any(|allowed| allowed == risk)
+        {
+            anyhow::bail!("high-risk action requires explicit policy opt-in: {risk}");
+        }
+    }
+
+    if impact.borrowed_value_usd > 0.0 {
+        let maximum = policy
+            .max_borrowed_value_usd
+            .ok_or_else(|| anyhow!("borrowing requires an explicit per-execution limit"))?;
+        if impact.borrowed_value_usd > maximum {
+            anyhow::bail!("borrowed value exceeds authorization policy");
+        }
+    }
+
+    let token_limits = crate::policy::validate_token_spend_limits(&policy.token_spend_limits)?;
+    let mut token_totals = std::collections::BTreeMap::<String, U256>::new();
+    for spend in &impact.token_spends {
+        let token = spend.token.to_ascii_lowercase();
+        let amount = U256::from_dec_str(&spend.amount_raw)?;
+        let total = token_totals.entry(token).or_default();
+        *total = total
+            .checked_add(amount)
+            .ok_or_else(|| anyhow!("token spend impact overflow"))?;
+    }
+    for (token, total) in token_totals {
+        let limit = token_limits
+            .iter()
+            .find(|limit| limit.token.eq_ignore_ascii_case(&token))
+            .or_else(|| token_limits.iter().find(|limit| limit.token == "*"))
+            .ok_or_else(|| anyhow!("token spending requires an explicit policy limit"))?;
+        if total > U256::from_dec_str(&limit.max_per_execution_raw)? {
+            anyhow::bail!("token spend exceeds per-execution authorization policy");
+        }
+    }
+
     Ok(())
 }
 
@@ -870,11 +924,29 @@ impl AuthService {
         let code_hash = hex::encode(Sha256::digest(code.as_bytes()));
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let mut transaction = self.pool.begin().await?;
+        let passkey_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT passkey_id FROM oauth_authorization_codes WHERE code_hash = $1",
+        )
+        .bind(&code_hash)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| anyhow!("authorization code is invalid"))?;
+        let active_passkey = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM owner_passkeys WHERE id = $1 AND status = 'active' FOR UPDATE",
+        )
+        .bind(passkey_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if active_passkey.is_none() {
+            anyhow::bail!("authorization code is invalid");
+        }
         let row = sqlx::query_as::<_, AuthorizationCodeRow>(
             r#"SELECT organization_id, principal_id, passkey_id, agent_id,
-                      agent_external_id,
-                      client_id, redirect_uri, code_challenge, resource, scopes, expires_at, used_at
-               FROM oauth_authorization_codes WHERE code_hash = $1 FOR UPDATE"#,
+                      agent_external_id, client_id, redirect_uri, code_challenge,
+                      resource, scopes, expires_at, used_at
+               FROM oauth_authorization_codes
+               WHERE code_hash = $1
+               FOR UPDATE"#,
         )
         .bind(&code_hash)
         .fetch_optional(&mut *transaction)
@@ -1848,6 +1920,14 @@ mod tests {
             allow_raw_execution: false,
             max_value_wei: Some("0".into()),
             max_execution_fee_usd: Some(1.0),
+            token_spend_limits: serde_json::json!([]),
+            risk_permissions: vec![],
+            rolling_window_seconds: 86_400,
+            max_rolling_execution_fee_usd: Some(10.0),
+            max_sponsored_gas_units: Some(2_000_000),
+            max_rolling_sponsored_gas_units: Some(10_000_000),
+            max_borrowed_value_usd: Some(0.0),
+            max_rolling_borrowed_value_usd: Some(0.0),
             is_active: true,
             created_at: now,
             updated_at: now,
@@ -1861,6 +1941,7 @@ mod tests {
             strategy_id: None,
             batch_calls: None,
             callback_url: None,
+            policy_impact: crate::policy::ExecutionPolicyImpact::default(),
         };
         assert!(enforce_compiled_execution_limits(&policy, &allowed).is_ok());
 
@@ -1871,6 +1952,61 @@ mod tests {
         let mut denied_value = allowed;
         denied_value.value = "1".into();
         assert!(enforce_compiled_execution_limits(&policy, &denied_value).is_err());
+    }
+
+    #[test]
+    fn policy_impacts_require_token_limits_and_explicit_risk_opt_ins() {
+        let now = Utc::now();
+        let mut policy = db::models::AuthorizationPolicyRow {
+            id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            name: "impact-test".into(),
+            version: 1,
+            allowed_chains: Some(vec!["arc-testnet".into()]),
+            allowed_protocols: Some(vec!["uniswap-v4".into()]),
+            allowed_actions: Some(vec!["protocol:uniswap-v4:swap".into()]),
+            allowed_targets: Some(vec!["*".into()]),
+            allow_raw_execution: false,
+            max_value_wei: Some("0".into()),
+            max_execution_fee_usd: Some(1.0),
+            token_spend_limits: serde_json::json!([{
+                "token": crate::policy::ARC_USDC_ADDRESS,
+                "max_per_execution_raw": "5000000",
+                "max_rolling_raw": "10000000"
+            }]),
+            risk_permissions: vec![],
+            rolling_window_seconds: 86_400,
+            max_rolling_execution_fee_usd: Some(10.0),
+            max_sponsored_gas_units: Some(2_000_000),
+            max_rolling_sponsored_gas_units: Some(10_000_000),
+            max_borrowed_value_usd: Some(100.0),
+            max_rolling_borrowed_value_usd: Some(100.0),
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let allowed = crate::policy::ExecutionPolicyImpact::uniswap_swap(
+            crate::policy::ARC_USDC_ADDRESS.parse().unwrap(),
+            U256::from(5_000_000u64),
+        );
+        assert!(enforce_policy_impact(&policy, &allowed).is_ok());
+
+        let oversized = crate::policy::ExecutionPolicyImpact::uniswap_swap(
+            crate::policy::ARC_USDC_ADDRESS.parse().unwrap(),
+            U256::from(5_000_001u64),
+        );
+        assert!(enforce_policy_impact(&policy, &oversized).is_err());
+
+        let borrowing = crate::policy::ExecutionPolicyImpact {
+            borrowed_value_usd: 1.0,
+            risks: vec![crate::policy::RISK_BORROWING.into()],
+            ..Default::default()
+        };
+        assert!(enforce_policy_impact(&policy, &borrowing).is_err());
+        policy
+            .risk_permissions
+            .push(crate::policy::RISK_BORROWING.into());
+        assert!(enforce_policy_impact(&policy, &borrowing).is_ok());
     }
 
     #[test]

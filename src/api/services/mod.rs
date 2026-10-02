@@ -252,6 +252,32 @@ async fn record_unfinished_failure(
     }
 }
 
+async fn record_policy_denial(
+    pool: &PgPool,
+    auth_context: &AuthContext,
+    agent_id: Option<Uuid>,
+    request_id: Option<Uuid>,
+    phase: &str,
+    error: &anyhow::Error,
+) {
+    let mut context = auth_context.clone();
+    context.agent_id = agent_id.or(context.agent_id);
+    db::insert_auth_audit_event(
+        pool,
+        &context,
+        "policy:enforce",
+        Some("execution"),
+        "deny",
+        serde_json::json!({
+            "phase": phase,
+            "request_id": request_id,
+            "reason": error.to_string(),
+        }),
+    )
+    .await
+    .ok();
+}
+
 enum ExecutionPayment<'a> {
     AtomicExecutionToken,
     X402Quote,
@@ -288,8 +314,19 @@ async fn handle_execution(
     } = context;
     // 1. Validate
     let chain = engine.validate(req)?;
-    let (_, policy) = db::authorize_execution_agent(pool, auth_context, &req.agent_id).await?;
-    crate::auth::enforce_compiled_execution_limits(&policy, req)?;
+    let (agent, policy) = db::authorize_execution_agent(pool, auth_context, &req.agent_id).await?;
+    if let Err(error) = crate::auth::enforce_compiled_execution_limits(&policy, req) {
+        record_policy_denial(
+            pool,
+            auth_context,
+            Some(agent.id),
+            None,
+            "compiled_execution",
+            &error,
+        )
+        .await;
+        return Err(error);
+    }
     let execution_token = engine.config.chain_config(&chain)?.execution_token.clone();
 
     // Validate callback_url if provided
@@ -556,6 +593,20 @@ async fn handle_execution(
     };
 
     db::enforce_execution_fee_policy(pool, request_id, payable_cost).await?;
+    if let Err(error) =
+        db::reserve_policy_budget(pool, request_id, payable_cost, final_sim.gas_estimate).await
+    {
+        record_policy_denial(
+            pool,
+            auth_context,
+            Some(agent.id),
+            Some(request_id),
+            "economic_budget",
+            &error,
+        )
+        .await;
+        return Err(error);
+    }
     let permit_fee_raw = atomic_execution_fee
         .as_ref()
         .map(|fee| fee.amount_raw.as_str())
@@ -1030,8 +1081,19 @@ pub async fn handle_simulate_authenticated(
     req: &ExecutionRequest,
 ) -> Result<ExecutionResponse> {
     let chain = engine.validate(req)?;
-    let (_, policy) = db::authorize_execution_agent(pool, auth_context, &req.agent_id).await?;
-    crate::auth::enforce_compiled_execution_limits(&policy, req)?;
+    let (agent, policy) = db::authorize_execution_agent(pool, auth_context, &req.agent_id).await?;
+    if let Err(error) = crate::auth::enforce_compiled_execution_limits(&policy, req) {
+        record_policy_denial(
+            pool,
+            auth_context,
+            Some(agent.id),
+            None,
+            "simulation",
+            &error,
+        )
+        .await;
+        return Err(error);
+    }
     let agent_wallet = wallet_registry
         .get_or_create(auth_context.organization_id, &req.agent_id)
         .await?;

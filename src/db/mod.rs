@@ -6,7 +6,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng as AeadOsRng},
     Aes256Gcm, Nonce,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use rand::{rngs::OsRng, RngCore};
@@ -150,6 +150,17 @@ pub async fn store_signed_user_operation_and_consume_permit(
     if consumed.rows_affected() != 1 {
         anyhow::bail!("execution permit expired or was revoked before signing completed");
     }
+    let committed = sqlx::query(
+        r#"UPDATE policy_budget_reservations
+           SET status = 'committed', committed_at = now()
+           WHERE request_id = $1 AND status = 'reserved'"#,
+    )
+    .bind(request_id)
+    .execute(&mut *transaction)
+    .await?;
+    if committed.rows_affected() != 1 {
+        anyhow::bail!("execution policy budget reservation is missing or already consumed");
+    }
     transaction.commit().await?;
     Ok(())
 }
@@ -234,10 +245,12 @@ pub struct PasskeyOwnerRegistrationOptions<'a> {
     pub organization_name: &'a str,
     pub display_name: &'a str,
     pub owner_handle: &'a str,
+    pub webauthn_user_id: Uuid,
     pub agent_external_id: &'a str,
     pub passkey_id: Uuid,
     pub credential_id: &'a str,
     pub passkey: &'a serde_json::Value,
+    pub turnkey_recovery_credential: &'a serde_json::Value,
     pub policy_actions: &'a [String],
     pub policy_protocols: &'a [String],
     pub max_execution_fee_usd: f64,
@@ -296,14 +309,16 @@ pub async fn create_passkey_owner_registration(
     .await?;
     sqlx::query(
         r#"INSERT INTO owner_accounts (
-            principal_id, organization_id, owner_handle, owner_handle_normalized, display_name
-        ) VALUES ($1, $2, $3, $4, $5)"#,
+            principal_id, organization_id, owner_handle, owner_handle_normalized,
+            display_name, webauthn_user_id
+        ) VALUES ($1, $2, $3, $4, $5, $6)"#,
     )
     .bind(principal_id)
     .bind(organization_id)
     .bind(options.owner_handle)
     .bind(normalized_handle)
     .bind(options.display_name)
+    .bind(options.webauthn_user_id)
     .execute(&mut *transaction)
     .await?;
 
@@ -312,8 +327,15 @@ pub async fn create_passkey_owner_registration(
         r#"
         INSERT INTO authorization_policies (
             id, organization_id, name, allowed_chains, allowed_protocols,
-            allowed_actions, max_value_wei, max_execution_fee_usd
-        ) VALUES ($1, $2, 'default-autonomous', $3, $4, $5, '0', $6)
+            allowed_actions, max_value_wei, max_execution_fee_usd,
+            token_spend_limits, rolling_window_seconds,
+            max_rolling_execution_fee_usd, max_sponsored_gas_units,
+            max_rolling_sponsored_gas_units, max_borrowed_value_usd,
+            max_rolling_borrowed_value_usd
+        ) VALUES (
+            $1, $2, 'default-autonomous', $3, $4, $5, '0', $6,
+            $7, $8, $9, $10, $11, 0, 0
+        )
         RETURNING *
         "#,
     )
@@ -323,6 +345,11 @@ pub async fn create_passkey_owner_registration(
     .bind(options.policy_protocols)
     .bind(options.policy_actions)
     .bind(options.max_execution_fee_usd)
+    .bind(crate::policy::default_token_spend_limits())
+    .bind(crate::auth::DEFAULT_ROLLING_WINDOW_SECONDS)
+    .bind(crate::auth::DEFAULT_MAX_ROLLING_EXECUTION_FEE_USD)
+    .bind(crate::auth::DEFAULT_MAX_SPONSORED_GAS_UNITS)
+    .bind(crate::auth::DEFAULT_MAX_ROLLING_SPONSORED_GAS_UNITS)
     .fetch_one(&mut *transaction)
     .await?;
     let agent = sqlx::query_as::<_, AgentRow>(
@@ -343,14 +370,16 @@ pub async fn create_passkey_owner_registration(
         .await?;
     sqlx::query(
         r#"INSERT INTO owner_passkeys (
-            id, organization_id, principal_id, credential_id, passkey
-        ) VALUES ($1, $2, $3, $4, $5)"#,
+            id, organization_id, principal_id, credential_id, passkey,
+            turnkey_recovery_credential
+        ) VALUES ($1, $2, $3, $4, $5, $6)"#,
     )
     .bind(options.passkey_id)
     .bind(organization_id)
     .bind(principal_id)
     .bind(options.credential_id)
     .bind(options.passkey)
+    .bind(options.turnkey_recovery_credential)
     .execute(&mut *transaction)
     .await?;
 
@@ -452,9 +481,16 @@ pub async fn create_self_service_registration(
         r#"
         INSERT INTO authorization_policies (
             id, organization_id, name, allowed_chains, allowed_protocols,
-            allowed_actions, max_value_wei, max_execution_fee_usd
+            allowed_actions, max_value_wei, max_execution_fee_usd,
+            token_spend_limits, rolling_window_seconds,
+            max_rolling_execution_fee_usd, max_sponsored_gas_units,
+            max_rolling_sponsored_gas_units, max_borrowed_value_usd,
+            max_rolling_borrowed_value_usd
         )
-        VALUES ($1, $2, 'default-autonomous', $3, $4, $5, '0', $6)
+        VALUES (
+            $1, $2, 'default-autonomous', $3, $4, $5, '0', $6,
+            $7, $8, $9, $10, $11, 0, 0
+        )
         RETURNING *
         "#,
     )
@@ -464,6 +500,11 @@ pub async fn create_self_service_registration(
     .bind(options.policy_protocols)
     .bind(options.policy_actions)
     .bind(options.max_execution_fee_usd)
+    .bind(crate::policy::default_token_spend_limits())
+    .bind(crate::auth::DEFAULT_ROLLING_WINDOW_SECONDS)
+    .bind(crate::auth::DEFAULT_MAX_ROLLING_EXECUTION_FEE_USD)
+    .bind(crate::auth::DEFAULT_MAX_SPONSORED_GAS_UNITS)
+    .bind(crate::auth::DEFAULT_MAX_ROLLING_SPONSORED_GAS_UNITS)
     .fetch_one(&mut *transaction)
     .await?;
     let agent = sqlx::query_as::<_, AgentRow>(
@@ -1059,6 +1100,547 @@ pub async fn list_authorization_policies(
     .await?)
 }
 
+pub struct CreateOwnerPasskeyEnrollmentOptions<'a> {
+    pub token_hash: &'a str,
+    pub label: &'a str,
+    pub purpose: &'a str,
+    pub replaces_passkey_id: Option<Uuid>,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub async fn create_owner_passkey_enrollment_request(
+    pool: &PgPool,
+    context: &AuthContext,
+    options: CreateOwnerPasskeyEnrollmentOptions<'_>,
+) -> Result<OwnerPasskeyEnrollmentRequestRow> {
+    if context.credential_kind != CredentialKind::OAuthSession || context.agent_id.is_some() {
+        anyhow::bail!("passkey enrollment requires an organization control OAuth session");
+    }
+    validate_passkey_label_and_purpose(options.label, options.purpose)?;
+    validate_secret_hash(options.token_hash, "passkey enrollment token")?;
+    if options.expires_at <= Utc::now() {
+        anyhow::bail!("passkey enrollment expiry must be in the future");
+    }
+    let mut transaction = pool.begin().await?;
+    lock_owner_account_tx(
+        &mut transaction,
+        context.organization_id,
+        context.principal_id,
+    )
+    .await?;
+    let connection_active: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM oauth_connections c
+               JOIN owner_accounts oa ON oa.principal_id = c.principal_id
+               JOIN principals p ON p.id = c.principal_id AND p.status = 'active'
+               JOIN organizations o ON o.id = c.organization_id AND o.status = 'active'
+               WHERE c.id = $1 AND c.organization_id = $2 AND c.principal_id = $3
+                 AND c.status = 'active' AND c.agent_id IS NULL
+           )"#,
+    )
+    .bind(context.credential_id)
+    .bind(context.organization_id)
+    .bind(context.principal_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !connection_active {
+        anyhow::bail!("active owner control connection was not found");
+    }
+    sqlx::query(
+        r#"UPDATE owner_passkey_enrollment_requests SET status = 'expired'
+           WHERE organization_id = $1 AND principal_id = $2
+             AND status = 'pending' AND expires_at <= now()"#,
+    )
+    .bind(context.organization_id)
+    .bind(context.principal_id)
+    .execute(&mut *transaction)
+    .await?;
+    let duplicate_label: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM owner_passkeys
+               WHERE organization_id = $1 AND principal_id = $2
+                 AND status = 'active' AND lower(label) = lower($3)
+                 AND id IS DISTINCT FROM $4
+           )"#,
+    )
+    .bind(context.organization_id)
+    .bind(context.principal_id)
+    .bind(options.label.trim())
+    .bind(options.replaces_passkey_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if duplicate_label {
+        anyhow::bail!("an active passkey already uses this label");
+    }
+    if let Some(replaced_id) = options.replaces_passkey_id {
+        let replaced: String = sqlx::query_scalar(
+            r#"SELECT purpose FROM owner_passkeys
+               WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+                 AND status = 'active'"#,
+        )
+        .bind(replaced_id)
+        .bind(context.organization_id)
+        .bind(context.principal_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("replacement target is not an active owner passkey"))?;
+        if replaced == "recovery" && options.purpose != "recovery" {
+            let recovery_count: i64 = sqlx::query_scalar(
+                r#"SELECT COUNT(*) FROM owner_passkeys
+                   WHERE organization_id = $1 AND principal_id = $2
+                     AND status = 'active' AND purpose = 'recovery'"#,
+            )
+            .bind(context.organization_id)
+            .bind(context.principal_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if recovery_count <= 1 {
+                anyhow::bail!(
+                    "the final recovery passkey must be replaced by another recovery passkey"
+                );
+            }
+        }
+    }
+    let request = sqlx::query_as::<_, OwnerPasskeyEnrollmentRequestRow>(
+        r#"INSERT INTO owner_passkey_enrollment_requests (
+               id, organization_id, principal_id, oauth_connection_id,
+               token_hash, label, purpose, replaces_passkey_id, expires_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           RETURNING *"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(context.organization_id)
+    .bind(context.principal_id)
+    .bind(context.credential_id)
+    .bind(options.token_hash)
+    .bind(options.label.trim())
+    .bind(options.purpose)
+    .bind(options.replaces_passkey_id)
+    .bind(options.expires_at)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(request)
+}
+
+pub async fn get_owner_passkey_enrollment_request(
+    pool: &PgPool,
+    context: &AuthContext,
+    id: Uuid,
+) -> Result<Option<OwnerPasskeyEnrollmentRequestRow>> {
+    sqlx::query(
+        r#"UPDATE owner_passkey_enrollment_requests SET status = 'expired'
+           WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+             AND status = 'pending' AND expires_at <= now()"#,
+    )
+    .bind(id)
+    .bind(context.organization_id)
+    .bind(context.principal_id)
+    .execute(pool)
+    .await?;
+    Ok(sqlx::query_as::<_, OwnerPasskeyEnrollmentRequestRow>(
+        r#"SELECT * FROM owner_passkey_enrollment_requests
+           WHERE id = $1 AND organization_id = $2 AND principal_id = $3"#,
+    )
+    .bind(id)
+    .bind(context.organization_id)
+    .bind(context.principal_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub fn validate_passkey_label_and_purpose(label: &str, purpose: &str) -> Result<()> {
+    let label = label.trim();
+    if !(1..=80).contains(&label.len()) || label.chars().any(char::is_control) {
+        anyhow::bail!("passkey label must contain 1-80 characters without control characters");
+    }
+    if !matches!(purpose, "standard" | "recovery") {
+        anyhow::bail!("passkey purpose must be standard or recovery");
+    }
+    Ok(())
+}
+
+pub async fn authenticate_owner_passkey_enrollment(
+    pool: &PgPool,
+    request_id: Uuid,
+    passkey_id: Uuid,
+    updated_passkey: &serde_json::Value,
+) -> Result<OwnerPasskeyEnrollmentRequestRow> {
+    let mut transaction = pool.begin().await?;
+    let request = sqlx::query_as::<_, OwnerPasskeyEnrollmentRequestRow>(
+        r#"SELECT * FROM owner_passkey_enrollment_requests
+           WHERE id = $1 AND status = 'pending' AND expires_at > now()
+           FOR UPDATE"#,
+    )
+    .bind(request_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("passkey enrollment is expired or no longer available"))?;
+    let updated = sqlx::query(
+        r#"UPDATE owner_passkeys SET passkey = $4, last_used_at = now(), updated_at = now()
+           WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+             AND status = 'active'"#,
+    )
+    .bind(passkey_id)
+    .bind(request.organization_id)
+    .bind(request.principal_id)
+    .bind(updated_passkey)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        anyhow::bail!("authenticated passkey is not active for this owner");
+    }
+    let request = sqlx::query_as::<_, OwnerPasskeyEnrollmentRequestRow>(
+        r#"UPDATE owner_passkey_enrollment_requests
+           SET authenticated_by_passkey_id = $2
+           WHERE id = $1 AND status = 'pending'
+             AND (
+                 authenticated_by_passkey_id IS NULL
+                 OR authenticated_by_passkey_id = $2
+             )
+           RETURNING *"#,
+    )
+    .bind(request_id)
+    .bind(passkey_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| {
+        anyhow::anyhow!("passkey enrollment is already authenticated by another owner passkey")
+    })?;
+    transaction.commit().await?;
+    Ok(request)
+}
+
+pub struct CompleteOwnerPasskeyEnrollmentOptions<'a> {
+    pub request_id: Uuid,
+    pub authenticated_by_passkey_id: Uuid,
+    pub new_passkey_id: Uuid,
+    pub credential_id: &'a str,
+    pub passkey: &'a serde_json::Value,
+    pub turnkey_recovery_credential: &'a serde_json::Value,
+}
+
+pub async fn complete_owner_passkey_enrollment(
+    pool: &PgPool,
+    options: CompleteOwnerPasskeyEnrollmentOptions<'_>,
+) -> Result<serde_json::Value> {
+    if options.credential_id.trim().is_empty() || options.credential_id.len() > 1024 {
+        anyhow::bail!("new passkey credential ID is invalid");
+    }
+    let mut transaction = pool.begin().await?;
+    let owner: (Uuid, Uuid) = sqlx::query_as(
+        r#"SELECT organization_id, principal_id
+           FROM owner_passkey_enrollment_requests
+           WHERE id = $1 AND status = 'pending' AND expires_at > now()"#,
+    )
+    .bind(options.request_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("passkey enrollment is expired or no longer available"))?;
+    lock_owner_account_tx(&mut transaction, owner.0, owner.1).await?;
+    let request = sqlx::query_as::<_, OwnerPasskeyEnrollmentRequestRow>(
+        r#"SELECT * FROM owner_passkey_enrollment_requests
+           WHERE id = $1 AND status = 'pending' AND expires_at > now()
+           FOR UPDATE"#,
+    )
+    .bind(options.request_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("passkey enrollment is expired or no longer available"))?;
+    if request.authenticated_by_passkey_id != Some(options.authenticated_by_passkey_id) {
+        anyhow::bail!("passkey enrollment was not authenticated by the expected owner passkey");
+    }
+    let approving_active = sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT id FROM owner_passkeys
+           WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+             AND status = 'active'
+           FOR UPDATE"#,
+    )
+    .bind(options.authenticated_by_passkey_id)
+    .bind(request.organization_id)
+    .bind(request.principal_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if approving_active.is_none() {
+        anyhow::bail!("authenticating owner passkey is no longer active");
+    }
+    let mut revoked_connections = 0;
+    if let Some(replaced_id) = request.replaces_passkey_id {
+        let replaced_purpose: String = sqlx::query_scalar(
+            r#"SELECT purpose FROM owner_passkeys
+               WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+                 AND status = 'active' FOR UPDATE"#,
+        )
+        .bind(replaced_id)
+        .bind(request.organization_id)
+        .bind(request.principal_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("replacement target is no longer active"))?;
+        if replaced_purpose == "recovery" && request.purpose != "recovery" {
+            let recovery_count: i64 = sqlx::query_scalar(
+                r#"SELECT COUNT(*) FROM owner_passkeys
+                   WHERE organization_id = $1 AND principal_id = $2
+                     AND status = 'active' AND purpose = 'recovery'"#,
+            )
+            .bind(request.organization_id)
+            .bind(request.principal_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if recovery_count <= 1 {
+                anyhow::bail!("replacement would remove the final recovery passkey");
+            }
+        }
+        sqlx::query(
+            r#"UPDATE owner_passkeys
+               SET status = 'revoked', revoked_by_passkey_id = $2,
+                   revoked_at = now(), updated_at = now()
+               WHERE id = $1 AND status = 'active'"#,
+        )
+        .bind(replaced_id)
+        .bind(options.authenticated_by_passkey_id)
+        .execute(&mut *transaction)
+        .await?;
+        revoked_connections = revoke_owner_sessions_tx(
+            &mut transaction,
+            request.organization_id,
+            request.principal_id,
+            replaced_id,
+        )
+        .await?;
+        sqlx::query(
+            r#"UPDATE owner_approval_requests SET status = 'expired'
+               WHERE organization_id = $1 AND principal_id = $2 AND status = 'pending'"#,
+        )
+        .bind(request.organization_id)
+        .bind(request.principal_id)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    sqlx::query(
+        r#"INSERT INTO owner_passkeys (
+               id, organization_id, principal_id, credential_id, passkey,
+               turnkey_recovery_credential, label, purpose, created_by_passkey_id
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+    )
+    .bind(options.new_passkey_id)
+    .bind(request.organization_id)
+    .bind(request.principal_id)
+    .bind(options.credential_id)
+    .bind(options.passkey)
+    .bind(options.turnkey_recovery_credential)
+    .bind(&request.label)
+    .bind(&request.purpose)
+    .bind(options.authenticated_by_passkey_id)
+    .execute(&mut *transaction)
+    .await?;
+    let completed = sqlx::query(
+        r#"UPDATE owner_passkey_enrollment_requests
+           SET status = 'completed', created_passkey_id = $2,
+               completed_at = now()
+           WHERE id = $1 AND status = 'pending'"#,
+    )
+    .bind(request.id)
+    .bind(options.new_passkey_id)
+    .execute(&mut *transaction)
+    .await?;
+    if completed.rows_affected() != 1 {
+        anyhow::bail!("passkey enrollment changed before completion");
+    }
+    let action = if request.replaces_passkey_id.is_some() {
+        "owner_passkey:replaced"
+    } else {
+        "owner_passkey:added"
+    };
+    sqlx::query(
+        r#"INSERT INTO auth_audit_events (
+               id, organization_id, principal_id, credential_id, credential_kind,
+               action, resource, decision, details
+           ) VALUES ($1, $2, $3, $4, 'oauth_session', $5, $6, 'allow', $7)"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(request.organization_id)
+    .bind(request.principal_id)
+    .bind(request.oauth_connection_id)
+    .bind(action)
+    .bind("/passkeys/enroll")
+    .bind(serde_json::json!({
+        "enrollment_request_id": request.id,
+        "new_passkey_id": options.new_passkey_id,
+        "purpose": request.purpose,
+        "replaced_passkey_id": request.replaces_passkey_id,
+        "authenticated_by_passkey_id": options.authenticated_by_passkey_id,
+        "revoked_connections": revoked_connections
+    }))
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(serde_json::json!({
+        "passkey_id": options.new_passkey_id,
+        "label": request.label,
+        "purpose": request.purpose,
+        "replaced_passkey_id": request.replaces_passkey_id,
+        "revoked_connections": revoked_connections
+    }))
+}
+
+async fn validate_owner_passkey_removal(
+    pool: &PgPool,
+    organization_id: Uuid,
+    principal_id: Uuid,
+    passkey_id: Uuid,
+) -> Result<()> {
+    let purpose: String = sqlx::query_scalar(
+        r#"SELECT purpose FROM owner_passkeys
+           WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+             AND status = 'active'"#,
+    )
+    .bind(passkey_id)
+    .bind(organization_id)
+    .bind(principal_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("active owner passkey was not found"))?;
+    let active_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM owner_passkeys
+           WHERE organization_id = $1 AND principal_id = $2 AND status = 'active'"#,
+    )
+    .bind(organization_id)
+    .bind(principal_id)
+    .fetch_one(pool)
+    .await?;
+    if active_count <= 1 {
+        anyhow::bail!("the final active owner passkey cannot be revoked");
+    }
+    if purpose == "recovery" {
+        let recovery_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM owner_passkeys
+               WHERE organization_id = $1 AND principal_id = $2
+                 AND status = 'active' AND purpose = 'recovery'"#,
+        )
+        .bind(organization_id)
+        .bind(principal_id)
+        .fetch_one(pool)
+        .await?;
+        if recovery_count <= 1 {
+            anyhow::bail!("the final recovery passkey cannot be revoked");
+        }
+    }
+    Ok(())
+}
+
+async fn lock_owner_account_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    principal_id: Uuid,
+) -> Result<()> {
+    sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT oa.principal_id FROM owner_accounts oa
+           JOIN principals p ON p.id = oa.principal_id AND p.status = 'active'
+           JOIN organizations o ON o.id = oa.organization_id AND o.status = 'active'
+           WHERE oa.principal_id = $1 AND oa.organization_id = $2
+           FOR UPDATE OF oa"#,
+    )
+    .bind(principal_id)
+    .bind(organization_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("active owner account was not found"))?;
+    Ok(())
+}
+
+async fn validate_owner_passkey_removal_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    principal_id: Uuid,
+    passkey_id: Uuid,
+    purpose: &str,
+) -> Result<()> {
+    let active_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM owner_passkeys
+           WHERE organization_id = $1 AND principal_id = $2 AND status = 'active'"#,
+    )
+    .bind(organization_id)
+    .bind(principal_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if active_count <= 1 {
+        anyhow::bail!("the final active owner passkey cannot be revoked");
+    }
+    if purpose == "recovery" {
+        let recovery_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM owner_passkeys
+               WHERE organization_id = $1 AND principal_id = $2
+                 AND status = 'active' AND purpose = 'recovery'"#,
+        )
+        .bind(organization_id)
+        .bind(principal_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if recovery_count <= 1 {
+            anyhow::bail!("the final recovery passkey cannot be revoked");
+        }
+    }
+    let target_active: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM owner_passkeys
+               WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+                 AND status = 'active'
+           )"#,
+    )
+    .bind(passkey_id)
+    .bind(organization_id)
+    .bind(principal_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !target_active {
+        anyhow::bail!("owner passkey is no longer active");
+    }
+    Ok(())
+}
+
+async fn revoke_owner_sessions_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    principal_id: Uuid,
+    revoked_passkey_id: Uuid,
+) -> Result<u64> {
+    let revoked = sqlx::query(
+        r#"UPDATE oauth_connections
+           SET status = 'revoked', revoked_at = now(), updated_at = now()
+           WHERE organization_id = $1 AND principal_id = $2 AND status = 'active'
+             AND (passkey_id = $3 OR agent_id IS NULL)"#,
+    )
+    .bind(organization_id)
+    .bind(principal_id)
+    .bind(revoked_passkey_id)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        r#"UPDATE oauth_authorization_codes SET used_at = now()
+           WHERE organization_id = $1 AND principal_id = $2 AND passkey_id = $3
+             AND used_at IS NULL"#,
+    )
+    .bind(organization_id)
+    .bind(principal_id)
+    .bind(revoked_passkey_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(revoked)
+}
+
+fn validate_secret_hash(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        anyhow::bail!("{label} hash is invalid");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OwnerApprovalAction {
@@ -1071,6 +1653,34 @@ pub enum OwnerApprovalAction {
         allow_raw_execution: bool,
         max_value_wei: Option<String>,
         max_execution_fee_usd: Option<f64>,
+        token_spend_limits: serde_json::Value,
+        risk_permissions: Vec<String>,
+        rolling_window_seconds: i64,
+        max_rolling_execution_fee_usd: Option<f64>,
+        max_sponsored_gas_units: Option<i64>,
+        max_rolling_sponsored_gas_units: Option<i64>,
+        max_borrowed_value_usd: Option<f64>,
+        max_rolling_borrowed_value_usd: Option<f64>,
+    },
+    UpdatePolicy {
+        policy_id: Uuid,
+        expected_version: i64,
+        name: String,
+        allowed_chains: Option<Vec<String>>,
+        allowed_protocols: Option<Vec<String>>,
+        allowed_actions: Option<Vec<String>>,
+        allowed_targets: Option<Vec<String>>,
+        allow_raw_execution: bool,
+        max_value_wei: Option<String>,
+        max_execution_fee_usd: Option<f64>,
+        token_spend_limits: serde_json::Value,
+        risk_permissions: Vec<String>,
+        rolling_window_seconds: i64,
+        max_rolling_execution_fee_usd: Option<f64>,
+        max_sponsored_gas_units: Option<i64>,
+        max_rolling_sponsored_gas_units: Option<i64>,
+        max_borrowed_value_usd: Option<f64>,
+        max_rolling_borrowed_value_usd: Option<f64>,
     },
     AssignPolicy {
         agent_id: Uuid,
@@ -1108,12 +1718,17 @@ pub enum OwnerApprovalAction {
         expected_smart_account_address: String,
         chain_id: i64,
     },
+    RevokeOwnerPasskey {
+        passkey_id: Uuid,
+        expected_credential_id: String,
+    },
 }
 
 impl OwnerApprovalAction {
     fn kind(&self) -> &'static str {
         match self {
             Self::CreatePolicy { .. } => "create_policy",
+            Self::UpdatePolicy { .. } => "update_policy",
             Self::AssignPolicy { .. } => "assign_policy",
             Self::RevokePolicy { .. } => "revoke_policy",
             Self::CreateAgent { .. } => "create_agent",
@@ -1121,10 +1736,19 @@ impl OwnerApprovalAction {
             Self::ReactivateAgent { .. } => "reactivate_agent",
             Self::RotateAgentCredential { .. } => "rotate_agent_credential",
             Self::RotateAgentOnchainSigner { .. } => "rotate_agent_onchain_signer",
+            Self::RevokeOwnerPasskey { .. } => "revoke_owner_passkey",
         }
     }
 
     pub fn validate(&self, expected_chain: &str) -> Result<()> {
+        if let Self::UpdatePolicy {
+            expected_version, ..
+        } = self
+        {
+            if *expected_version <= 0 {
+                anyhow::bail!("expected policy version must be positive");
+            }
+        }
         match self {
             Self::CreatePolicy {
                 name,
@@ -1132,8 +1756,36 @@ impl OwnerApprovalAction {
                 allowed_protocols,
                 allowed_actions,
                 allowed_targets,
+                allow_raw_execution,
                 max_value_wei,
                 max_execution_fee_usd,
+                token_spend_limits,
+                risk_permissions,
+                rolling_window_seconds,
+                max_rolling_execution_fee_usd,
+                max_sponsored_gas_units,
+                max_rolling_sponsored_gas_units,
+                max_borrowed_value_usd,
+                max_rolling_borrowed_value_usd,
+                ..
+            }
+            | Self::UpdatePolicy {
+                name,
+                allowed_chains,
+                allowed_protocols,
+                allowed_actions,
+                allowed_targets,
+                allow_raw_execution,
+                max_value_wei,
+                max_execution_fee_usd,
+                token_spend_limits,
+                risk_permissions,
+                rolling_window_seconds,
+                max_rolling_execution_fee_usd,
+                max_sponsored_gas_units,
+                max_rolling_sponsored_gas_units,
+                max_borrowed_value_usd,
+                max_rolling_borrowed_value_usd,
                 ..
             } => {
                 if name.trim().is_empty() || name.len() > 100 {
@@ -1145,6 +1797,13 @@ impl OwnerApprovalAction {
                     && allowed_targets.is_none()
                     && max_value_wei.is_none()
                     && max_execution_fee_usd.is_none()
+                    && token_spend_limits == &serde_json::json!([])
+                    && risk_permissions.is_empty()
+                    && max_rolling_execution_fee_usd.is_none()
+                    && max_sponsored_gas_units.is_none()
+                    && max_rolling_sponsored_gas_units.is_none()
+                    && max_borrowed_value_usd.is_none()
+                    && max_rolling_borrowed_value_usd.is_none()
                 {
                     anyhow::bail!("policy must contain at least one explicit restriction");
                 }
@@ -1182,6 +1841,78 @@ impl OwnerApprovalAction {
                 }
                 if max_execution_fee_usd.is_some_and(|value| !value.is_finite() || value < 0.0) {
                     anyhow::bail!("max_execution_fee_usd must be a non-negative finite number");
+                }
+                crate::policy::validate_token_spend_limits(token_spend_limits)?;
+                crate::policy::validate_risk_permissions(risk_permissions)?;
+                if !(60..=2_678_400).contains(rolling_window_seconds) {
+                    anyhow::bail!("rolling_window_seconds must be between 60 and 2678400");
+                }
+                validate_policy_usd_limit(
+                    "max_rolling_execution_fee_usd",
+                    *max_rolling_execution_fee_usd,
+                )?;
+                validate_policy_usd_limit("max_borrowed_value_usd", *max_borrowed_value_usd)?;
+                validate_policy_usd_limit(
+                    "max_rolling_borrowed_value_usd",
+                    *max_rolling_borrowed_value_usd,
+                )?;
+                if max_sponsored_gas_units.is_some_and(|value| value <= 0)
+                    || max_rolling_sponsored_gas_units.is_some_and(|value| value <= 0)
+                {
+                    anyhow::bail!("sponsored gas limits must be positive");
+                }
+                if let (Some(per_execution), Some(rolling)) =
+                    (max_execution_fee_usd, max_rolling_execution_fee_usd)
+                {
+                    if rolling < per_execution {
+                        anyhow::bail!(
+                            "rolling execution-fee limit is below the per-execution limit"
+                        );
+                    }
+                }
+                if let (Some(per_execution), Some(rolling)) =
+                    (max_sponsored_gas_units, max_rolling_sponsored_gas_units)
+                {
+                    if rolling < per_execution {
+                        anyhow::bail!(
+                            "rolling sponsored-gas limit is below the per-execution limit"
+                        );
+                    }
+                }
+                if let (Some(per_execution), Some(rolling)) =
+                    (max_borrowed_value_usd, max_rolling_borrowed_value_usd)
+                {
+                    if rolling < per_execution {
+                        anyhow::bail!(
+                            "rolling borrowed-value limit is below the per-execution limit"
+                        );
+                    }
+                }
+                let executes = *allow_raw_execution
+                    || allowed_actions.as_ref().is_some_and(|actions| {
+                        actions.iter().any(|action| {
+                            action == "*"
+                                || action == "transaction:execute"
+                                || action.starts_with("protocol:")
+                        })
+                    });
+                if executes
+                    && (max_execution_fee_usd.is_none()
+                        || max_rolling_execution_fee_usd.is_none()
+                        || max_sponsored_gas_units.is_none()
+                        || max_rolling_sponsored_gas_units.is_none())
+                {
+                    anyhow::bail!(
+                        "execution policies require per-execution and rolling fee/gas limits"
+                    );
+                }
+                if allowed_actions.as_ref().is_some_and(|actions| {
+                    actions
+                        .iter()
+                        .any(|action| action == "*" || action == "protocol:uniswap-v4:swap")
+                }) && crate::policy::validate_token_spend_limits(token_spend_limits)?.is_empty()
+                {
+                    anyhow::bail!("Uniswap execution requires at least one token spend limit");
                 }
             }
             Self::CreateAgent {
@@ -1233,6 +1964,14 @@ impl OwnerApprovalAction {
                     anyhow::bail!("signer rotation targets the wrong Arc network");
                 }
             }
+            Self::RevokeOwnerPasskey {
+                expected_credential_id,
+                ..
+            } => {
+                if expected_credential_id.trim().is_empty() || expected_credential_id.len() > 1024 {
+                    anyhow::bail!("expected passkey credential ID is invalid");
+                }
+            }
         }
         Ok(())
     }
@@ -1268,6 +2007,13 @@ fn validate_enrollment_request(
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
         anyhow::bail!("enrollment token hash is invalid");
+    }
+    Ok(())
+}
+
+fn validate_policy_usd_limit(name: &str, value: Option<f64>) -> Result<()> {
+    if value.is_some_and(|value| !value.is_finite() || !(0.0..=1_000_000_000.0).contains(&value)) {
+        anyhow::bail!("{name} must be a finite value between 0 and 1000000000");
     }
     Ok(())
 }
@@ -1337,7 +2083,82 @@ pub fn validate_delegated_policy(
         }
         _ => {}
     }
+    if !policy_values_are_subset(
+        Some(&child.risk_permissions),
+        Some(&parent.risk_permissions),
+        false,
+    ) {
+        anyhow::bail!("child policy enables a risk denied by its parent");
+    }
+    if child.rolling_window_seconds < parent.rolling_window_seconds {
+        anyhow::bail!("child policy cannot shorten the parent rolling window");
+    }
+    validate_delegated_optional_limit(
+        "rolling execution-fee",
+        parent.max_rolling_execution_fee_usd,
+        child.max_rolling_execution_fee_usd,
+    )?;
+    validate_delegated_optional_limit(
+        "borrowed-value",
+        parent.max_borrowed_value_usd,
+        child.max_borrowed_value_usd,
+    )?;
+    validate_delegated_optional_limit(
+        "rolling borrowed-value",
+        parent.max_rolling_borrowed_value_usd,
+        child.max_rolling_borrowed_value_usd,
+    )?;
+    validate_delegated_optional_limit(
+        "sponsored-gas",
+        parent.max_sponsored_gas_units,
+        child.max_sponsored_gas_units,
+    )?;
+    validate_delegated_optional_limit(
+        "rolling sponsored-gas",
+        parent.max_rolling_sponsored_gas_units,
+        child.max_rolling_sponsored_gas_units,
+    )?;
+
+    let parent_tokens = crate::policy::validate_token_spend_limits(&parent.token_spend_limits)?;
+    let child_tokens = crate::policy::validate_token_spend_limits(&child.token_spend_limits)?;
+    for child_limit in child_tokens {
+        let parent_limit = parent_tokens
+            .iter()
+            .find(|limit| limit.token.eq_ignore_ascii_case(&child_limit.token))
+            .or_else(|| parent_tokens.iter().find(|limit| limit.token == "*"))
+            .ok_or_else(|| anyhow::anyhow!("child policy adds token-spend authority"))?;
+        if child_limit
+            .max_per_execution_raw
+            .parse::<ethers::types::U256>()?
+            > parent_limit
+                .max_per_execution_raw
+                .parse::<ethers::types::U256>()?
+            || child_limit.max_rolling_raw.parse::<ethers::types::U256>()?
+                > parent_limit
+                    .max_rolling_raw
+                    .parse::<ethers::types::U256>()?
+        {
+            anyhow::bail!("child policy exceeds a parent token-spend limit");
+        }
+    }
     Ok(())
+}
+
+fn validate_delegated_optional_limit<T>(
+    name: &str,
+    parent: Option<T>,
+    child: Option<T>,
+) -> Result<()>
+where
+    T: PartialOrd + Copy,
+{
+    match (parent, child) {
+        (Some(_), None) => anyhow::bail!("child policy must retain the parent {name} limit"),
+        (Some(parent), Some(child)) if child > parent => {
+            anyhow::bail!("child policy exceeds the parent {name} limit")
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_bounded_policy_values(name: &str, values: Option<&[String]>) -> Result<()> {
@@ -1353,7 +2174,7 @@ fn validate_bounded_policy_values(name: &str, values: Option<&[String]>) -> Resu
 }
 
 fn policy_risk_warnings(action: &OwnerApprovalAction) -> Vec<&'static str> {
-    let OwnerApprovalAction::CreatePolicy {
+    let (OwnerApprovalAction::CreatePolicy {
         allowed_chains,
         allowed_protocols,
         allowed_actions,
@@ -1362,7 +2183,17 @@ fn policy_risk_warnings(action: &OwnerApprovalAction) -> Vec<&'static str> {
         max_value_wei,
         max_execution_fee_usd,
         ..
-    } = action
+    }
+    | OwnerApprovalAction::UpdatePolicy {
+        allowed_chains,
+        allowed_protocols,
+        allowed_actions,
+        allowed_targets,
+        allow_raw_execution,
+        max_value_wei,
+        max_execution_fee_usd,
+        ..
+    }) = action
     else {
         return Vec::new();
     };
@@ -1402,7 +2233,92 @@ fn policy_risk_warnings(action: &OwnerApprovalAction) -> Vec<&'static str> {
     if max_execution_fee_usd.is_none() {
         warnings.push("Does not set an execution-fee limit");
     }
+    if let OwnerApprovalAction::CreatePolicy {
+        token_spend_limits,
+        risk_permissions,
+        max_rolling_execution_fee_usd,
+        max_sponsored_gas_units,
+        max_rolling_sponsored_gas_units,
+        ..
+    }
+    | OwnerApprovalAction::UpdatePolicy {
+        token_spend_limits,
+        risk_permissions,
+        max_rolling_execution_fee_usd,
+        max_sponsored_gas_units,
+        max_rolling_sponsored_gas_units,
+        ..
+    } = action
+    {
+        if token_spend_limits == &serde_json::json!([]) {
+            warnings.push("Denies all token spending");
+        }
+        if !risk_permissions.is_empty() {
+            warnings.push("Enables explicitly listed high-risk actions");
+        }
+        if max_rolling_execution_fee_usd.is_none() {
+            warnings.push("Does not set a rolling execution-fee limit");
+        }
+        if max_sponsored_gas_units.is_none() || max_rolling_sponsored_gas_units.is_none() {
+            warnings.push("Does not fully limit sponsored gas");
+        }
+    }
     warnings
+}
+
+fn proposed_policy_update(
+    current: &AuthorizationPolicyRow,
+    action: &OwnerApprovalAction,
+) -> Result<AuthorizationPolicyRow> {
+    let OwnerApprovalAction::UpdatePolicy {
+        policy_id,
+        expected_version,
+        name,
+        allowed_chains,
+        allowed_protocols,
+        allowed_actions,
+        allowed_targets,
+        allow_raw_execution,
+        max_value_wei,
+        max_execution_fee_usd,
+        token_spend_limits,
+        risk_permissions,
+        rolling_window_seconds,
+        max_rolling_execution_fee_usd,
+        max_sponsored_gas_units,
+        max_rolling_sponsored_gas_units,
+        max_borrowed_value_usd,
+        max_rolling_borrowed_value_usd,
+    } = action
+    else {
+        anyhow::bail!("owner approval is not a policy update");
+    };
+    if current.id != *policy_id || current.version != *expected_version {
+        anyhow::bail!("policy changed before the update could be applied");
+    }
+    let mut proposed = current.clone();
+    proposed.name = name.trim().to_owned();
+    proposed.version = current
+        .version
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("policy version overflow"))?;
+    proposed.allowed_chains = allowed_chains.clone();
+    proposed.allowed_protocols = allowed_protocols.clone();
+    proposed.allowed_actions = allowed_actions.clone();
+    proposed.allowed_targets = allowed_targets.clone();
+    proposed.allow_raw_execution = *allow_raw_execution;
+    proposed.max_value_wei = max_value_wei.clone();
+    proposed.max_execution_fee_usd = *max_execution_fee_usd;
+    proposed.token_spend_limits = token_spend_limits.clone();
+    proposed.risk_permissions = risk_permissions.clone();
+    proposed.rolling_window_seconds = *rolling_window_seconds;
+    proposed.max_rolling_execution_fee_usd = *max_rolling_execution_fee_usd;
+    proposed.max_sponsored_gas_units = *max_sponsored_gas_units;
+    proposed.max_rolling_sponsored_gas_units = *max_rolling_sponsored_gas_units;
+    proposed.max_borrowed_value_usd = *max_borrowed_value_usd;
+    proposed.max_rolling_borrowed_value_usd = *max_rolling_borrowed_value_usd;
+    proposed.updated_at = Utc::now();
+    Ok(proposed)
 }
 
 async fn get_owner_agent_for_status(
@@ -1468,6 +2384,45 @@ async fn validate_agent_policy_assignment(
     )
     .bind(agent.id)
     .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+    for child_policy in child_policies {
+        validate_delegated_policy(proposed, &child_policy)?;
+    }
+    Ok(())
+}
+
+async fn validate_policy_update_assignments(
+    pool: &PgPool,
+    organization_id: Uuid,
+    proposed: &AuthorizationPolicyRow,
+) -> Result<()> {
+    let parent_policies = sqlx::query_as::<_, AuthorizationPolicyRow>(
+        r#"SELECT ap.* FROM agents assigned
+           JOIN agents parent ON parent.id = assigned.parent_agent_id
+           JOIN authorization_policies ap ON ap.id = parent.policy_id
+           WHERE assigned.organization_id = $1 AND assigned.policy_id = $2
+             AND assigned.status = 'active' AND parent.status = 'active'
+             AND parent.policy_id <> $2 AND ap.is_active = TRUE"#,
+    )
+    .bind(organization_id)
+    .bind(proposed.id)
+    .fetch_all(pool)
+    .await?;
+    for parent_policy in parent_policies {
+        validate_delegated_policy(&parent_policy, proposed)?;
+    }
+
+    let child_policies = sqlx::query_as::<_, AuthorizationPolicyRow>(
+        r#"SELECT ap.* FROM agents assigned
+           JOIN agents child ON child.parent_agent_id = assigned.id
+           JOIN authorization_policies ap ON ap.id = child.policy_id
+           WHERE assigned.organization_id = $1 AND assigned.policy_id = $2
+             AND assigned.status = 'active' AND child.status = 'active'
+             AND child.policy_id <> $2 AND ap.is_active = TRUE"#,
+    )
+    .bind(organization_id)
+    .bind(proposed.id)
     .fetch_all(pool)
     .await?;
     for child_policy in child_policies {
@@ -1567,6 +2522,47 @@ async fn validate_agent_policy_assignment_tx(
     Ok(())
 }
 
+async fn validate_policy_update_assignments_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    proposed: &AuthorizationPolicyRow,
+) -> Result<()> {
+    let parent_policies = sqlx::query_as::<_, AuthorizationPolicyRow>(
+        r#"SELECT ap.* FROM agents assigned
+           JOIN agents parent ON parent.id = assigned.parent_agent_id
+           JOIN authorization_policies ap ON ap.id = parent.policy_id
+           WHERE assigned.organization_id = $1 AND assigned.policy_id = $2
+             AND assigned.status = 'active' AND parent.status = 'active'
+             AND parent.policy_id <> $2 AND ap.is_active = TRUE
+           FOR UPDATE OF ap"#,
+    )
+    .bind(organization_id)
+    .bind(proposed.id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for parent_policy in parent_policies {
+        validate_delegated_policy(&parent_policy, proposed)?;
+    }
+
+    let child_policies = sqlx::query_as::<_, AuthorizationPolicyRow>(
+        r#"SELECT ap.* FROM agents assigned
+           JOIN agents child ON child.parent_agent_id = assigned.id
+           JOIN authorization_policies ap ON ap.id = child.policy_id
+           WHERE assigned.organization_id = $1 AND assigned.policy_id = $2
+             AND assigned.status = 'active' AND child.status = 'active'
+             AND child.policy_id <> $2 AND ap.is_active = TRUE
+           FOR UPDATE OF ap"#,
+    )
+    .bind(organization_id)
+    .bind(proposed.id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for child_policy in child_policies {
+        validate_delegated_policy(proposed, &child_policy)?;
+    }
+    Ok(())
+}
+
 pub async fn create_owner_approval_request(
     pool: &PgPool,
     context: &AuthContext,
@@ -1616,6 +2612,31 @@ pub async fn create_owner_approval_request(
             "proposed_policy": action,
             "warnings": policy_risk_warnings(action)
         }),
+        OwnerApprovalAction::UpdatePolicy {
+            policy_id,
+            expected_version,
+            ..
+        } => {
+            let current = get_authorization_policy(pool, context.organization_id, *policy_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("active policy was not found"))?;
+            if current.version != *expected_version {
+                anyhow::bail!("policy changed before the approval request was created");
+            }
+            let proposed = proposed_policy_update(&current, action)?;
+            validate_policy_update_assignments(pool, context.organization_id, &proposed).await?;
+            serde_json::json!({
+                "title": "Update authorization policy",
+                "current_policy": current,
+                "proposed_policy": proposed,
+                "warnings": policy_risk_warnings(action),
+                "effects": [
+                    "Increments the policy version",
+                    "Revokes unsigned execution permits from the previous version",
+                    "Releases only uncommitted budget reservations from the previous version"
+                ]
+            })
+        }
         OwnerApprovalAction::AssignPolicy {
             agent_id,
             expected_current_policy_id,
@@ -1846,6 +2867,50 @@ pub async fn create_owner_approval_request(
                 ]
             })
         }
+        OwnerApprovalAction::RevokeOwnerPasskey {
+            passkey_id,
+            expected_credential_id,
+        } => {
+            let passkey: (String, String, String, DateTime<Utc>, Option<DateTime<Utc>>) =
+                sqlx::query_as(
+                    r#"SELECT label, purpose, credential_id, created_at, last_used_at
+                       FROM owner_passkeys
+                       WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+                         AND status = 'active'"#,
+                )
+                .bind(passkey_id)
+                .bind(context.organization_id)
+                .bind(context.principal_id)
+                .fetch_optional(pool)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("active owner passkey was not found"))?;
+            if passkey.2 != *expected_credential_id {
+                anyhow::bail!("passkey changed before approval was created");
+            }
+            validate_owner_passkey_removal(
+                pool,
+                context.organization_id,
+                context.principal_id,
+                *passkey_id,
+            )
+            .await?;
+            serde_json::json!({
+                "title": "Revoke owner passkey",
+                "passkey": {
+                    "id": passkey_id,
+                    "label": passkey.0,
+                    "purpose": passkey.1,
+                    "created_at": passkey.3,
+                    "last_used_at": passkey.4
+                },
+                "effects": [
+                    "Requires a different active passkey to approve removal",
+                    "Revokes sessions created with this passkey",
+                    "Revokes active organization-control sessions and expires pending sensitive changes",
+                    "Cannot remove the final active passkey or final recovery passkey"
+                ]
+            })
+        }
     };
     let id = Uuid::new_v4();
     let payload = serde_json::to_value(action)?;
@@ -1920,6 +2985,7 @@ pub async fn complete_owner_approval(
     expected_chain: &str,
 ) -> Result<serde_json::Value> {
     let mut transaction = pool.begin().await?;
+    lock_owner_account_tx(&mut transaction, organization_id, principal_id).await?;
     let row = sqlx::query_as::<_, PendingOwnerApprovalExecution>(
         r#"SELECT organization_id, principal_id, oauth_connection_id,
                   action, payload, expires_at
@@ -1961,6 +3027,7 @@ pub async fn complete_owner_approval(
         r#"UPDATE owner_passkeys op SET passkey = $4, last_used_at = now(), updated_at = now()
            FROM principals p, organizations o
            WHERE op.id = $1 AND op.organization_id = $2 AND op.principal_id = $3
+             AND op.status = 'active'
              AND p.id = op.principal_id AND p.status = 'active'
              AND o.id = op.organization_id AND o.status = 'active'"#,
     )
@@ -1989,14 +3056,29 @@ pub async fn complete_owner_approval(
             allow_raw_execution,
             max_value_wei,
             max_execution_fee_usd,
+            token_spend_limits,
+            risk_permissions,
+            rolling_window_seconds,
+            max_rolling_execution_fee_usd,
+            max_sponsored_gas_units,
+            max_rolling_sponsored_gas_units,
+            max_borrowed_value_usd,
+            max_rolling_borrowed_value_usd,
         } => {
             let policy_id = Uuid::new_v4();
             sqlx::query(
                 r#"INSERT INTO authorization_policies (
                     id, organization_id, name, allowed_chains, allowed_protocols,
                     allowed_actions, allowed_targets, allow_raw_execution,
-                    max_value_wei, max_execution_fee_usd
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+                    max_value_wei, max_execution_fee_usd, token_spend_limits,
+                    risk_permissions, rolling_window_seconds,
+                    max_rolling_execution_fee_usd, max_sponsored_gas_units,
+                    max_rolling_sponsored_gas_units, max_borrowed_value_usd,
+                    max_rolling_borrowed_value_usd
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    $11, $12, $13, $14, $15, $16, $17, $18
+                )"#,
             )
             .bind(policy_id)
             .bind(row.organization_id)
@@ -2008,9 +3090,118 @@ pub async fn complete_owner_approval(
             .bind(allow_raw_execution)
             .bind(max_value_wei)
             .bind(max_execution_fee_usd)
+            .bind(token_spend_limits)
+            .bind(risk_permissions)
+            .bind(rolling_window_seconds)
+            .bind(max_rolling_execution_fee_usd)
+            .bind(max_sponsored_gas_units)
+            .bind(max_rolling_sponsored_gas_units)
+            .bind(max_borrowed_value_usd)
+            .bind(max_rolling_borrowed_value_usd)
             .execute(&mut *transaction)
             .await?;
             serde_json::json!({"policy_id": policy_id, "created": true})
+        }
+        update @ OwnerApprovalAction::UpdatePolicy { policy_id, .. } => {
+            let current =
+                get_active_policy_tx(&mut transaction, row.organization_id, policy_id).await?;
+            let proposed = proposed_policy_update(&current, &update)?;
+            validate_policy_update_assignments_tx(&mut transaction, row.organization_id, &proposed)
+                .await?;
+
+            let released_reservations = sqlx::query(
+                r#"UPDATE policy_budget_reservations pbr
+                   SET status = 'released', released_at = now()
+                   FROM execution_requests er
+                   WHERE pbr.request_id = er.id
+                     AND pbr.organization_id = $1 AND pbr.policy_id = $2
+                     AND pbr.policy_version = $3 AND pbr.status = 'reserved'
+                     AND er.signed_user_operation IS NULL"#,
+            )
+            .bind(row.organization_id)
+            .bind(current.id)
+            .bind(current.version)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            let revoked_permits = sqlx::query(
+                r#"DELETE FROM execution_permits
+                   WHERE organization_id = $1 AND policy_id = $2
+                     AND policy_version = $3 AND consumed_at IS NULL"#,
+            )
+            .bind(row.organization_id)
+            .bind(current.id)
+            .bind(current.version)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            let failed_requests = sqlx::query(
+                r#"UPDATE execution_requests
+                   SET status = 'failed',
+                       error_message = 'authorization policy was updated before signing',
+                       updated_at = now()
+                   WHERE organization_id = $1 AND policy_id = $2 AND policy_version = $3
+                     AND signed_user_operation IS NULL
+                     AND status IN ('pending', 'payment_verified')"#,
+            )
+            .bind(row.organization_id)
+            .bind(current.id)
+            .bind(current.version)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+
+            let updated = sqlx::query(
+                r#"UPDATE authorization_policies SET
+                       name = $4, version = $5, allowed_chains = $6,
+                       allowed_protocols = $7, allowed_actions = $8,
+                       allowed_targets = $9, allow_raw_execution = $10,
+                       max_value_wei = $11, max_execution_fee_usd = $12,
+                       token_spend_limits = $13, risk_permissions = $14,
+                       rolling_window_seconds = $15,
+                       max_rolling_execution_fee_usd = $16,
+                       max_sponsored_gas_units = $17,
+                       max_rolling_sponsored_gas_units = $18,
+                       max_borrowed_value_usd = $19,
+                       max_rolling_borrowed_value_usd = $20,
+                       updated_at = now()
+                   WHERE id = $1 AND organization_id = $2 AND version = $3
+                     AND is_active = TRUE"#,
+            )
+            .bind(current.id)
+            .bind(row.organization_id)
+            .bind(current.version)
+            .bind(&proposed.name)
+            .bind(proposed.version)
+            .bind(&proposed.allowed_chains)
+            .bind(&proposed.allowed_protocols)
+            .bind(&proposed.allowed_actions)
+            .bind(&proposed.allowed_targets)
+            .bind(proposed.allow_raw_execution)
+            .bind(&proposed.max_value_wei)
+            .bind(proposed.max_execution_fee_usd)
+            .bind(&proposed.token_spend_limits)
+            .bind(&proposed.risk_permissions)
+            .bind(proposed.rolling_window_seconds)
+            .bind(proposed.max_rolling_execution_fee_usd)
+            .bind(proposed.max_sponsored_gas_units)
+            .bind(proposed.max_rolling_sponsored_gas_units)
+            .bind(proposed.max_borrowed_value_usd)
+            .bind(proposed.max_rolling_borrowed_value_usd)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() != 1 {
+                anyhow::bail!("policy changed while approval was pending");
+            }
+            serde_json::json!({
+                "policy_id": current.id,
+                "previous_version": current.version,
+                "version": proposed.version,
+                "updated": true,
+                "revoked_unsigned_permits": revoked_permits,
+                "released_uncommitted_reservations": released_reservations,
+                "failed_unfinished_requests": failed_requests
+            })
         }
         OwnerApprovalAction::AssignPolicy {
             agent_id,
@@ -2369,6 +3560,81 @@ pub async fn complete_owner_approval(
                 "message": "Signer rotation was approved and queued; execution remains paused until reconciliation completes."
             })
         }
+        OwnerApprovalAction::RevokeOwnerPasskey {
+            passkey_id: target_passkey_id,
+            expected_credential_id,
+        } => {
+            if passkey_id == target_passkey_id {
+                anyhow::bail!("a passkey cannot approve its own revocation");
+            }
+            let target: (String, String) = sqlx::query_as(
+                r#"SELECT credential_id, purpose FROM owner_passkeys
+                   WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+                     AND status = 'active' FOR UPDATE"#,
+            )
+            .bind(target_passkey_id)
+            .bind(row.organization_id)
+            .bind(row.principal_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("active owner passkey was not found"))?;
+            if target.0 != expected_credential_id {
+                anyhow::bail!("passkey changed while approval was pending");
+            }
+            validate_owner_passkey_removal_tx(
+                &mut transaction,
+                row.organization_id,
+                row.principal_id,
+                target_passkey_id,
+                &target.1,
+            )
+            .await?;
+            sqlx::query(
+                r#"UPDATE owner_passkeys
+                   SET status = 'revoked', revoked_by_passkey_id = $2,
+                       revoked_at = now(), updated_at = now()
+                   WHERE id = $1 AND status = 'active'"#,
+            )
+            .bind(target_passkey_id)
+            .bind(passkey_id)
+            .execute(&mut *transaction)
+            .await?;
+            let revoked_connections = revoke_owner_sessions_tx(
+                &mut transaction,
+                row.organization_id,
+                row.principal_id,
+                target_passkey_id,
+            )
+            .await?;
+            let expired_approvals = sqlx::query(
+                r#"UPDATE owner_approval_requests SET status = 'expired'
+                   WHERE organization_id = $1 AND principal_id = $2
+                     AND id <> $3 AND status = 'pending'"#,
+            )
+            .bind(row.organization_id)
+            .bind(row.principal_id)
+            .bind(approval_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            let expired_enrollments = sqlx::query(
+                r#"UPDATE owner_passkey_enrollment_requests SET status = 'expired'
+                   WHERE organization_id = $1 AND principal_id = $2
+                     AND status = 'pending'"#,
+            )
+            .bind(row.organization_id)
+            .bind(row.principal_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            serde_json::json!({
+                "passkey_id": target_passkey_id,
+                "revoked": true,
+                "revoked_connections": revoked_connections,
+                "expired_approvals": expired_approvals,
+                "expired_passkey_enrollments": expired_enrollments
+            })
+        }
     };
     sqlx::query(
         r#"UPDATE owner_approval_requests
@@ -2479,6 +3745,7 @@ fn idempotency_fingerprint(
         "strategy_id": req.strategy_id,
         "batch_calls": req.batch_calls,
         "callback_url": req.callback_url,
+        "policy_impact": req.policy_impact,
     });
     Ok(sha256_hex(&serde_json::to_string(&payload)?))
 }
@@ -2521,10 +3788,10 @@ pub async fn insert_execution_request(
             (id, chain, target_contract, calldata, value, strategy_id,
              status, created_at, updated_at, agent_id, smart_wallet_address, callback_url,
              payload_hash, organization_id, principal_id, agent_uuid,
-             instance_id, policy_id, policy_version)
+             instance_id, policy_id, policy_version, policy_impact)
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-            $14, $15, $16, $17, $18, $19
+            $14, $15, $16, $17, $18, $19, $20
         )
         RETURNING *
         "#,
@@ -2548,6 +3815,7 @@ pub async fn insert_execution_request(
     .bind(context.instance_id)
     .bind(policy.id)
     .bind(policy.version)
+    .bind(serde_json::to_value(&req.policy_impact)?)
     .fetch_one(pool)
     .await?;
     Ok(row)
@@ -2579,10 +3847,11 @@ pub async fn reserve_execution_request(
             (id, chain, target_contract, calldata, value, strategy_id,
              status, created_at, updated_at, agent_id, smart_wallet_address,
              callback_url, payload_hash, organization_id, principal_id, agent_uuid,
-             instance_id, policy_id, policy_version, idempotency_key, idempotency_fingerprint)
+             instance_id, policy_id, policy_version, policy_impact,
+             idempotency_key, idempotency_fingerprint)
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-            $14, $15, $16, $17, $18, $19, $20, $21
+            $14, $15, $16, $17, $18, $19, $20, $21, $22
         )
         ON CONFLICT (organization_id, idempotency_key)
             WHERE idempotency_key IS NOT NULL
@@ -2609,6 +3878,7 @@ pub async fn reserve_execution_request(
     .bind(context.instance_id)
     .bind(policy.id)
     .bind(policy.version)
+    .bind(serde_json::to_value(&req.policy_impact)?)
     .bind(idempotency_key)
     .bind(&fingerprint)
     .fetch_optional(pool)
@@ -2733,6 +4003,7 @@ pub async fn fail_unfinished_idempotent_execution(
     .bind(reason)
     .execute(pool)
     .await?;
+    release_policy_budget_reservation(pool, row.id).await?;
     Ok(())
 }
 
@@ -2828,10 +4099,16 @@ pub async fn issue_execution_permit(
         JOIN authorization_policies ap
           ON ap.id = er.policy_id AND ap.organization_id = er.organization_id
         JOIN agents a ON a.id = er.agent_uuid
+        JOIN policy_budget_reservations pbr ON pbr.request_id = er.id
         WHERE er.id = $1 AND er.status = 'payment_verified'
           AND er.smart_wallet_address IS NOT NULL
           AND ap.is_active = TRUE AND ap.version = er.policy_version
           AND a.status = 'active' AND a.policy_id = er.policy_id
+          AND pbr.organization_id = er.organization_id
+          AND pbr.agent_id = er.agent_uuid
+          AND pbr.policy_id = er.policy_id
+          AND pbr.policy_version = er.policy_version
+          AND pbr.status = 'reserved'
         ON CONFLICT (request_id) DO UPDATE
         SET expires_at = EXCLUDED.expires_at
         WHERE execution_permits.consumed_at IS NULL
@@ -2871,6 +4148,234 @@ pub async fn enforce_execution_fee_policy(
         anyhow::bail!("execution fee exceeds authorization policy");
     }
     Ok(())
+}
+
+fn usd_to_microusd(value: f64, round_up: bool) -> Result<i64> {
+    if !value.is_finite() || !(0.0..=1_000_000_000.0).contains(&value) {
+        anyhow::bail!("USD policy value is outside the supported range");
+    }
+    let scaled = value * 1_000_000.0;
+    let rounded = if round_up {
+        scaled.ceil()
+    } else {
+        scaled.floor()
+    };
+    if rounded > i64::MAX as f64 {
+        anyhow::bail!("USD policy value is too large");
+    }
+    Ok(rounded as i64)
+}
+
+/// Atomically reserve the economic authority consumed by an execution.
+///
+/// Locking the agent row serializes reservations even while policies are
+/// migrated. Active reservations from prior policy versions remain part of
+/// the rolling total, preventing a policy replacement from resetting spend.
+pub async fn reserve_policy_budget(
+    pool: &PgPool,
+    request_id: Uuid,
+    execution_fee_usd: f64,
+    sponsored_gas_units: u64,
+) -> Result<()> {
+    let execution_fee_microusd = usd_to_microusd(execution_fee_usd, true)?;
+    let sponsored_gas_units = i64::try_from(sponsored_gas_units)
+        .map_err(|_| anyhow::anyhow!("sponsored gas units exceed the supported range"))?;
+    let mut transaction = pool.begin().await?;
+    let execution = sqlx::query_as::<_, (Uuid, Uuid, Uuid, i64, serde_json::Value, String)>(
+        r#"SELECT er.organization_id, er.agent_uuid, er.policy_id,
+                  er.policy_version, er.policy_impact, er.status
+           FROM execution_requests er
+           JOIN agents a ON a.id = er.agent_uuid AND a.organization_id = er.organization_id
+           WHERE er.id = $1
+           FOR UPDATE OF a"#,
+    )
+    .bind(request_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("execution request was not found"))?;
+    if execution.5 != "payment_verified" {
+        anyhow::bail!("policy budget can only be reserved for a payment-verified execution");
+    }
+    let policy = sqlx::query_as::<_, AuthorizationPolicyRow>(
+        r#"SELECT * FROM authorization_policies
+           WHERE id = $1 AND organization_id = $2 AND is_active = TRUE
+             AND version = $3
+           FOR UPDATE"#,
+    )
+    .bind(execution.2)
+    .bind(execution.0)
+    .bind(execution.3)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("execution policy changed or was revoked"))?;
+    let impact: crate::policy::ExecutionPolicyImpact =
+        serde_json::from_value(execution.4).context("stored policy impact is invalid")?;
+    crate::auth::enforce_policy_impact(&policy, &impact)?;
+
+    if let Some(limit) = policy.max_execution_fee_usd {
+        if execution_fee_microusd > usd_to_microusd(limit, false)? {
+            anyhow::bail!("execution fee exceeds per-execution authorization policy");
+        }
+    }
+    if policy
+        .max_sponsored_gas_units
+        .is_some_and(|limit| sponsored_gas_units > limit)
+    {
+        anyhow::bail!("sponsored gas exceeds per-execution authorization policy");
+    }
+    let borrowed_value_microusd = usd_to_microusd(impact.borrowed_value_usd, true)?;
+    if let Some(limit) = policy.max_borrowed_value_usd {
+        if borrowed_value_microusd > usd_to_microusd(limit, false)? {
+            anyhow::bail!("borrowed value exceeds per-execution authorization policy");
+        }
+    }
+
+    let existing = sqlx::query_as::<_, (i64, i64, i64, String)>(
+        r#"SELECT execution_fee_microusd, borrowed_value_microusd,
+                  sponsored_gas_units, status
+           FROM policy_budget_reservations WHERE request_id = $1"#,
+    )
+    .bind(request_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if let Some(existing) = existing {
+        if existing.0 != execution_fee_microusd
+            || existing.1 != borrowed_value_microusd
+            || existing.2 != sponsored_gas_units
+            || existing.3 == "released"
+        {
+            anyhow::bail!("execution already has a different policy budget reservation");
+        }
+        transaction.commit().await?;
+        return Ok(());
+    }
+
+    let rolling: (i64, i64, i64) = sqlx::query_as(
+        r#"SELECT
+             COALESCE(SUM(execution_fee_microusd), 0)::BIGINT,
+             COALESCE(SUM(borrowed_value_microusd), 0)::BIGINT,
+             COALESCE(SUM(sponsored_gas_units), 0)::BIGINT
+           FROM policy_budget_reservations
+           WHERE organization_id = $1 AND agent_id = $2
+             AND status IN ('reserved', 'committed')
+             AND reserved_at >= now() - ($3 * interval '1 second')"#,
+    )
+    .bind(execution.0)
+    .bind(execution.1)
+    .bind(policy.rolling_window_seconds)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if let Some(limit) = policy.max_rolling_execution_fee_usd {
+        let next = rolling
+            .0
+            .checked_add(execution_fee_microusd)
+            .ok_or_else(|| anyhow::anyhow!("rolling execution-fee budget overflow"))?;
+        if next > usd_to_microusd(limit, false)? {
+            anyhow::bail!("execution fee exceeds rolling authorization policy");
+        }
+    }
+    if let Some(limit) = policy.max_rolling_borrowed_value_usd {
+        let next = rolling
+            .1
+            .checked_add(borrowed_value_microusd)
+            .ok_or_else(|| anyhow::anyhow!("rolling borrowed-value budget overflow"))?;
+        if next > usd_to_microusd(limit, false)? {
+            anyhow::bail!("borrowed value exceeds rolling authorization policy");
+        }
+    }
+    if let Some(limit) = policy.max_rolling_sponsored_gas_units {
+        let next = rolling
+            .2
+            .checked_add(sponsored_gas_units)
+            .ok_or_else(|| anyhow::anyhow!("rolling sponsored-gas budget overflow"))?;
+        if next > limit {
+            anyhow::bail!("sponsored gas exceeds rolling authorization policy");
+        }
+    }
+
+    sqlx::query(
+        r#"INSERT INTO policy_budget_reservations (
+               request_id, organization_id, agent_id, policy_id, policy_version,
+               execution_fee_microusd, borrowed_value_microusd, sponsored_gas_units
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+    )
+    .bind(request_id)
+    .bind(execution.0)
+    .bind(execution.1)
+    .bind(execution.2)
+    .bind(execution.3)
+    .bind(execution_fee_microusd)
+    .bind(borrowed_value_microusd)
+    .bind(sponsored_gas_units)
+    .execute(&mut *transaction)
+    .await?;
+
+    let token_limits = crate::policy::validate_token_spend_limits(&policy.token_spend_limits)?;
+    let mut spends = std::collections::BTreeMap::<String, ethers::types::U256>::new();
+    for spend in impact.token_spends {
+        let token = spend.token.to_ascii_lowercase();
+        let amount = ethers::types::U256::from_dec_str(&spend.amount_raw)?;
+        let total = spends.entry(token).or_default();
+        *total = total
+            .checked_add(amount)
+            .ok_or_else(|| anyhow::anyhow!("token spend reservation overflow"))?;
+    }
+    for (token, amount) in spends {
+        let limit = token_limits
+            .iter()
+            .find(|limit| limit.token.eq_ignore_ascii_case(&token))
+            .or_else(|| token_limits.iter().find(|limit| limit.token == "*"))
+            .ok_or_else(|| anyhow::anyhow!("token spending requires an explicit policy limit"))?;
+        let current: String = sqlx::query_scalar(
+            r#"SELECT COALESCE(SUM(ts.amount_raw), 0)::TEXT
+               FROM policy_token_spend_reservations ts
+               JOIN policy_budget_reservations br ON br.request_id = ts.request_id
+               WHERE br.organization_id = $1 AND br.agent_id = $2
+                 AND br.status IN ('reserved', 'committed')
+                 AND br.reserved_at >= now() - ($3 * interval '1 second')
+                 AND ts.token_address = $4"#,
+        )
+        .bind(execution.0)
+        .bind(execution.1)
+        .bind(policy.rolling_window_seconds)
+        .bind(&token)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let next = ethers::types::U256::from_dec_str(&current)?
+            .checked_add(amount)
+            .ok_or_else(|| anyhow::anyhow!("rolling token spend overflow"))?;
+        if next > ethers::types::U256::from_dec_str(&limit.max_rolling_raw)? {
+            anyhow::bail!("token spend exceeds rolling authorization policy");
+        }
+        sqlx::query(
+            r#"INSERT INTO policy_token_spend_reservations (
+                   request_id, token_address, amount_raw
+               ) VALUES ($1, $2, $3::NUMERIC)"#,
+        )
+        .bind(request_id)
+        .bind(token)
+        .bind(amount.to_string())
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+pub async fn release_policy_budget_reservation(pool: &PgPool, request_id: Uuid) -> Result<bool> {
+    let released = sqlx::query(
+        r#"UPDATE policy_budget_reservations br
+           SET status = 'released', released_at = now()
+           WHERE br.request_id = $1 AND br.status = 'reserved'
+             AND NOT EXISTS (
+                 SELECT 1 FROM execution_requests er
+                 WHERE er.id = br.request_id AND er.signed_user_operation IS NOT NULL
+             )"#,
+    )
+    .bind(request_id)
+    .execute(pool)
+    .await?;
+    Ok(released.rows_affected() == 1)
 }
 
 pub async fn claim_execution_permit(
@@ -3375,9 +4880,40 @@ mod tests {
             allow_raw_execution,
             max_value_wei: max_value_wei.map(str::to_string),
             max_execution_fee_usd,
+            token_spend_limits: crate::policy::default_token_spend_limits(),
+            risk_permissions: vec![],
+            rolling_window_seconds: 86_400,
+            max_rolling_execution_fee_usd: max_execution_fee_usd.map(|value| value * 10.0),
+            max_sponsored_gas_units: Some(2_000_000),
+            max_rolling_sponsored_gas_units: Some(10_000_000),
+            max_borrowed_value_usd: Some(0.0),
+            max_rolling_borrowed_value_usd: Some(0.0),
             is_active: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    fn update_policy_action(policy: &AuthorizationPolicyRow) -> OwnerApprovalAction {
+        OwnerApprovalAction::UpdatePolicy {
+            policy_id: policy.id,
+            expected_version: policy.version,
+            name: policy.name.clone(),
+            allowed_chains: policy.allowed_chains.clone(),
+            allowed_protocols: policy.allowed_protocols.clone(),
+            allowed_actions: policy.allowed_actions.clone(),
+            allowed_targets: policy.allowed_targets.clone(),
+            allow_raw_execution: policy.allow_raw_execution,
+            max_value_wei: policy.max_value_wei.clone(),
+            max_execution_fee_usd: policy.max_execution_fee_usd,
+            token_spend_limits: policy.token_spend_limits.clone(),
+            risk_permissions: policy.risk_permissions.clone(),
+            rolling_window_seconds: policy.rolling_window_seconds,
+            max_rolling_execution_fee_usd: policy.max_rolling_execution_fee_usd,
+            max_sponsored_gas_units: policy.max_sponsored_gas_units,
+            max_rolling_sponsored_gas_units: policy.max_rolling_sponsored_gas_units,
+            max_borrowed_value_usd: policy.max_borrowed_value_usd,
+            max_rolling_borrowed_value_usd: policy.max_rolling_borrowed_value_usd,
         }
     }
 
@@ -3392,6 +4928,14 @@ mod tests {
             allow_raw_execution: false,
             max_value_wei: Some("0".into()),
             max_execution_fee_usd: Some(1.0),
+            token_spend_limits: crate::policy::default_token_spend_limits(),
+            risk_permissions: vec![],
+            rolling_window_seconds: 86_400,
+            max_rolling_execution_fee_usd: Some(10.0),
+            max_sponsored_gas_units: Some(2_000_000),
+            max_rolling_sponsored_gas_units: Some(10_000_000),
+            max_borrowed_value_usd: Some(0.0),
+            max_rolling_borrowed_value_usd: Some(0.0),
         };
         assert!(valid.validate("arc-testnet").is_ok());
 
@@ -3404,6 +4948,14 @@ mod tests {
             allow_raw_execution: false,
             max_value_wei: None,
             max_execution_fee_usd: None,
+            token_spend_limits: serde_json::json!([]),
+            risk_permissions: vec![],
+            rolling_window_seconds: 86_400,
+            max_rolling_execution_fee_usd: None,
+            max_sponsored_gas_units: None,
+            max_rolling_sponsored_gas_units: None,
+            max_borrowed_value_usd: None,
+            max_rolling_borrowed_value_usd: None,
         };
         assert!(unrestricted.validate("arc-testnet").is_err());
 
@@ -3416,6 +4968,14 @@ mod tests {
             allow_raw_execution: false,
             max_value_wei: Some("0".into()),
             max_execution_fee_usd: None,
+            token_spend_limits: serde_json::json!([]),
+            risk_permissions: vec![],
+            rolling_window_seconds: 86_400,
+            max_rolling_execution_fee_usd: None,
+            max_sponsored_gas_units: None,
+            max_rolling_sponsored_gas_units: None,
+            max_borrowed_value_usd: None,
+            max_rolling_borrowed_value_usd: None,
         };
         assert!(wrong_chain.validate("arc-testnet").is_err());
     }
@@ -3451,9 +5011,25 @@ mod tests {
         unlimited.max_value_wei = None;
         assert!(validate_delegated_policy(&parent, &unlimited).is_err());
 
-        let mut costly = child;
+        let mut costly = child.clone();
         costly.max_execution_fee_usd = Some(2.0);
         assert!(validate_delegated_policy(&parent, &costly).is_err());
+
+        let mut risky = child.clone();
+        risky.risk_permissions = vec![crate::policy::RISK_BORROWING.into()];
+        assert!(validate_delegated_policy(&parent, &risky).is_err());
+
+        let mut shorter_window = child.clone();
+        shorter_window.rolling_window_seconds = 60;
+        assert!(validate_delegated_policy(&parent, &shorter_window).is_err());
+
+        let mut larger_token_budget = child.clone();
+        larger_token_budget.token_spend_limits = serde_json::json!([{
+            "token": crate::policy::ARC_USDC_ADDRESS,
+            "max_per_execution_raw": "25000001",
+            "max_rolling_raw": "100000001"
+        }]);
+        assert!(validate_delegated_policy(&parent, &larger_token_budget).is_err());
 
         let mut unrestricted_parent = parent;
         unrestricted_parent.allowed_actions = Some(vec!["*".into()]);
@@ -3572,6 +5148,14 @@ mod tests {
             allow_raw_execution: false,
             max_value_wei: Some("0".into()),
             max_execution_fee_usd: Some(1.0),
+            token_spend_limits: crate::policy::default_token_spend_limits(),
+            risk_permissions: vec![],
+            rolling_window_seconds: 86_400,
+            max_rolling_execution_fee_usd: Some(10.0),
+            max_sponsored_gas_units: Some(2_000_000),
+            max_rolling_sponsored_gas_units: Some(10_000_000),
+            max_borrowed_value_usd: Some(0.0),
+            max_rolling_borrowed_value_usd: Some(0.0),
         };
         let token_hash = hex::encode(Sha256::digest(Uuid::new_v4().as_bytes()));
         let approval = create_owner_approval_request(
@@ -3656,12 +5240,13 @@ mod tests {
         sqlx::query(
             r#"INSERT INTO owner_accounts (
                 principal_id, organization_id, owner_handle,
-                owner_handle_normalized, display_name
-            ) VALUES ($1, $2, $3, $3, 'Lifecycle owner')"#,
+                owner_handle_normalized, display_name, webauthn_user_id
+            ) VALUES ($1, $2, $3, $3, 'Lifecycle owner', $4)"#,
         )
         .bind(base.principal_id)
         .bind(base.organization_id)
         .bind(owner_handle)
+        .bind(Uuid::new_v4())
         .execute(pool)
         .await
         .unwrap();
@@ -3723,6 +5308,429 @@ mod tests {
             root_agent,
             root_policy,
         }
+    }
+
+    async fn insert_owner_passkey(
+        pool: &PgPool,
+        fixture: &OwnerControlFixture,
+        label: &str,
+        purpose: &str,
+    ) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let credential_id = format!("credential-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            r#"INSERT INTO owner_passkeys (
+                   id, organization_id, principal_id, credential_id, passkey,
+                   label, purpose, created_by_passkey_id
+               ) VALUES ($1, $2, $3, $4, '{}'::jsonb, $5, $6, $7)"#,
+        )
+        .bind(id)
+        .bind(fixture.context.organization_id)
+        .bind(fixture.context.principal_id)
+        .bind(&credential_id)
+        .bind(label)
+        .bind(purpose)
+        .bind(fixture.passkey_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        (id, credential_id)
+    }
+
+    #[test]
+    fn passkey_enrollment_fields_and_revocation_payload_are_validated() {
+        assert!(validate_passkey_label_and_purpose("Travel key", "standard").is_ok());
+        assert!(validate_passkey_label_and_purpose("Safe recovery", "recovery").is_ok());
+        assert!(validate_passkey_label_and_purpose("", "standard").is_err());
+        assert!(validate_passkey_label_and_purpose("Bad\nlabel", "standard").is_err());
+        assert!(validate_passkey_label_and_purpose("Key", "primary").is_err());
+
+        let valid = OwnerApprovalAction::RevokeOwnerPasskey {
+            passkey_id: Uuid::new_v4(),
+            expected_credential_id: "credential-id".into(),
+        };
+        assert!(valid.validate("arc-testnet").is_ok());
+        let invalid = OwnerApprovalAction::RevokeOwnerPasskey {
+            passkey_id: Uuid::new_v4(),
+            expected_credential_id: String::new(),
+        };
+        assert!(invalid.validate("arc-testnet").is_err());
+    }
+
+    #[tokio::test]
+    async fn passkey_enrollment_adds_and_atomically_replaces_recovery_credentials() {
+        let pool = setup_pool().await;
+        let fixture = create_owner_control_fixture(&pool).await;
+        let first_request = create_owner_passkey_enrollment_request(
+            &pool,
+            &fixture.context,
+            CreateOwnerPasskeyEnrollmentOptions {
+                token_hash: &sha256_hex(&random_secret()),
+                label: "Offline recovery",
+                purpose: "recovery",
+                replaces_passkey_id: None,
+                expires_at: Utc::now() + chrono::Duration::minutes(10),
+            },
+        )
+        .await
+        .unwrap();
+        let (other_passkey_id, _) =
+            insert_owner_passkey(&pool, &fixture, "Secondary device", "standard").await;
+        authenticate_owner_passkey_enrollment(
+            &pool,
+            first_request.id,
+            fixture.passkey_id,
+            &serde_json::json!({"counter": 1}),
+        )
+        .await
+        .unwrap();
+        assert!(authenticate_owner_passkey_enrollment(
+            &pool,
+            first_request.id,
+            other_passkey_id,
+            &serde_json::json!({"counter": 1}),
+        )
+        .await
+        .is_err());
+        let first_recovery_id = Uuid::new_v4();
+        let added = complete_owner_passkey_enrollment(
+            &pool,
+            CompleteOwnerPasskeyEnrollmentOptions {
+                request_id: first_request.id,
+                authenticated_by_passkey_id: fixture.passkey_id,
+                new_passkey_id: first_recovery_id,
+                credential_id: &format!("credential-{}", Uuid::new_v4().simple()),
+                passkey: &serde_json::json!({"counter": 0}),
+                turnkey_recovery_credential: &serde_json::json!({"challenge": "first"}),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(added["purpose"], "recovery");
+
+        let unsafe_downgrade = create_owner_passkey_enrollment_request(
+            &pool,
+            &fixture.context,
+            CreateOwnerPasskeyEnrollmentOptions {
+                token_hash: &sha256_hex(&random_secret()),
+                label: "No longer recovery",
+                purpose: "standard",
+                replaces_passkey_id: Some(first_recovery_id),
+                expires_at: Utc::now() + chrono::Duration::minutes(10),
+            },
+        )
+        .await;
+        assert!(unsafe_downgrade.is_err());
+
+        let replacement_request = create_owner_passkey_enrollment_request(
+            &pool,
+            &fixture.context,
+            CreateOwnerPasskeyEnrollmentOptions {
+                token_hash: &sha256_hex(&random_secret()),
+                label: "Offline recovery",
+                purpose: "recovery",
+                replaces_passkey_id: Some(first_recovery_id),
+                expires_at: Utc::now() + chrono::Duration::minutes(10),
+            },
+        )
+        .await
+        .unwrap();
+        authenticate_owner_passkey_enrollment(
+            &pool,
+            replacement_request.id,
+            fixture.passkey_id,
+            &serde_json::json!({"counter": 2}),
+        )
+        .await
+        .unwrap();
+        let replacement_id = Uuid::new_v4();
+        let replaced = complete_owner_passkey_enrollment(
+            &pool,
+            CompleteOwnerPasskeyEnrollmentOptions {
+                request_id: replacement_request.id,
+                authenticated_by_passkey_id: fixture.passkey_id,
+                new_passkey_id: replacement_id,
+                credential_id: &format!("credential-{}", Uuid::new_v4().simple()),
+                passkey: &serde_json::json!({"counter": 0}),
+                turnkey_recovery_credential: &serde_json::json!({"challenge": "replacement"}),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replaced["replaced_passkey_id"],
+            first_recovery_id.to_string()
+        );
+
+        let states = sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(
+            r#"SELECT id, status, revoked_by_passkey_id FROM owner_passkeys
+               WHERE id IN ($1, $2) ORDER BY id"#,
+        )
+        .bind(first_recovery_id)
+        .bind(replacement_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let first = states
+            .iter()
+            .find(|row| row.0 == first_recovery_id)
+            .unwrap();
+        let replacement = states.iter().find(|row| row.0 == replacement_id).unwrap();
+        assert_eq!(first.1, "revoked");
+        assert_eq!(first.2, Some(fixture.passkey_id));
+        assert_eq!(replacement.1, "active");
+        let request_status: String = sqlx::query_scalar(
+            "SELECT status FROM owner_passkey_enrollment_requests WHERE id = $1",
+        )
+        .bind(replacement_request.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(request_status, "completed");
+        let connection_status: String =
+            sqlx::query_scalar("SELECT status FROM oauth_connections WHERE id = $1")
+                .bind(fixture.context.credential_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(connection_status, "revoked");
+        let audit_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM auth_audit_events
+               WHERE organization_id = $1
+                 AND action IN ('owner_passkey:added', 'owner_passkey:replaced')"#,
+        )
+        .bind(fixture.context.organization_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 2);
+    }
+
+    #[tokio::test]
+    async fn passkey_revocation_requires_another_passkey_and_contains_sessions() {
+        let pool = setup_pool().await;
+        let fixture = create_owner_control_fixture(&pool).await;
+        let (first_recovery_id, first_credential_id) =
+            insert_owner_passkey(&pool, &fixture, "Recovery one", "recovery").await;
+        let final_recovery_action = OwnerApprovalAction::RevokeOwnerPasskey {
+            passkey_id: first_recovery_id,
+            expected_credential_id: first_credential_id.clone(),
+        };
+        assert!(create_owner_approval_request(
+            &pool,
+            &fixture.context,
+            "arc-testnet",
+            &sha256_hex(&random_secret()),
+            &final_recovery_action,
+            Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await
+        .is_err());
+
+        let (_second_recovery_id, _) =
+            insert_owner_passkey(&pool, &fixture, "Recovery two", "recovery").await;
+        let primary_credential_id: String =
+            sqlx::query_scalar("SELECT credential_id FROM owner_passkeys WHERE id = $1")
+                .bind(fixture.passkey_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let self_revoke_action = OwnerApprovalAction::RevokeOwnerPasskey {
+            passkey_id: fixture.passkey_id,
+            expected_credential_id: primary_credential_id,
+        };
+        let self_revoke = create_owner_approval_request(
+            &pool,
+            &fixture.context,
+            "arc-testnet",
+            &sha256_hex(&random_secret()),
+            &self_revoke_action,
+            Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await
+        .unwrap();
+        assert!(complete_owner_approval(
+            &pool,
+            self_revoke.id,
+            fixture.context.organization_id,
+            fixture.context.principal_id,
+            fixture.passkey_id,
+            &serde_json::json!({"counter": 1}),
+            "arc-testnet",
+        )
+        .await
+        .is_err());
+
+        let client_id: String =
+            sqlx::query_scalar("SELECT client_id FROM oauth_connections WHERE id = $1")
+                .bind(fixture.context.credential_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let target_control_connection = Uuid::new_v4();
+        let target_agent_connection = Uuid::new_v4();
+        let survivor_agent_connection = Uuid::new_v4();
+        for (id, passkey_id, agent_bound) in [
+            (target_control_connection, first_recovery_id, false),
+            (target_agent_connection, first_recovery_id, true),
+            (survivor_agent_connection, fixture.passkey_id, true),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO oauth_connections (
+                       id, organization_id, principal_id, passkey_id, agent_id,
+                       agent_external_id, client_id, resource, scopes
+                   ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ARRAY['wallet:read'])"#,
+            )
+            .bind(id)
+            .bind(fixture.context.organization_id)
+            .bind(fixture.context.principal_id)
+            .bind(passkey_id)
+            .bind(agent_bound.then_some(fixture.root_agent.id))
+            .bind(agent_bound.then_some(fixture.root_agent.external_id.as_str()))
+            .bind(&client_id)
+            .bind(if agent_bound {
+                "https://api.example/mcp/agent"
+            } else {
+                "https://api.example/mcp/control"
+            })
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let revocation = create_owner_approval_request(
+            &pool,
+            &fixture.context,
+            "arc-testnet",
+            &sha256_hex(&random_secret()),
+            &final_recovery_action,
+            Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await
+        .unwrap();
+        let result = complete_owner_approval(
+            &pool,
+            revocation.id,
+            fixture.context.organization_id,
+            fixture.context.principal_id,
+            fixture.passkey_id,
+            &serde_json::json!({"counter": 2}),
+            "arc-testnet",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["revoked"], true);
+        assert_eq!(result["revoked_connections"], 3);
+
+        let target_status: (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT status, revoked_by_passkey_id FROM owner_passkeys WHERE id = $1",
+        )
+        .bind(first_recovery_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(target_status.0, "revoked");
+        assert_eq!(target_status.1, Some(fixture.passkey_id));
+        let connection_states = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT id, status FROM oauth_connections WHERE id = ANY($1)",
+        )
+        .bind(vec![
+            fixture.context.credential_id,
+            target_control_connection,
+            target_agent_connection,
+            survivor_agent_connection,
+        ])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        for (id, status) in connection_states {
+            let expected = if id == survivor_agent_connection {
+                "active"
+            } else {
+                "revoked"
+            };
+            assert_eq!(status, expected);
+        }
+        let stale_approval_status: String =
+            sqlx::query_scalar("SELECT status FROM owner_approval_requests WHERE id = $1")
+                .bind(self_revoke.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stale_approval_status, "expired");
+    }
+
+    #[tokio::test]
+    async fn concurrent_recovery_revocations_preserve_a_recovery_passkey() {
+        let pool = setup_pool().await;
+        let fixture = create_owner_control_fixture(&pool).await;
+        let (first_id, first_credential) =
+            insert_owner_passkey(&pool, &fixture, "Recovery alpha", "recovery").await;
+        let (second_id, second_credential) =
+            insert_owner_passkey(&pool, &fixture, "Recovery beta", "recovery").await;
+        let first_action = OwnerApprovalAction::RevokeOwnerPasskey {
+            passkey_id: first_id,
+            expected_credential_id: first_credential,
+        };
+        let second_action = OwnerApprovalAction::RevokeOwnerPasskey {
+            passkey_id: second_id,
+            expected_credential_id: second_credential,
+        };
+        let first_approval = create_owner_approval_request(
+            &pool,
+            &fixture.context,
+            "arc-testnet",
+            &sha256_hex(&random_secret()),
+            &first_action,
+            Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await
+        .unwrap();
+        let second_approval = create_owner_approval_request(
+            &pool,
+            &fixture.context,
+            "arc-testnet",
+            &sha256_hex(&random_secret()),
+            &second_action,
+            Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await
+        .unwrap();
+
+        let first_updated_passkey = serde_json::json!({"counter": 1});
+        let second_updated_passkey = serde_json::json!({"counter": 2});
+        let first = complete_owner_approval(
+            &pool,
+            first_approval.id,
+            fixture.context.organization_id,
+            fixture.context.principal_id,
+            fixture.passkey_id,
+            &first_updated_passkey,
+            "arc-testnet",
+        );
+        let second = complete_owner_approval(
+            &pool,
+            second_approval.id,
+            fixture.context.organization_id,
+            fixture.context.principal_id,
+            fixture.passkey_id,
+            &second_updated_passkey,
+            "arc-testnet",
+        );
+        let (first_result, second_result) = tokio::join!(first, second);
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+
+        let active_recovery_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM owner_passkeys
+               WHERE organization_id = $1 AND principal_id = $2
+                 AND status = 'active' AND purpose = 'recovery'"#,
+        )
+        .bind(fixture.context.organization_id)
+        .bind(fixture.context.principal_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active_recovery_count, 1);
     }
 
     async fn approve_test_action(
@@ -3935,6 +5943,14 @@ mod tests {
                 allow_raw_execution: false,
                 max_value_wei: Some("0".into()),
                 max_execution_fee_usd: Some(0.5),
+                token_spend_limits: serde_json::json!([]),
+                risk_permissions: vec![],
+                rolling_window_seconds: 86_400,
+                max_rolling_execution_fee_usd: Some(5.0),
+                max_sponsored_gas_units: Some(1_000_000),
+                max_rolling_sponsored_gas_units: Some(5_000_000),
+                max_borrowed_value_usd: Some(0.0),
+                max_rolling_borrowed_value_usd: Some(0.0),
             },
         )
         .await
@@ -4114,6 +6130,7 @@ mod tests {
             strategy_id: None,
             batch_calls: None,
             callback_url: None,
+            policy_impact: crate::policy::ExecutionPolicyImpact::default(),
         }
     }
 
@@ -4413,6 +6430,9 @@ mod tests {
         )
         .await
         .expect("insert payment-verified request");
+        reserve_policy_budget(&pool, row.id, 0.001, 1_000)
+            .await
+            .expect("reserve policy budget");
         let permit = issue_execution_permit(&pool, row.id, Some("1000"), 300)
             .await
             .expect("issue permit");
@@ -4441,6 +6461,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rolling_token_budget_is_atomic_idempotent_and_releasable() {
+        let pool = setup_pool().await;
+        let external_id = format!("budget-{}", Uuid::new_v4().simple());
+        let context = create_test_auth_context(&pool, &external_id).await;
+        let policy_id: Uuid = sqlx::query_scalar(
+            "SELECT policy_id FROM agents WHERE organization_id = $1 AND external_id = $2",
+        )
+        .bind(context.organization_id)
+        .bind(&external_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"UPDATE authorization_policies
+               SET token_spend_limits = $2
+               WHERE id = $1"#,
+        )
+        .bind(policy_id)
+        .bind(serde_json::json!([{
+            "token": crate::policy::ARC_USDC_ADDRESS,
+            "max_per_execution_raw": "20000000",
+            "max_rolling_raw": "20000000"
+        }]))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut first = sample_request(&external_id);
+        first.policy_impact = crate::policy::ExecutionPolicyImpact::uniswap_swap(
+            crate::policy::ARC_USDC_ADDRESS.parse().unwrap(),
+            ethers::types::U256::from(20_000_000u64),
+        );
+        let second = first.clone();
+        let first_row = insert_execution_request(
+            &pool,
+            &context,
+            &first,
+            &ExecutionStatus::PaymentVerified,
+            Some("0x1234567890abcdef1234567890abcdef12345678"),
+            None,
+        )
+        .await
+        .unwrap();
+        let second_row = insert_execution_request(
+            &pool,
+            &context,
+            &second,
+            &ExecutionStatus::PaymentVerified,
+            Some("0x1234567890abcdef1234567890abcdef12345678"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let first_reservation = reserve_policy_budget(&pool, first_row.id, 0.0, 1);
+        let second_reservation = reserve_policy_budget(&pool, second_row.id, 0.0, 1);
+        let (first_result, second_result) = tokio::join!(first_reservation, second_reservation);
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let (reserved_id, denied_id) = if first_result.is_ok() {
+            (first_row.id, second_row.id)
+        } else {
+            (second_row.id, first_row.id)
+        };
+
+        reserve_policy_budget(&pool, reserved_id, 0.0, 1)
+            .await
+            .expect("repeating an identical reservation is idempotent");
+        let reservation_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM policy_budget_reservations
+               WHERE organization_id = $1 AND agent_id = $2 AND status = 'reserved'"#,
+        )
+        .bind(first_row.organization_id)
+        .bind(first_row.agent_uuid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reservation_count, 1);
+
+        assert!(release_policy_budget_reservation(&pool, reserved_id)
+            .await
+            .unwrap());
+        reserve_policy_budget(&pool, denied_id, 0.0, 1)
+            .await
+            .expect("released reservations no longer consume the rolling budget");
+    }
+
+    #[tokio::test]
+    async fn approved_policy_update_revokes_unsigned_old_version_work() {
+        let pool = setup_pool().await;
+        let fixture = create_owner_control_fixture(&pool).await;
+        let request = sample_request(&fixture.root_agent.external_id);
+        let row = insert_execution_request(
+            &pool,
+            &fixture.context,
+            &request,
+            &ExecutionStatus::PaymentVerified,
+            Some("0x1234567890abcdef1234567890abcdef12345678"),
+            None,
+        )
+        .await
+        .unwrap();
+        reserve_policy_budget(&pool, row.id, 0.001, 1_000)
+            .await
+            .unwrap();
+        let permit = issue_execution_permit(&pool, row.id, Some("1000"), 300)
+            .await
+            .unwrap();
+
+        let mut update = update_policy_action(&fixture.root_policy);
+        if let OwnerApprovalAction::UpdatePolicy {
+            max_rolling_execution_fee_usd,
+            ..
+        } = &mut update
+        {
+            *max_rolling_execution_fee_usd = Some(9.0);
+        }
+        let result = approve_test_action(&pool, &fixture, &update).await.unwrap();
+        assert_eq!(result["previous_version"], 1);
+        assert_eq!(result["version"], 2);
+
+        let updated = get_authorization_policy(
+            &pool,
+            fixture.context.organization_id,
+            fixture.root_policy.id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.version, 2);
+        assert_eq!(updated.max_rolling_execution_fee_usd, Some(9.0));
+        assert!(claim_execution_permit(&pool, permit.id, row.id)
+            .await
+            .is_err());
+        let request_status: String =
+            sqlx::query_scalar("SELECT status FROM execution_requests WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(request_status, "failed");
+        let reservation_status: String = sqlx::query_scalar(
+            "SELECT status FROM policy_budget_reservations WHERE request_id = $1",
+        )
+        .bind(row.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reservation_status, "released");
+
+        assert!(create_owner_approval_request(
+            &pool,
+            &fixture.context,
+            "arc-testnet",
+            &hex::encode(Sha256::digest(Uuid::new_v4().as_bytes())),
+            &update,
+            Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn signed_arc_operation_remains_recoverable_after_policy_revocation() {
         let pool = setup_pool().await;
         let req = sample_request(&format!("recovery-{}", Uuid::new_v4().simple()));
@@ -4455,6 +6637,9 @@ mod tests {
         )
         .await
         .unwrap();
+        reserve_policy_budget(&pool, row.id, 0.001, 1_000)
+            .await
+            .unwrap();
         let permit = issue_execution_permit(&pool, row.id, Some("1000"), 300)
             .await
             .unwrap();

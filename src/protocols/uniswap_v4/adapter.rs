@@ -356,6 +356,7 @@ pub fn compile_swap(req: &UniswapSwapRequest) -> Result<ExecutionRequest> {
         strategy_id,
         batch_calls: Some(batch_calls),
         callback_url: req.callback_url.clone(),
+        policy_impact: crate::policy::ExecutionPolicyImpact::uniswap_swap(token_in, max_input),
     })
 }
 

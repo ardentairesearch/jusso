@@ -128,6 +128,10 @@ pub struct ExecutionRequest {
     /// to poll `/status/{id}` — the result will be pushed automatically.
     #[serde(default)]
     pub callback_url: Option<String>,
+    /// Trusted metadata produced by typed protocol adapters. This field is
+    /// never accepted from or serialized to external callers.
+    #[serde(skip)]
+    pub policy_impact: crate::policy::ExecutionPolicyImpact,
 }
 
 /// Response after an execution or simulation request.

@@ -35,9 +35,39 @@ CREATE TABLE authorization_policies (
     max_value_wei TEXT CHECK (max_value_wei IS NULL OR max_value_wei ~ '^[0-9]+$'),
     max_execution_fee_usd DOUBLE PRECISION
         CHECK (max_execution_fee_usd IS NULL OR max_execution_fee_usd >= 0),
+    token_spend_limits JSONB NOT NULL DEFAULT '[]'::JSONB
+        CHECK (jsonb_typeof(token_spend_limits) = 'array'),
+    risk_permissions TEXT[] NOT NULL DEFAULT '{}',
+    rolling_window_seconds BIGINT NOT NULL DEFAULT 86400
+        CHECK (rolling_window_seconds BETWEEN 60 AND 2678400),
+    max_rolling_execution_fee_usd DOUBLE PRECISION
+        CHECK (max_rolling_execution_fee_usd IS NULL OR max_rolling_execution_fee_usd >= 0),
+    max_sponsored_gas_units BIGINT
+        CHECK (max_sponsored_gas_units IS NULL OR max_sponsored_gas_units > 0),
+    max_rolling_sponsored_gas_units BIGINT
+        CHECK (max_rolling_sponsored_gas_units IS NULL OR max_rolling_sponsored_gas_units > 0),
+    max_borrowed_value_usd DOUBLE PRECISION
+        CHECK (max_borrowed_value_usd IS NULL OR max_borrowed_value_usd >= 0),
+    max_rolling_borrowed_value_usd DOUBLE PRECISION
+        CHECK (max_rolling_borrowed_value_usd IS NULL OR max_rolling_borrowed_value_usd >= 0),
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (
+        max_execution_fee_usd IS NULL
+        OR max_rolling_execution_fee_usd IS NULL
+        OR max_rolling_execution_fee_usd >= max_execution_fee_usd
+    ),
+    CHECK (
+        max_sponsored_gas_units IS NULL
+        OR max_rolling_sponsored_gas_units IS NULL
+        OR max_rolling_sponsored_gas_units >= max_sponsored_gas_units
+    ),
+    CHECK (
+        max_borrowed_value_usd IS NULL
+        OR max_rolling_borrowed_value_usd IS NULL
+        OR max_rolling_borrowed_value_usd >= max_borrowed_value_usd
+    ),
     UNIQUE (organization_id, name)
 );
 CREATE INDEX idx_auth_policies_org ON authorization_policies(organization_id);
@@ -181,6 +211,7 @@ CREATE TABLE owner_accounts (
     owner_handle TEXT NOT NULL,
     owner_handle_normalized TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
+    webauthn_user_id UUID UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (principal_id, organization_id)
@@ -193,13 +224,38 @@ CREATE TABLE owner_passkeys (
     principal_id UUID NOT NULL REFERENCES owner_accounts(principal_id),
     credential_id TEXT NOT NULL UNIQUE,
     passkey JSONB NOT NULL,
+    turnkey_recovery_credential JSONB,
     label TEXT NOT NULL DEFAULT 'Primary passkey',
+    purpose TEXT NOT NULL DEFAULT 'primary'
+        CHECK (purpose IN ('primary', 'standard', 'recovery')),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'revoked')),
+    created_by_passkey_id UUID,
+    revoked_by_passkey_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used_at TIMESTAMPTZ,
-    UNIQUE (id, organization_id, principal_id)
+    revoked_at TIMESTAMPTZ,
+    UNIQUE (id, organization_id, principal_id),
+    FOREIGN KEY (created_by_passkey_id, organization_id, principal_id)
+        REFERENCES owner_passkeys(id, organization_id, principal_id),
+    FOREIGN KEY (revoked_by_passkey_id, organization_id, principal_id)
+        REFERENCES owner_passkeys(id, organization_id, principal_id),
+    CHECK (length(trim(label)) BETWEEN 1 AND 80),
+    CHECK (
+        turnkey_recovery_credential IS NULL
+        OR jsonb_typeof(turnkey_recovery_credential) = 'object'
+    ),
+    CHECK (
+        (status = 'active' AND revoked_at IS NULL AND revoked_by_passkey_id IS NULL)
+        OR (status = 'revoked' AND revoked_at IS NOT NULL AND revoked_by_passkey_id IS NOT NULL)
+    )
 );
 CREATE INDEX idx_owner_passkeys_principal ON owner_passkeys(principal_id);
+CREATE UNIQUE INDEX owner_passkeys_active_label_key
+    ON owner_passkeys(principal_id, lower(label)) WHERE status = 'active';
+CREATE INDEX owner_passkeys_active_principal
+    ON owner_passkeys(principal_id) WHERE status = 'active';
 
 ALTER TABLE connect_sessions
     ADD CONSTRAINT connect_sessions_passkey_id_fkey
@@ -210,7 +266,7 @@ CREATE TABLE oauth_authorization_codes (
     connect_session_id UUID NOT NULL UNIQUE REFERENCES connect_sessions(id),
     organization_id UUID NOT NULL REFERENCES organizations(id),
     principal_id UUID NOT NULL REFERENCES principals(id),
-    passkey_id UUID NOT NULL REFERENCES owner_passkeys(id),
+    passkey_id UUID NOT NULL,
     agent_id UUID REFERENCES agents(id),
     agent_external_id TEXT,
     client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
@@ -221,7 +277,9 @@ CREATE TABLE oauth_authorization_codes (
     expires_at TIMESTAMPTZ NOT NULL,
     used_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK ((agent_id IS NULL) = (agent_external_id IS NULL))
+    CHECK ((agent_id IS NULL) = (agent_external_id IS NULL)),
+    FOREIGN KEY (passkey_id, organization_id, principal_id)
+        REFERENCES owner_passkeys(id, organization_id, principal_id)
 );
 CREATE INDEX idx_oauth_authorization_codes_expiry
     ON oauth_authorization_codes(expires_at);
@@ -230,7 +288,7 @@ CREATE TABLE oauth_connections (
     id UUID PRIMARY KEY,
     organization_id UUID NOT NULL REFERENCES organizations(id),
     principal_id UUID NOT NULL REFERENCES principals(id),
-    passkey_id UUID NOT NULL REFERENCES owner_passkeys(id),
+    passkey_id UUID NOT NULL,
     agent_id UUID REFERENCES agents(id),
     agent_external_id TEXT,
     client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
@@ -243,10 +301,53 @@ CREATE TABLE oauth_connections (
     last_used_at TIMESTAMPTZ,
     revoked_at TIMESTAMPTZ,
     CHECK ((agent_id IS NULL) = (agent_external_id IS NULL)),
+    FOREIGN KEY (passkey_id, organization_id, principal_id)
+        REFERENCES owner_passkeys(id, organization_id, principal_id),
     UNIQUE (id, organization_id, principal_id)
 );
 CREATE INDEX idx_oauth_connections_principal
     ON oauth_connections(principal_id, created_at DESC);
+
+CREATE TABLE owner_passkey_enrollment_requests (
+    id UUID PRIMARY KEY,
+    organization_id UUID NOT NULL,
+    principal_id UUID NOT NULL,
+    oauth_connection_id UUID NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    label TEXT NOT NULL CHECK (length(trim(label)) BETWEEN 1 AND 80),
+    purpose TEXT NOT NULL CHECK (purpose IN ('standard', 'recovery')),
+    replaces_passkey_id UUID,
+    authenticated_by_passkey_id UUID,
+    created_passkey_id UUID,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'completed', 'expired')),
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    FOREIGN KEY (principal_id, organization_id)
+        REFERENCES owner_accounts(principal_id, organization_id),
+    FOREIGN KEY (oauth_connection_id, organization_id, principal_id)
+        REFERENCES oauth_connections(id, organization_id, principal_id),
+    FOREIGN KEY (replaces_passkey_id, organization_id, principal_id)
+        REFERENCES owner_passkeys(id, organization_id, principal_id),
+    FOREIGN KEY (authenticated_by_passkey_id, organization_id, principal_id)
+        REFERENCES owner_passkeys(id, organization_id, principal_id),
+    FOREIGN KEY (created_passkey_id, organization_id, principal_id)
+        REFERENCES owner_passkeys(id, organization_id, principal_id),
+    CHECK (expires_at > created_at),
+    CHECK (
+        (status = 'completed') =
+        (completed_at IS NOT NULL AND authenticated_by_passkey_id IS NOT NULL
+         AND created_passkey_id IS NOT NULL)
+    )
+);
+CREATE INDEX owner_passkey_enrollment_requests_owner
+    ON owner_passkey_enrollment_requests(organization_id, principal_id, created_at DESC);
+CREATE UNIQUE INDEX owner_passkey_enrollment_requests_one_pending
+    ON owner_passkey_enrollment_requests(principal_id)
+    WHERE status = 'pending';
+CREATE INDEX owner_passkey_enrollment_requests_expiry
+    ON owner_passkey_enrollment_requests(expires_at) WHERE status = 'pending';
 
 CREATE TABLE oauth_refresh_tokens (
     token_hash TEXT PRIMARY KEY CHECK (token_hash ~ '^[0-9a-f]{64}$'),
@@ -267,9 +368,10 @@ CREATE TABLE owner_approval_requests (
     token_hash TEXT NOT NULL UNIQUE CHECK (token_hash ~ '^[0-9a-f]{64}$'),
     action TEXT NOT NULL CHECK (
         action IN (
-            'create_policy', 'assign_policy', 'revoke_policy',
+            'create_policy', 'update_policy', 'assign_policy', 'revoke_policy',
             'create_agent', 'suspend_agent', 'reactivate_agent',
-            'rotate_agent_credential', 'rotate_agent_onchain_signer'
+            'rotate_agent_credential', 'rotate_agent_onchain_signer',
+            'revoke_owner_passkey'
         )
     ),
     payload JSONB NOT NULL,
@@ -303,17 +405,49 @@ CREATE TABLE turnkey_organization_bindings (
     organization_id UUID PRIMARY KEY REFERENCES organizations(id),
     provider_organization_id TEXT UNIQUE,
     sub_organization_name TEXT NOT NULL UNIQUE,
+    -- The runtime credential is a non-root Turnkey service user.
     api_public_key TEXT NOT NULL,
     api_private_key_encrypted TEXT NOT NULL,
+    -- Bootstrap root authority exists only while provisioning is incomplete.
+    bootstrap_api_public_key TEXT,
+    bootstrap_api_private_key_encrypted TEXT,
+    bootstrap_user_id TEXT,
+    recovery_user_id TEXT,
+    runtime_user_id TEXT,
+    wallet_policy_id TEXT,
+    signing_policy_id TEXT,
+    credential_lockdown_policy_id TEXT,
+    root_hardened_at TIMESTAMPTZ,
     status TEXT NOT NULL CHECK (status IN ('provisioning', 'active', 'failed')),
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (
-        (status = 'active') = (provider_organization_id IS NOT NULL)
-    ),
+    CHECK (status <> 'active' OR (
+        provider_organization_id IS NOT NULL
+        AND bootstrap_api_public_key IS NULL
+        AND bootstrap_api_private_key_encrypted IS NULL
+        AND bootstrap_user_id IS NOT NULL
+        AND recovery_user_id IS NOT NULL
+        AND runtime_user_id IS NOT NULL
+        AND wallet_policy_id IS NOT NULL
+        AND signing_policy_id IS NOT NULL
+        AND credential_lockdown_policy_id IS NOT NULL
+        AND root_hardened_at IS NOT NULL
+    )),
     CHECK (api_public_key ~ '^(02|03)[0-9a-f]{64}$'),
     CHECK (btrim(api_private_key_encrypted) <> ''),
+    CHECK (
+        (bootstrap_api_public_key IS NULL) =
+        (bootstrap_api_private_key_encrypted IS NULL)
+    ),
+    CHECK (
+        bootstrap_api_public_key IS NULL
+        OR bootstrap_api_public_key ~ '^(02|03)[0-9a-f]{64}$'
+    ),
+    CHECK (
+        bootstrap_api_private_key_encrypted IS NULL
+        OR btrim(bootstrap_api_private_key_encrypted) <> ''
+    ),
     CHECK (provider_organization_id IS NULL OR btrim(provider_organization_id) <> ''),
     UNIQUE (organization_id, provider_organization_id)
 );
@@ -463,6 +597,8 @@ CREATE TABLE execution_requests (
     instance_id UUID REFERENCES agent_instances(id),
     policy_id UUID NOT NULL REFERENCES authorization_policies(id),
     policy_version BIGINT NOT NULL CHECK (policy_version > 0),
+    policy_impact JSONB NOT NULL DEFAULT '{}'::JSONB
+        CHECK (jsonb_typeof(policy_impact) = 'object'),
     agent_id TEXT NOT NULL,
     smart_wallet_address TEXT,
     chain TEXT NOT NULL,
@@ -500,6 +636,40 @@ CREATE INDEX idx_execution_requests_org_id ON execution_requests(organization_id
 CREATE UNIQUE INDEX execution_requests_org_idempotency
     ON execution_requests(organization_id, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
+
+CREATE TABLE policy_budget_reservations (
+    request_id UUID PRIMARY KEY REFERENCES execution_requests(id),
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    agent_id UUID NOT NULL REFERENCES agents(id),
+    policy_id UUID NOT NULL REFERENCES authorization_policies(id),
+    policy_version BIGINT NOT NULL CHECK (policy_version > 0),
+    execution_fee_microusd BIGINT NOT NULL CHECK (execution_fee_microusd >= 0),
+    borrowed_value_microusd BIGINT NOT NULL CHECK (borrowed_value_microusd >= 0),
+    sponsored_gas_units BIGINT NOT NULL CHECK (sponsored_gas_units >= 0),
+    status TEXT NOT NULL DEFAULT 'reserved'
+        CHECK (status IN ('reserved', 'committed', 'released')),
+    reserved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    committed_at TIMESTAMPTZ,
+    released_at TIMESTAMPTZ,
+    CHECK (
+        (status = 'reserved' AND committed_at IS NULL AND released_at IS NULL)
+        OR (status = 'committed' AND committed_at IS NOT NULL AND released_at IS NULL)
+        OR (status = 'released' AND released_at IS NOT NULL)
+    )
+);
+CREATE INDEX policy_budget_reservations_agent_window
+    ON policy_budget_reservations(organization_id, agent_id, reserved_at DESC)
+    WHERE status IN ('reserved', 'committed');
+
+CREATE TABLE policy_token_spend_reservations (
+    request_id UUID NOT NULL REFERENCES policy_budget_reservations(request_id) ON DELETE CASCADE,
+    token_address TEXT NOT NULL,
+    amount_raw NUMERIC(78, 0) NOT NULL CHECK (amount_raw > 0),
+    PRIMARY KEY (request_id, token_address),
+    CHECK (token_address ~ '^0x[0-9a-f]{40}$')
+);
+CREATE INDEX policy_token_spend_reservations_token
+    ON policy_token_spend_reservations(token_address, request_id);
 
 CREATE TABLE execution_permits (
     id UUID PRIMARY KEY,

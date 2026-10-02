@@ -47,6 +47,14 @@ pub struct AuthorizationPolicyRow {
     pub allow_raw_execution: bool,
     pub max_value_wei: Option<String>,
     pub max_execution_fee_usd: Option<f64>,
+    pub token_spend_limits: serde_json::Value,
+    pub risk_permissions: Vec<String>,
+    pub rolling_window_seconds: i64,
+    pub max_rolling_execution_fee_usd: Option<f64>,
+    pub max_sponsored_gas_units: Option<i64>,
+    pub max_rolling_sponsored_gas_units: Option<i64>,
+    pub max_borrowed_value_usd: Option<f64>,
+    pub max_rolling_borrowed_value_usd: Option<f64>,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -65,6 +73,25 @@ pub struct OwnerApprovalRequestRow {
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub approved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct OwnerPasskeyEnrollmentRequestRow {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub principal_id: Uuid,
+    pub oauth_connection_id: Uuid,
+    #[serde(skip_serializing)]
+    pub token_hash: String,
+    pub label: String,
+    pub purpose: String,
+    pub replaces_passkey_id: Option<Uuid>,
+    pub authenticated_by_passkey_id: Option<Uuid>,
+    pub created_passkey_id: Option<Uuid>,
+    pub status: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -151,6 +178,7 @@ pub struct ExecutionRequestRow {
     pub instance_id: Option<Uuid>,
     pub policy_id: Uuid,
     pub policy_version: i64,
+    pub policy_impact: serde_json::Value,
     pub idempotency_key: Option<String>,
     pub idempotency_fingerprint: Option<String>,
 }

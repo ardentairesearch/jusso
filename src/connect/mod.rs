@@ -743,6 +743,8 @@ async fn finish_registration(
         .context("passkey registration verification failed")?;
     let passkey_id = Uuid::new_v4();
     let credential_id = URL_SAFE_NO_PAD.encode(passkey.cred_id().as_ref());
+    let turnkey_recovery_credential =
+        turnkey_recovery_credential(&body.credential, &credential_id)?;
     let policy_actions = auth::DEFAULT_POLICY_ACTIONS
         .iter()
         .map(|value| (*value).to_string())
@@ -760,10 +762,12 @@ async fn finish_registration(
             organization_name: &stored.organization_name,
             display_name: &stored.display_name,
             owner_handle: &stored.owner_handle,
+            webauthn_user_id: stored.user_id,
             agent_external_id: &stored.agent_id,
             passkey_id,
             credential_id: &credential_id,
             passkey: &serde_json::to_value(passkey)?,
+            turnkey_recovery_credential: &turnkey_recovery_credential,
             policy_actions: &policy_actions,
             policy_protocols: &policy_protocols,
             max_execution_fee_usd: auth::DEFAULT_MAX_EXECUTION_FEE_USD,
@@ -869,7 +873,7 @@ async fn start_authentication(
            JOIN owner_accounts oa ON oa.principal_id = op.principal_id
            JOIN principals p ON p.id = op.principal_id AND p.status = 'active'
            JOIN organizations o ON o.id = op.organization_id AND o.status = 'active'
-           WHERE oa.owner_handle_normalized = $1"#,
+           WHERE oa.owner_handle_normalized = $1 AND op.status = 'active'"#,
     )
     .bind(handle)
     .fetch_all(&service.pool)
@@ -956,7 +960,7 @@ async fn finish_authentication(
         .finish_passkey_authentication(&body.credential, &stored.state)
         .context("passkey authentication failed")?;
     let rows = sqlx::query_as::<_, OwnerPasskeyRow>(
-        "SELECT id, organization_id, principal_id, passkey FROM owner_passkeys WHERE principal_id = $1",
+        "SELECT id, organization_id, principal_id, passkey FROM owner_passkeys WHERE principal_id = $1 AND status = 'active'",
     )
     .bind(stored.principal_id)
     .fetch_all(&service.pool)
@@ -965,15 +969,19 @@ async fn finish_authentication(
     for row in rows {
         let mut passkey: Passkey = serde_json::from_value(row.passkey.clone())?;
         if passkey.update_credential(&result).is_some() {
-            sqlx::query(
-                "UPDATE owner_passkeys SET passkey = $2, last_used_at = now(), updated_at = now() WHERE id = $1",
+            let updated = sqlx::query(
+                r#"UPDATE owner_passkeys
+                   SET passkey = $2, last_used_at = now(), updated_at = now()
+                   WHERE id = $1 AND status = 'active'"#,
             )
             .bind(row.id)
             .bind(serde_json::to_value(passkey)?)
             .execute(&service.pool)
             .await?;
-            matched = Some(row);
-            break;
+            if updated.rows_affected() == 1 {
+                matched = Some(row);
+                break;
+            }
         }
     }
     let passkey = matched.ok_or_else(|| anyhow!("authenticated passkey is not registered"))?;
@@ -1006,7 +1014,12 @@ async fn complete_connect_session(
            SET status = 'completed', organization_id = $2, principal_id = $3,
                passkey_id = $4, selected_agent_id = $5,
                selected_agent_external_id = $6, completed_at = now()
-           WHERE id = $1 AND status = 'pending' AND expires_at > now()"#,
+           WHERE id = $1 AND status = 'pending' AND expires_at > now()
+             AND EXISTS (
+                 SELECT 1 FROM owner_passkeys op
+                 WHERE op.id = $4 AND op.organization_id = $2
+                   AND op.principal_id = $3 AND op.status = 'active'
+             )"#,
     )
     .bind(session.id)
     .bind(organization_id)
@@ -1047,12 +1060,435 @@ async fn complete_connect_session(
 }
 
 #[derive(Debug, FromRow)]
+struct PendingPasskeyEnrollmentRow {
+    id: Uuid,
+    organization_id: Uuid,
+    principal_id: Uuid,
+    label: String,
+    purpose: String,
+    replaces_passkey_id: Option<Uuid>,
+    owner_handle: String,
+    display_name: String,
+    webauthn_user_id: Uuid,
+}
+
+async fn pending_passkey_enrollment(
+    pool: &PgPool,
+    raw_token: &str,
+) -> Result<PendingPasskeyEnrollmentRow> {
+    let hash = token_hash(raw_token);
+    sqlx::query(
+        r#"UPDATE owner_passkey_enrollment_requests SET status = 'expired'
+           WHERE token_hash = $1 AND status = 'pending' AND expires_at <= now()"#,
+    )
+    .bind(&hash)
+    .execute(pool)
+    .await?;
+    sqlx::query_as::<_, PendingPasskeyEnrollmentRow>(
+        r#"SELECT r.id, r.organization_id, r.principal_id, r.label, r.purpose,
+                  r.replaces_passkey_id, oa.owner_handle_normalized AS owner_handle,
+                  oa.display_name, oa.webauthn_user_id
+           FROM owner_passkey_enrollment_requests r
+           JOIN owner_accounts oa ON oa.principal_id = r.principal_id
+             AND oa.organization_id = r.organization_id
+           JOIN oauth_connections c ON c.id = r.oauth_connection_id
+             AND c.organization_id = r.organization_id
+             AND c.principal_id = r.principal_id
+           JOIN principals p ON p.id = r.principal_id AND p.status = 'active'
+           JOIN organizations o ON o.id = r.organization_id AND o.status = 'active'
+           WHERE r.token_hash = $1 AND r.status = 'pending' AND r.expires_at > now()
+             AND c.status = 'active' AND c.agent_id IS NULL
+             AND oa.webauthn_user_id IS NOT NULL"#,
+    )
+    .bind(hash)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow!("passkey enrollment link is invalid, expired, or already used"))
+}
+
+pub async fn owner_passkey_enrollment_page_handler(
+    State(service): State<ConnectService>,
+    Path(token): Path<String>,
+) -> Response {
+    let enrollment = match pending_passkey_enrollment(&service.pool, &token).await {
+        Ok(enrollment) => enrollment,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Html("This passkey enrollment link is invalid or expired.".to_string()),
+            )
+                .into_response()
+        }
+    };
+    let mut response = Html(passkey_enrollment_page_html(
+        &token,
+        &enrollment.label,
+        &enrollment.purpose,
+        enrollment.replaces_passkey_id.is_some(),
+    ))
+    .into_response();
+    response.headers_mut().insert(
+        "cache-control",
+        "no-store, max-age=0".parse().expect("static header"),
+    );
+    response.headers_mut().insert(
+        "referrer-policy",
+        "no-referrer".parse().expect("static header"),
+    );
+    response
+        .headers_mut()
+        .insert("x-frame-options", "DENY".parse().expect("static header"));
+    response.headers_mut().insert(
+        "content-security-policy",
+        "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'"
+            .parse()
+            .expect("static header"),
+    );
+    response.headers_mut().insert(
+        "permissions-policy",
+        "publickey-credentials-get=(self), publickey-credentials-create=(self)"
+            .parse()
+            .expect("static header"),
+    );
+    response
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredPasskeyEnrollmentAuthentication {
+    request_id: Uuid,
+    organization_id: Uuid,
+    principal_id: Uuid,
+    state: PasskeyAuthentication,
+}
+
+pub async fn owner_passkey_enrollment_auth_start_handler(
+    State(service): State<ConnectService>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Response {
+    match start_passkey_enrollment_authentication(&service, peer, &headers, &token).await {
+        Ok((ceremony_id, options)) => Json(serde_json::json!({
+            "ceremony_id": ceremony_id,
+            "options": options
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "passkey enrollment authentication could not be started");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "passkey enrollment could not be started"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn start_passkey_enrollment_authentication(
+    service: &ConnectService,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    token: &str,
+) -> Result<(String, serde_json::Value)> {
+    let enrollment = pending_passkey_enrollment(&service.pool, token).await?;
+    let client_ip = registration_client_ip(
+        headers,
+        peer.ip(),
+        service.config.registration_client_ip_header.as_deref(),
+    )?;
+    let limiter = RateLimiter::new(service.redis.clone(), 20.0 / 3600.0, 20.0);
+    let fingerprint = keyed_fingerprint(
+        &service.config.auth_secret_encryption_key,
+        &client_ip.to_string(),
+    );
+    if limiter
+        .check_key(&format!("passkey-enrollment:{fingerprint}"))
+        .await?
+        .is_some()
+    {
+        anyhow::bail!("passkey enrollment rate limit exceeded");
+    }
+    let rows = sqlx::query_as::<_, OwnerPasskeyRow>(
+        r#"SELECT id, organization_id, principal_id, passkey
+           FROM owner_passkeys
+           WHERE organization_id = $1 AND principal_id = $2 AND status = 'active'"#,
+    )
+    .bind(enrollment.organization_id)
+    .bind(enrollment.principal_id)
+    .fetch_all(&service.pool)
+    .await?;
+    if rows.is_empty() {
+        anyhow::bail!("owner has no active passkey");
+    }
+    let passkeys = rows
+        .into_iter()
+        .map(|row| serde_json::from_value::<Passkey>(row.passkey))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let (challenge, state) = service.webauthn.start_passkey_authentication(&passkeys)?;
+    let ceremony_id = random_token();
+    store_ceremony(
+        service,
+        &ceremony_id,
+        &StoredPasskeyEnrollmentAuthentication {
+            request_id: enrollment.id,
+            organization_id: enrollment.organization_id,
+            principal_id: enrollment.principal_id,
+            state,
+        },
+    )
+    .await?;
+    Ok((ceremony_id, serde_json::to_value(challenge)?))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredAdditionalPasskeyRegistration {
+    request_id: Uuid,
+    organization_id: Uuid,
+    principal_id: Uuid,
+    authenticated_by_passkey_id: Uuid,
+    state: PasskeyRegistration,
+}
+
+pub async fn owner_passkey_enrollment_auth_finish_handler(
+    State(service): State<ConnectService>,
+    Path(token): Path<String>,
+    Json(body): Json<AuthenticationFinishRequest>,
+) -> Response {
+    match finish_passkey_enrollment_authentication(&service, &token, body).await {
+        Ok((ceremony_id, options)) => Json(serde_json::json!({
+            "ceremony_id": ceremony_id,
+            "options": options
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "passkey enrollment authentication failed");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "owner passkey authentication failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn finish_passkey_enrollment_authentication(
+    service: &ConnectService,
+    token: &str,
+    body: AuthenticationFinishRequest,
+) -> Result<(String, serde_json::Value)> {
+    let enrollment = pending_passkey_enrollment(&service.pool, token).await?;
+    let stored: StoredPasskeyEnrollmentAuthentication =
+        take_ceremony(service, &body.ceremony_id).await?;
+    if stored.request_id != enrollment.id
+        || stored.organization_id != enrollment.organization_id
+        || stored.principal_id != enrollment.principal_id
+    {
+        anyhow::bail!("authentication ceremony does not belong to this enrollment");
+    }
+    let result = service
+        .webauthn
+        .finish_passkey_authentication(&body.credential, &stored.state)
+        .context("passkey enrollment owner authentication failed")?;
+    let rows = sqlx::query_as::<_, OwnerPasskeyRow>(
+        r#"SELECT id, organization_id, principal_id, passkey
+           FROM owner_passkeys
+           WHERE organization_id = $1 AND principal_id = $2 AND status = 'active'"#,
+    )
+    .bind(enrollment.organization_id)
+    .bind(enrollment.principal_id)
+    .fetch_all(&service.pool)
+    .await?;
+    let mut matched = None;
+    let mut active_passkeys = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut passkey: Passkey = serde_json::from_value(row.passkey)?;
+        if passkey.update_credential(&result).is_some() {
+            matched = Some((row.id, serde_json::to_value(&passkey)?));
+        }
+        active_passkeys.push(passkey);
+    }
+    let (authenticated_by, updated_passkey) =
+        matched.ok_or_else(|| anyhow!("authenticated passkey is not registered"))?;
+    db::authenticate_owner_passkey_enrollment(
+        &service.pool,
+        enrollment.id,
+        authenticated_by,
+        &updated_passkey,
+    )
+    .await?;
+    let exclude = active_passkeys
+        .iter()
+        .map(|passkey| passkey.cred_id().clone())
+        .collect::<Vec<_>>();
+    let (challenge, state) = service.webauthn.start_passkey_registration(
+        enrollment.webauthn_user_id,
+        &enrollment.owner_handle,
+        &enrollment.display_name,
+        Some(exclude),
+    )?;
+    let ceremony_id = random_token();
+    store_ceremony(
+        service,
+        &ceremony_id,
+        &StoredAdditionalPasskeyRegistration {
+            request_id: enrollment.id,
+            organization_id: enrollment.organization_id,
+            principal_id: enrollment.principal_id,
+            authenticated_by_passkey_id: authenticated_by,
+            state,
+        },
+    )
+    .await?;
+    Ok((ceremony_id, serde_json::to_value(challenge)?))
+}
+
+pub async fn owner_passkey_enrollment_register_finish_handler(
+    State(service): State<ConnectService>,
+    Path(token): Path<String>,
+    Json(body): Json<RegistrationFinishRequest>,
+) -> Response {
+    match finish_additional_passkey_registration(&service, &token, body).await {
+        Ok(result) => {
+            Json(serde_json::json!({"completed": true, "result": result})).into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "additional passkey registration failed");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "new passkey registration failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn finish_additional_passkey_registration(
+    service: &ConnectService,
+    token: &str,
+    body: RegistrationFinishRequest,
+) -> Result<serde_json::Value> {
+    let enrollment = pending_passkey_enrollment(&service.pool, token).await?;
+    let stored: StoredAdditionalPasskeyRegistration =
+        take_ceremony(service, &body.ceremony_id).await?;
+    if stored.request_id != enrollment.id
+        || stored.organization_id != enrollment.organization_id
+        || stored.principal_id != enrollment.principal_id
+    {
+        anyhow::bail!("registration ceremony does not belong to this enrollment");
+    }
+    let passkey = service
+        .webauthn
+        .finish_passkey_registration(&body.credential, &stored.state)
+        .context("additional passkey registration verification failed")?;
+    let credential_id = URL_SAFE_NO_PAD.encode(passkey.cred_id().as_ref());
+    let turnkey_recovery_credential =
+        turnkey_recovery_credential(&body.credential, &credential_id)?;
+    db::complete_owner_passkey_enrollment(
+        &service.pool,
+        db::CompleteOwnerPasskeyEnrollmentOptions {
+            request_id: enrollment.id,
+            authenticated_by_passkey_id: stored.authenticated_by_passkey_id,
+            new_passkey_id: Uuid::new_v4(),
+            credential_id: &credential_id,
+            passkey: &serde_json::to_value(passkey)?,
+            turnkey_recovery_credential: &turnkey_recovery_credential,
+        },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct WebauthnClientData {
+    challenge: String,
+}
+
+fn turnkey_recovery_credential(
+    credential: &RegisterPublicKeyCredential,
+    verified_credential_id: &str,
+) -> Result<serde_json::Value> {
+    if verified_credential_id.is_empty() || verified_credential_id.len() > 256 {
+        anyhow::bail!("passkey credential ID cannot be used for Turnkey recovery");
+    }
+    let client_data = credential.response.client_data_json.as_ref();
+    let challenge = serde_json::from_slice::<WebauthnClientData>(client_data)
+        .context("passkey client data is invalid")?
+        .challenge;
+    if challenge.is_empty() || challenge.len() > 256 {
+        anyhow::bail!("passkey challenge cannot be used for Turnkey recovery");
+    }
+    let transports = credential
+        .response
+        .transports
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|transport| {
+            let serialized = serde_json::to_value(transport).ok()?;
+            match serialized.as_str()? {
+                "ble" => Some("AUTHENTICATOR_TRANSPORT_BLE"),
+                "internal" => Some("AUTHENTICATOR_TRANSPORT_INTERNAL"),
+                "nfc" => Some("AUTHENTICATOR_TRANSPORT_NFC"),
+                "usb" => Some("AUTHENTICATOR_TRANSPORT_USB"),
+                "hybrid" => Some("AUTHENTICATOR_TRANSPORT_HYBRID"),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "authenticatorName": "Jusso Owner Passkey",
+        "challenge": challenge,
+        "attestation": {
+            "credentialId": verified_credential_id,
+            "clientDataJson": URL_SAFE_NO_PAD.encode(client_data),
+            "attestationObject": URL_SAFE_NO_PAD.encode(
+                credential.response.attestation_object.as_ref()
+            ),
+            "transports": transports,
+        }
+    }))
+}
+
+fn passkey_enrollment_page_html(
+    token: &str,
+    label: &str,
+    purpose: &str,
+    replacing: bool,
+) -> String {
+    let token = serde_json::to_string(token).expect("token is serializable");
+    let label = html_escape(label);
+    let purpose = html_escape(purpose);
+    let verb = if replacing { "Replace" } else { "Add" };
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{verb} owner passkey</title><style>
+:root{{color-scheme:light dark;--ink:#111713;--paper:#f5f7f5;--line:#ccd5ce;--green:#008f50;--muted:#5f6d64}}
+*{{box-sizing:border-box}}body{{margin:0;font:15px/1.5 system-ui,sans-serif;background:var(--paper);color:var(--ink)}}
+main{{width:min(560px,calc(100% - 32px));margin:8vh auto}}h1{{font-size:30px;margin:8px 0}}p{{color:var(--muted)}}
+.mark{{font-weight:800;letter-spacing:.08em}}.panel{{border:1px solid var(--line);padding:24px}}dl{{display:grid;grid-template-columns:auto 1fr;gap:8px 18px;margin:0 0 22px}}dt{{color:var(--muted)}}dd{{margin:0;font-weight:650}}button{{width:100%;padding:12px;border:0;background:var(--green);color:white;font:inherit;font-weight:700;cursor:pointer}}button:disabled{{opacity:.55}}#message{{min-height:24px;margin-top:16px}}
+</style></head><body><main><div class="mark">JUSSO</div><h1>{verb} owner passkey</h1><p>Confirm with an active owner passkey, then create the new credential.</p><section class="panel"><dl><dt>Label</dt><dd>{label}</dd><dt>Purpose</dt><dd>{purpose}</dd></dl><button id="continue">Continue with passkeys</button><div id="message" role="alert"></div></section></main>
+<script>
+const token={token};const message=document.querySelector('#message');const button=document.querySelector('#continue');
+const b64u=b=>{{let s='';new Uint8Array(b).forEach(v=>s+=String.fromCharCode(v));return btoa(s).replaceAll('+','-').replaceAll('/','_').replaceAll('=','')}};
+const bytes=s=>{{s=s.replaceAll('-','+').replaceAll('_','/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))}};
+function creation(o){{o.challenge=bytes(o.challenge);o.user.id=bytes(o.user.id);(o.excludeCredentials||[]).forEach(c=>c.id=bytes(c.id));return o}}
+function request(o){{o.challenge=bytes(o.challenge);(o.allowCredentials||[]).forEach(c=>c.id=bytes(c.id));return o}}
+function regJSON(c){{return {{id:c.id,type:c.type,rawId:b64u(c.rawId),authenticatorAttachment:c.authenticatorAttachment,response:{{attestationObject:b64u(c.response.attestationObject),clientDataJSON:b64u(c.response.clientDataJSON),transports:c.response.getTransports?c.response.getTransports():[]}},clientExtensionResults:c.getClientExtensionResults()}}}}
+function authJSON(c){{return {{id:c.id,type:c.type,rawId:b64u(c.rawId),authenticatorAttachment:c.authenticatorAttachment,response:{{authenticatorData:b64u(c.response.authenticatorData),clientDataJSON:b64u(c.response.clientDataJSON),signature:b64u(c.response.signature),userHandle:c.response.userHandle?b64u(c.response.userHandle):null}},clientExtensionResults:c.getClientExtensionResults()}}}}
+async function post(path,body){{const r=await fetch(`/passkeys/enroll/${{token}}/${{path}}`,{{method:'POST',headers:{{'content-type':'application/json'}},body:body?JSON.stringify(body):null}});const j=await r.json();if(!r.ok)throw new Error(j.error||'Request failed');return j}}
+button.onclick=async()=>{{button.disabled=true;message.textContent='Confirming owner passkey...';try{{const auth=await post('authenticate/start');const existing=await navigator.credentials.get({{publicKey:request(auth.options.publicKey)}});const registration=await post('authenticate/finish',{{ceremony_id:auth.ceremony_id,credential:authJSON(existing)}});message.textContent='Create the new passkey...';const created=await navigator.credentials.create({{publicKey:creation(registration.options.publicKey)}});await post('register/finish',{{ceremony_id:registration.ceremony_id,credential:regJSON(created)}});message.textContent='Passkey updated. You may return to your assistant.'}}catch(err){{button.disabled=false;message.textContent=err.message}}}};
+</script></body></html>"#
+    )
+}
+
+#[derive(Debug, FromRow)]
 struct PendingOwnerApprovalRow {
     id: Uuid,
     organization_id: Uuid,
     principal_id: Uuid,
     client_name: String,
     presentation: serde_json::Value,
+    excluded_passkey_id: Option<Uuid>,
 }
 
 async fn pending_owner_approval(pool: &PgPool, raw_token: &str) -> Result<PendingOwnerApprovalRow> {
@@ -1065,7 +1501,10 @@ async fn pending_owner_approval(pool: &PgPool, raw_token: &str) -> Result<Pendin
     .await?;
     sqlx::query_as::<_, PendingOwnerApprovalRow>(
         r#"SELECT ar.id, ar.organization_id, ar.principal_id,
-                  oc.client_name, ar.presentation
+                  oc.client_name, ar.presentation,
+                  CASE WHEN ar.action = 'revoke_owner_passkey'
+                       THEN (ar.payload->>'passkey_id')::uuid
+                  END AS excluded_passkey_id
            FROM owner_approval_requests ar
            JOIN oauth_connections c ON c.id = ar.oauth_connection_id
            JOIN oauth_clients oc ON oc.client_id = c.client_id
@@ -1182,10 +1621,12 @@ async fn start_owner_approval(
     let rows = sqlx::query_as::<_, OwnerPasskeyRow>(
         r#"SELECT op.id, op.organization_id, op.principal_id, op.passkey
            FROM owner_passkeys op
-           WHERE op.organization_id = $1 AND op.principal_id = $2"#,
+           WHERE op.organization_id = $1 AND op.principal_id = $2
+             AND op.status = 'active' AND op.id IS DISTINCT FROM $3"#,
     )
     .bind(approval.organization_id)
     .bind(approval.principal_id)
+    .bind(approval.excluded_passkey_id)
     .fetch_all(&service.pool)
     .await?;
     if rows.is_empty() {
@@ -1249,7 +1690,8 @@ async fn finish_owner_approval(
         .context("owner approval passkey verification failed")?;
     let rows = sqlx::query_as::<_, OwnerPasskeyRow>(
         r#"SELECT id, organization_id, principal_id, passkey
-           FROM owner_passkeys WHERE organization_id = $1 AND principal_id = $2"#,
+           FROM owner_passkeys WHERE organization_id = $1 AND principal_id = $2
+             AND status = 'active'"#,
     )
     .bind(approval.organization_id)
     .bind(approval.principal_id)
@@ -1569,5 +2011,68 @@ mod tests {
         assert!(!html.contains("</pre><script>alert(1)</script>"));
         assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
         assert!(html.contains("&lt;/pre&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
+    }
+
+    #[test]
+    fn passkey_enrollment_page_escapes_credential_metadata() {
+        let html = passkey_enrollment_page_html(
+            "safe-token",
+            "<img src=x onerror=alert(1)>",
+            "</dd><script>alert(2)</script>",
+            true,
+        );
+
+        assert!(!html.contains("<img src=x onerror=alert(1)>"));
+        assert!(!html.contains("</dd><script>alert(2)</script>"));
+        assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(html.contains("&lt;/dd&gt;&lt;script&gt;alert(2)&lt;/script&gt;"));
+        assert!(html.contains("Replace owner passkey"));
+    }
+
+    #[test]
+    fn verified_passkey_registration_builds_a_turnkey_authenticator() {
+        let client_data = br#"{"type":"webauthn.create","challenge":"test-challenge","origin":"https://jusso.example"}"#;
+        let credential: RegisterPublicKeyCredential = serde_json::from_value(serde_json::json!({
+            "id": "verified-credential",
+            "rawId": "dmVyaWZpZWQtY3JlZGVudGlhbA",
+            "type": "public-key",
+            "response": {
+                "attestationObject": URL_SAFE_NO_PAD.encode(b"attestation"),
+                "clientDataJSON": URL_SAFE_NO_PAD.encode(client_data),
+                "transports": ["internal", "hybrid", "test"]
+            },
+            "clientExtensionResults": {}
+        }))
+        .expect("registration credential");
+
+        let stored = turnkey_recovery_credential(&credential, "verified-credential")
+            .expect("Turnkey recovery credential");
+        let authenticator =
+            serde_json::from_value::<turnkey_client::generated::AuthenticatorParamsV2>(stored)
+                .expect("Turnkey SDK authenticator");
+
+        assert_eq!(authenticator.challenge, "test-challenge");
+        let attestation = authenticator.attestation.expect("attestation");
+        assert_eq!(attestation.credential_id, "verified-credential");
+        assert_eq!(attestation.transports.len(), 2);
+    }
+
+    #[test]
+    fn invalid_turnkey_passkey_material_is_rejected() {
+        let credential: RegisterPublicKeyCredential = serde_json::from_value(serde_json::json!({
+            "id": "credential",
+            "rawId": "Y3JlZGVudGlhbA",
+            "type": "public-key",
+            "response": {
+                "attestationObject": URL_SAFE_NO_PAD.encode(b"attestation"),
+                "clientDataJSON": URL_SAFE_NO_PAD.encode(br#"{"type":"webauthn.create","challenge":"","origin":"https://jusso.example"}"#),
+                "transports": []
+            },
+            "clientExtensionResults": {}
+        }))
+        .expect("registration credential");
+
+        assert!(turnkey_recovery_credential(&credential, "credential").is_err());
+        assert!(turnkey_recovery_credential(&credential, &"x".repeat(257)).is_err());
     }
 }

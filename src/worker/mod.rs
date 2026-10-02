@@ -172,6 +172,8 @@ async fn execute_arc(
         strategy_id: None,
         batch_calls: job.batch_calls.clone(),
         callback_url: job.callback_url.clone(),
+        policy_impact: serde_json::from_value(record.policy_impact.clone())
+            .context("stored execution policy impact is invalid")?,
     };
     if db::execution_payload_hash(&queued_request)? != record.payload_hash
         || record.agent_id != job.agent_id
@@ -664,6 +666,7 @@ mod tests {
             strategy_id: None,
             batch_calls: None,
             callback_url: None,
+            policy_impact: crate::policy::ExecutionPolicyImpact::default(),
         };
         let response = services::handle_execute_idempotent(
             &ctx.engine,

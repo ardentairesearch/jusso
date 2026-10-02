@@ -26,21 +26,8 @@ than retained as a historical checklist.
 - [ ] Add end-to-end tests for enrollment, simulation, execution, expiry,
   revocation, signer rotation, and compromised-agent containment.
 
-## Policy Hardening
-
-- [ ] Add conservative per-transaction and rolling-window limits for token
-  spend, borrowed value, execution fees, and sponsored native gas.
-- [ ] Require explicit opt-in for borrowing, leverage, withdrawals to new
-  recipients, unlimited approvals, and other high-risk protocol actions.
-- [ ] Mirror enforceable wallet-signing restrictions into Turnkey policies,
-  while keeping Jusso authorization as the first policy boundary.
-- [ ] Add policy migration, policy-version pinning, denial audit events, and
-  adversarial tests before changing the self-service default.
-
 ## Owner And Agent Lifecycle
 
-- [ ] Add owner-facing recovery and passkey addition, replacement, and removal
-  without introducing a standing admin secret.
 - [ ] Add notification and expiry handling for abandoned approval requests.
 
 ## Turnkey Operations
@@ -49,5 +36,6 @@ than retained as a historical checklist.
   secret service and define credential rotation procedures.
 - [ ] Add operator reconciliation for Turnkey sub-organizations left in a
   provisioning or failed state after an interrupted API call.
-- [ ] Add customer-facing recovery-key rotation and a separately controlled
-  Jusso break-glass process with audited, time-bound access.
+- [ ] Synchronize customer recovery-authenticator rotation with Turnkey and add
+  a separately controlled Jusso break-glass process with audited, time-bound
+  access.
