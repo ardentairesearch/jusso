@@ -144,6 +144,161 @@ CREATE TABLE oauth_proof_jtis (
 );
 CREATE INDEX idx_oauth_proof_jtis_expiry ON oauth_proof_jtis(expires_at);
 
+CREATE TABLE oauth_clients (
+    client_id TEXT PRIMARY KEY,
+    client_name TEXT NOT NULL,
+    redirect_uris TEXT[] NOT NULL CHECK (cardinality(redirect_uris) BETWEEN 1 AND 10),
+    token_endpoint_auth_method TEXT NOT NULL DEFAULT 'none'
+        CHECK (token_endpoint_auth_method = 'none'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE connect_sessions (
+    id UUID PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
+    redirect_uri TEXT NOT NULL,
+    client_state TEXT,
+    code_challenge TEXT NOT NULL CHECK (code_challenge ~ '^[A-Za-z0-9_-]{43}$'),
+    resource TEXT NOT NULL,
+    scopes TEXT[] NOT NULL,
+    organization_id UUID REFERENCES organizations(id),
+    principal_id UUID REFERENCES principals(id),
+    passkey_id UUID,
+    selected_agent_id UUID REFERENCES agents(id),
+    selected_agent_external_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'authenticated', 'completed', 'expired')),
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX idx_connect_sessions_expiry ON connect_sessions(expires_at);
+
+CREATE TABLE owner_accounts (
+    principal_id UUID PRIMARY KEY REFERENCES principals(id),
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    owner_handle TEXT NOT NULL,
+    owner_handle_normalized TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (principal_id, organization_id)
+);
+CREATE INDEX idx_owner_accounts_organization ON owner_accounts(organization_id);
+
+CREATE TABLE owner_passkeys (
+    id UUID PRIMARY KEY,
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    principal_id UUID NOT NULL REFERENCES owner_accounts(principal_id),
+    credential_id TEXT NOT NULL UNIQUE,
+    passkey JSONB NOT NULL,
+    label TEXT NOT NULL DEFAULT 'Primary passkey',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ,
+    UNIQUE (id, organization_id, principal_id)
+);
+CREATE INDEX idx_owner_passkeys_principal ON owner_passkeys(principal_id);
+
+ALTER TABLE connect_sessions
+    ADD CONSTRAINT connect_sessions_passkey_id_fkey
+    FOREIGN KEY (passkey_id) REFERENCES owner_passkeys(id);
+
+CREATE TABLE oauth_authorization_codes (
+    code_hash TEXT PRIMARY KEY CHECK (code_hash ~ '^[0-9a-f]{64}$'),
+    connect_session_id UUID NOT NULL UNIQUE REFERENCES connect_sessions(id),
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    principal_id UUID NOT NULL REFERENCES principals(id),
+    passkey_id UUID NOT NULL REFERENCES owner_passkeys(id),
+    agent_id UUID REFERENCES agents(id),
+    agent_external_id TEXT,
+    client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
+    redirect_uri TEXT NOT NULL,
+    code_challenge TEXT NOT NULL CHECK (code_challenge ~ '^[A-Za-z0-9_-]{43}$'),
+    resource TEXT NOT NULL,
+    scopes TEXT[] NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK ((agent_id IS NULL) = (agent_external_id IS NULL))
+);
+CREATE INDEX idx_oauth_authorization_codes_expiry
+    ON oauth_authorization_codes(expires_at);
+
+CREATE TABLE oauth_connections (
+    id UUID PRIMARY KEY,
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    principal_id UUID NOT NULL REFERENCES principals(id),
+    passkey_id UUID NOT NULL REFERENCES owner_passkeys(id),
+    agent_id UUID REFERENCES agents(id),
+    agent_external_id TEXT,
+    client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
+    resource TEXT NOT NULL,
+    scopes TEXT[] NOT NULL,
+    dpop_jkt TEXT CHECK (dpop_jkt IS NULL OR dpop_jkt ~ '^[A-Za-z0-9_-]{43}$'),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ,
+    revoked_at TIMESTAMPTZ,
+    CHECK ((agent_id IS NULL) = (agent_external_id IS NULL)),
+    UNIQUE (id, organization_id, principal_id)
+);
+CREATE INDEX idx_oauth_connections_principal
+    ON oauth_connections(principal_id, created_at DESC);
+
+CREATE TABLE oauth_refresh_tokens (
+    token_hash TEXT PRIMARY KEY CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    connection_id UUID NOT NULL REFERENCES oauth_connections(id),
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+    replaced_by_hash TEXT REFERENCES oauth_refresh_tokens(token_hash),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_oauth_refresh_tokens_connection
+    ON oauth_refresh_tokens(connection_id, created_at DESC);
+
+CREATE TABLE owner_approval_requests (
+    id UUID PRIMARY KEY,
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    principal_id UUID NOT NULL,
+    oauth_connection_id UUID NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    action TEXT NOT NULL CHECK (
+        action IN (
+            'create_policy', 'assign_policy', 'revoke_policy',
+            'create_agent', 'suspend_agent', 'reactivate_agent',
+            'rotate_agent_credential', 'rotate_agent_onchain_signer'
+        )
+    ),
+    payload JSONB NOT NULL,
+    presentation JSONB NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'approved', 'expired')
+    ),
+    result JSONB,
+    expires_at TIMESTAMPTZ NOT NULL,
+    approved_by_passkey_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    approved_at TIMESTAMPTZ,
+    CHECK (
+        (status = 'approved') =
+        (approved_at IS NOT NULL AND approved_by_passkey_id IS NOT NULL AND result IS NOT NULL)
+    ),
+    CHECK (expires_at > created_at),
+    FOREIGN KEY (principal_id, organization_id)
+        REFERENCES owner_accounts(principal_id, organization_id),
+    FOREIGN KEY (oauth_connection_id, organization_id, principal_id)
+        REFERENCES oauth_connections(id, organization_id, principal_id),
+    FOREIGN KEY (approved_by_passkey_id, organization_id, principal_id)
+        REFERENCES owner_passkeys(id, organization_id, principal_id)
+);
+CREATE INDEX idx_owner_approval_requests_owner
+    ON owner_approval_requests(organization_id, principal_id, created_at DESC);
+CREATE INDEX idx_owner_approval_requests_expiry
+    ON owner_approval_requests(expires_at) WHERE status = 'pending';
+
 CREATE TABLE turnkey_organization_bindings (
     organization_id UUID PRIMARY KEY REFERENCES organizations(id),
     provider_organization_id TEXT UNIQUE,
@@ -206,6 +361,7 @@ CREATE TABLE agent_wallets (
     address TEXT NOT NULL UNIQUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (organization_id, agent_id),
+    UNIQUE (id, agent_uuid, organization_id),
     FOREIGN KEY (agent_uuid, organization_id)
         REFERENCES agents(id, organization_id),
     FOREIGN KEY (managed_wallet_id, organization_id)
@@ -218,12 +374,69 @@ CREATE TABLE agent_smart_accounts (
     agent_wallet_id UUID NOT NULL REFERENCES agent_wallets(id),
     chain_id BIGINT NOT NULL CHECK (chain_id IN (5042, 5042002)),
     account_address TEXT NOT NULL,
+    initial_signer_address TEXT NOT NULL,
     account_provider TEXT NOT NULL CHECK (length(trim(account_provider)) > 0),
     provider_account_id TEXT NOT NULL CHECK (length(trim(provider_account_id)) > 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (agent_wallet_id, chain_id),
     UNIQUE (chain_id, account_address)
 );
+
+CREATE TABLE agent_signer_rotations (
+    id UUID PRIMARY KEY,
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    agent_id UUID NOT NULL,
+    agent_wallet_id UUID NOT NULL,
+    old_managed_wallet_id UUID NOT NULL,
+    replacement_managed_wallet_id UUID,
+    old_signer_address TEXT NOT NULL,
+    replacement_signer_address TEXT,
+    smart_account_address TEXT NOT NULL,
+    chain_id BIGINT NOT NULL CHECK (chain_id IN (5042, 5042002)),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN (
+            'pending', 'provisioned', 'prepared', 'submitted', 'confirmed',
+            'reconciled', 'failed', 'recovery_required'
+        )
+    ),
+    signed_user_operation JSONB,
+    user_operation_hash TEXT,
+    provider_call_id TEXT,
+    tx_hash TEXT,
+    error_message TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    requested_by_principal_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    FOREIGN KEY (agent_wallet_id, agent_id, organization_id)
+        REFERENCES agent_wallets(id, agent_uuid, organization_id),
+    FOREIGN KEY (old_managed_wallet_id, organization_id)
+        REFERENCES managed_wallets(id, scope_organization_id),
+    FOREIGN KEY (replacement_managed_wallet_id, organization_id)
+        REFERENCES managed_wallets(id, scope_organization_id),
+    FOREIGN KEY (requested_by_principal_id, organization_id)
+        REFERENCES owner_accounts(principal_id, organization_id),
+    CHECK (
+        (replacement_managed_wallet_id IS NULL) =
+        (replacement_signer_address IS NULL)
+    ),
+    CHECK (
+        (signed_user_operation IS NULL AND user_operation_hash IS NULL)
+        OR (signed_user_operation IS NOT NULL AND user_operation_hash IS NOT NULL)
+    ),
+    CHECK (
+        (status IN ('reconciled', 'failed')) = (completed_at IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX agent_signer_rotations_one_active_per_agent
+    ON agent_signer_rotations(agent_id)
+    WHERE status NOT IN ('reconciled', 'failed');
+CREATE INDEX agent_signer_rotations_work_queue
+    ON agent_signer_rotations(created_at)
+    WHERE status NOT IN ('reconciled', 'failed');
+CREATE INDEX agent_signer_rotations_owner
+    ON agent_signer_rotations(organization_id, requested_by_principal_id, created_at DESC);
 
 CREATE TABLE auth_audit_events (
     id UUID PRIMARY KEY,

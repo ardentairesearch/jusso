@@ -24,6 +24,7 @@ use crate::wallet_provider::WalletScope;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmartAccount {
     pub address: Address,
+    pub initial_signer_address: Address,
     pub signer_address: Address,
     pub provider_account_id: String,
     pub network: ArcNetwork,
@@ -61,7 +62,14 @@ fn validate_deployed_account(
 
 #[async_trait]
 pub trait SmartAccountVerifier: Send + Sync {
-    async fn verify(&self, account: Address, signer: Address) -> Result<()>;
+    async fn verify(
+        &self,
+        account: Address,
+        initial_signer: Address,
+        effective_signer: Address,
+    ) -> Result<()>;
+
+    async fn effective_signer(&self, account: Address) -> Result<Option<Address>>;
 }
 
 #[derive(Clone, Debug)]
@@ -108,12 +116,49 @@ impl AlchemyMav2Verifier {
             .into_address()
             .context("Arc contract did not return an address")
     }
+
+    async fn call_fallback_signer(&self, contract: Address) -> Result<(Address, bool)> {
+        let data = Bytes::from(keccak256(b"getFallbackSignerData()")[..4].to_vec());
+        let raw = self
+            .provider
+            .call(
+                &TransactionRequest::new().to(contract).data(data).into(),
+                None,
+            )
+            .await
+            .context("Arc fallback-signer lookup failed")?;
+        decode_fallback_signer_data(&raw)
+    }
+}
+
+fn decode_fallback_signer_data(raw: &[u8]) -> Result<(Address, bool)> {
+    let decoded = decode(&[ParamType::Address, ParamType::Bool], raw)
+        .context("Arc smart account returned invalid fallback-signer data")?;
+    let signer = decoded[0]
+        .clone()
+        .into_address()
+        .context("Arc smart account omitted its fallback signer")?;
+    let disabled = decoded[1]
+        .clone()
+        .into_bool()
+        .context("Arc smart account omitted its fallback-signer status")?;
+    Ok((signer, disabled))
 }
 
 #[async_trait]
 impl SmartAccountVerifier for AlchemyMav2Verifier {
-    async fn verify(&self, account: Address, signer: Address) -> Result<()> {
-        if account == Address::zero() || signer == Address::zero() || account == signer {
+    async fn verify(
+        &self,
+        account: Address,
+        initial_signer: Address,
+        effective_signer: Address,
+    ) -> Result<()> {
+        if account == Address::zero()
+            || initial_signer == Address::zero()
+            || effective_signer == Address::zero()
+            || account == initial_signer
+            || account == effective_signer
+        {
             bail!("invalid dedicated smart-account binding");
         }
         let factory: Address = MAV2_FACTORY.parse().expect("fixed MAv2 factory address");
@@ -150,7 +195,7 @@ impl SmartAccountVerifier for AlchemyMav2Verifier {
             .call_address(
                 factory,
                 "getAddressSemiModular(address,uint256)",
-                vec![Token::Address(signer), Token::Uint(U256::zero())],
+                vec![Token::Address(initial_signer), Token::Uint(U256::zero())],
             )
             .await?;
         if account != expected {
@@ -163,6 +208,9 @@ impl SmartAccountVerifier for AlchemyMav2Verifier {
             .await
             .context("smart-account code lookup failed")?;
         if code.is_empty() {
+            if initial_signer != effective_signer {
+                bail!("undeployed smart account cannot have a rotated signer");
+            }
             return Ok(());
         }
         let implementation_slot: H256 = ERC1967_IMPLEMENTATION_SLOT
@@ -173,7 +221,32 @@ impl SmartAccountVerifier for AlchemyMav2Verifier {
             .get_storage_at(account, implementation_slot, None)
             .await
             .context("smart-account implementation lookup failed")?;
-        validate_deployed_account(&code, stored_implementation, signer, implementation)
+        validate_deployed_account(&code, stored_implementation, initial_signer, implementation)?;
+        let (actual_signer, disabled) = self.call_fallback_signer(account).await?;
+        if disabled || actual_signer != effective_signer {
+            bail!("smart-account effective signer does not match the persisted binding");
+        }
+        Ok(())
+    }
+
+    async fn effective_signer(&self, account: Address) -> Result<Option<Address>> {
+        if account == Address::zero() {
+            bail!("smart-account address cannot be zero");
+        }
+        if self
+            .provider
+            .get_code(account, None)
+            .await
+            .context("smart-account code lookup failed")?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        let (signer, disabled) = self.call_fallback_signer(account).await?;
+        if disabled || signer == Address::zero() {
+            bail!("smart-account fallback signer is disabled or invalid");
+        }
+        Ok(Some(signer))
     }
 }
 
@@ -338,7 +411,9 @@ impl SmartAccountRegistry {
         self.validate_signer_binding(agent_wallet).await?;
         let signer = agent_wallet.managed_wallet.provider_wallet.address;
         if let Some(account) = self.load(agent_wallet.id, signer, network).await? {
-            self.verifier.verify(account.address, signer).await?;
+            self.verifier
+                .verify(account.address, account.initial_signer_address, signer)
+                .await?;
             return Ok(account);
         }
 
@@ -355,19 +430,22 @@ impl SmartAccountRegistry {
         {
             bail!("smart-account provider returned an invalid account ID");
         }
-        self.verifier.verify(proposed.address, signer).await?;
+        self.verifier
+            .verify(proposed.address, signer, signer)
+            .await?;
         sqlx::query(
             r#"
             INSERT INTO agent_smart_accounts (
                 agent_wallet_id, chain_id, account_address,
-                account_provider, provider_account_id
-            ) VALUES ($1, $2, $3, $4, $5)
+                initial_signer_address, account_provider, provider_account_id
+            ) VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT DO NOTHING
             "#,
         )
         .bind(agent_wallet.id)
         .bind(network.chain_id() as i64)
         .bind(format!("{:?}", proposed.address))
+        .bind(format!("{signer:?}"))
         .bind(self.provider.name())
         .bind(&proposed.provider_account_id)
         .execute(&self.db_pool)
@@ -422,9 +500,10 @@ impl SmartAccountRegistry {
         signer: Address,
         network: ArcNetwork,
     ) -> Result<Option<SmartAccount>> {
-        let row: Option<(String, String, String)> = sqlx::query_as(
+        let row: Option<(String, String, String, String)> = sqlx::query_as(
             r#"
-            SELECT account_address, account_provider, provider_account_id
+            SELECT account_address, initial_signer_address,
+                   account_provider, provider_account_id
             FROM agent_smart_accounts
             WHERE agent_wallet_id = $1 AND chain_id = $2
             "#,
@@ -433,27 +512,48 @@ impl SmartAccountRegistry {
         .bind(network.chain_id() as i64)
         .fetch_optional(&self.db_pool)
         .await?;
-        row.map(|(raw_address, provider, provider_account_id)| {
-            if provider != self.provider.name() {
-                bail!("persisted smart-account provider differs from runtime provider");
-            }
-            let address: Address = raw_address
-                .parse()
-                .context("persisted smart-account address is invalid")?;
-            if address == Address::zero() || address == signer {
-                bail!("persisted Arc account is not distinct from its signer");
-            }
-            if provider_account_id.trim().is_empty() || provider_account_id.len() > 128 {
-                bail!("persisted smart-account provider ID is invalid");
-            }
-            Ok(SmartAccount {
-                address,
-                signer_address: signer,
-                provider_account_id,
-                network,
-            })
-        })
+        row.map(
+            |(raw_address, raw_initial_signer, provider, provider_account_id)| {
+                if provider != self.provider.name() {
+                    bail!("persisted smart-account provider differs from runtime provider");
+                }
+                let address: Address = raw_address
+                    .parse()
+                    .context("persisted smart-account address is invalid")?;
+                let initial_signer_address: Address = raw_initial_signer
+                    .parse()
+                    .context("persisted initial signer address is invalid")?;
+                if address == Address::zero() || address == signer {
+                    bail!("persisted Arc account is not distinct from its signer");
+                }
+                if provider_account_id.trim().is_empty() || provider_account_id.len() > 128 {
+                    bail!("persisted smart-account provider ID is invalid");
+                }
+                Ok(SmartAccount {
+                    address,
+                    initial_signer_address,
+                    signer_address: signer,
+                    provider_account_id,
+                    network,
+                })
+            },
+        )
         .transpose()
+    }
+
+    pub async fn verify_existing(
+        &self,
+        account: Address,
+        initial_signer: Address,
+        effective_signer: Address,
+    ) -> Result<()> {
+        self.verifier
+            .verify(account, initial_signer, effective_signer)
+            .await
+    }
+
+    pub async fn effective_signer(&self, account: Address) -> Result<Option<Address>> {
+        self.verifier.effective_signer(account).await
     }
 }
 
@@ -536,5 +636,16 @@ mod tests {
             validate_deployed_account(&code, H256(slot), other_signer, implementation).is_err()
         );
         assert!(validate_deployed_account(&code, H256::zero(), signer, implementation).is_err());
+    }
+
+    #[test]
+    fn decodes_fallback_signer_data() {
+        let signer = Address::from_low_u64_be(7);
+        let encoded = encode(&[Token::Address(signer), Token::Bool(false)]);
+        assert_eq!(
+            decode_fallback_signer_data(&encoded).unwrap(),
+            (signer, false)
+        );
+        assert!(decode_fallback_signer_data(&encoded[..32]).is_err());
     }
 }

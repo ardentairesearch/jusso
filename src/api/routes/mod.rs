@@ -1495,83 +1495,6 @@ pub async fn agent_enrollment_handler(
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-pub struct CreateAgentRequest {
-    pub agent_id: String,
-    pub display_name: String,
-    pub parent_agent_id: Option<Uuid>,
-    pub policy_id: Uuid,
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    pub enrollment_ttl_seconds: Option<i64>,
-}
-
-pub async fn create_agent_handler(
-    State(state): State<AppState>,
-    Extension(context): Extension<AuthContext>,
-    Json(body): Json<CreateAgentRequest>,
-) -> impl IntoResponse {
-    let scopes = if body.scopes.is_empty() {
-        crate::auth::RUNTIME_SCOPES
-            .iter()
-            .map(|scope| (*scope).to_string())
-            .collect()
-    } else {
-        body.scopes.clone()
-    };
-    if let Err(error) = crate::auth::validate_runtime_scopes(&scopes) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": error.to_string()})),
-        )
-            .into_response();
-    }
-    let agent_id = body.agent_id.trim();
-    let valid_agent_id = (2..=128).contains(&agent_id.len())
-        && agent_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
-    if !valid_agent_id || body.display_name.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "agent_id or display_name is invalid"})),
-        )
-            .into_response();
-    }
-    match db::create_agent_with_enrollment(
-        &state.db_pool,
-        db::CreateAgentOptions {
-            organization_id: context.organization_id,
-            created_by_principal_id: context.principal_id,
-            external_id: agent_id,
-            display_name: body.display_name.trim(),
-            parent_agent_id: body.parent_agent_id,
-            policy_id: body.policy_id,
-            runtime_scopes: &scopes,
-            enrollment_ttl_seconds: body.enrollment_ttl_seconds.unwrap_or(900),
-        },
-    )
-    .await
-    {
-        Ok((agent, enrollment_token, expires_at)) => (
-            StatusCode::CREATED,
-            [("cache-control", "no-store"), ("pragma", "no-cache")],
-            Json(serde_json::json!({
-                "agent": agent,
-                "enrollment_token": enrollment_token,
-                "enrollment_expires_at": expires_at,
-                "message": "Pass this one-time token to the agent runtime; it is shown once."
-            })),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": error.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
 pub async fn list_agents_handler(
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
@@ -1591,174 +1514,6 @@ pub async fn list_agents_handler(
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-pub struct AgentPolicyAssignmentRequest {
-    pub policy_id: Uuid,
-}
-
-pub async fn assign_agent_policy_handler(
-    State(state): State<AppState>,
-    Extension(context): Extension<AuthContext>,
-    Path(agent_id): Path<Uuid>,
-    Json(body): Json<AgentPolicyAssignmentRequest>,
-) -> impl IntoResponse {
-    match db::assign_agent_policy(
-        &state.db_pool,
-        context.organization_id,
-        context.principal_id,
-        agent_id,
-        body.policy_id,
-    )
-    .await
-    {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "agent or active policy not found"})),
-        )
-            .into_response(),
-        Err(error) => {
-            error!(%error, "failed to assign agent policy");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct CreateEnrollmentGrantRequest {
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    pub enrollment_ttl_seconds: Option<i64>,
-}
-
-pub async fn create_enrollment_grant_handler(
-    State(state): State<AppState>,
-    Extension(context): Extension<AuthContext>,
-    Path(agent_id): Path<Uuid>,
-    Json(body): Json<CreateEnrollmentGrantRequest>,
-) -> impl IntoResponse {
-    let scopes = if body.scopes.is_empty() {
-        crate::auth::RUNTIME_SCOPES
-            .iter()
-            .map(|scope| (*scope).to_string())
-            .collect()
-    } else {
-        body.scopes
-    };
-    if let Err(error) = crate::auth::validate_runtime_scopes(&scopes) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": error.to_string()})),
-        )
-            .into_response();
-    }
-    match db::create_agent_enrollment_grant(
-        &state.db_pool,
-        context.organization_id,
-        context.principal_id,
-        agent_id,
-        &scopes,
-        body.enrollment_ttl_seconds.unwrap_or(900),
-    )
-    .await
-    {
-        Ok((token, expires_at)) => (
-            StatusCode::CREATED,
-            [("cache-control", "no-store"), ("pragma", "no-cache")],
-            Json(serde_json::json!({
-                "enrollment_token": token,
-                "enrollment_expires_at": expires_at,
-                "scopes": scopes
-            })),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": error.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct CreateCredentialBindingRequest {
-    pub agent_id: Option<Uuid>,
-    pub public_jwk: serde_json::Value,
-    #[serde(default)]
-    pub scopes: Vec<String>,
-}
-
-pub async fn create_credential_binding_handler(
-    State(state): State<AppState>,
-    Extension(context): Extension<AuthContext>,
-    Json(body): Json<CreateCredentialBindingRequest>,
-) -> impl IntoResponse {
-    let scopes = if body.scopes.is_empty() {
-        if body.agent_id.is_some() {
-            crate::auth::RUNTIME_SCOPES
-        } else {
-            crate::auth::DEFAULT_SCOPES
-        }
-        .iter()
-        .map(|scope| (*scope).to_string())
-        .collect::<Vec<_>>()
-    } else {
-        body.scopes.clone()
-    };
-    let validation = if body.agent_id.is_some() {
-        crate::auth::validate_runtime_scopes(&scopes)
-    } else {
-        crate::auth::validate_scopes(&scopes)
-    };
-    if let Err(error) = validation {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": error.to_string()})),
-        )
-            .into_response();
-    }
-    let thumbprint = match crate::auth::validate_public_jwk(&body.public_jwk) {
-        Ok(value) => value,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": error.to_string()})),
-            )
-                .into_response()
-        }
-    };
-    match db::create_credential_binding(
-        &state.db_pool,
-        db::CreateCredentialBindingOptions {
-            organization_id: context.organization_id,
-            principal_id: context.principal_id,
-            agent_id: body.agent_id,
-            public_jwk: &body.public_jwk,
-            public_jwk_thumbprint: &thumbprint,
-            scopes: &scopes,
-        },
-    )
-    .await
-    {
-        Ok(row) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "credential_binding_id": row.id,
-                "client_id": row.client_id,
-                "agent_id": row.agent_id,
-                "scopes": row.scopes,
-                "token_auth_method": "private_key_jwt+dpop"
-            })),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": error.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
 pub async fn list_credential_bindings_handler(
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
@@ -1771,25 +1526,6 @@ pub async fn list_credential_bindings_handler(
             .into_response(),
         Err(error) => {
             error!(%error, "failed to list credential bindings");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-pub async fn revoke_credential_binding_handler(
-    State(state): State<AppState>,
-    Extension(context): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-) -> impl IntoResponse {
-    match db::revoke_credential_binding(&state.db_pool, context.organization_id, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "active credential binding not found"})),
-        )
-            .into_response(),
-        Err(error) => {
-            error!(%error, "failed to revoke credential binding");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1831,122 +1567,6 @@ pub async fn rotate_webhook_secret_handler(
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-pub struct CreateAuthorizationPolicyRequest {
-    pub name: String,
-    pub allowed_chains: Option<Vec<String>>,
-    pub allowed_protocols: Option<Vec<String>>,
-    pub allowed_actions: Option<Vec<String>>,
-    pub allowed_targets: Option<Vec<String>>,
-    #[serde(default)]
-    pub allow_raw_execution: bool,
-    pub max_value_wei: Option<String>,
-    pub max_execution_fee_usd: Option<f64>,
-}
-
-pub async fn create_authorization_policy_handler(
-    State(state): State<AppState>,
-    Extension(context): Extension<AuthContext>,
-    Json(body): Json<CreateAuthorizationPolicyRequest>,
-) -> impl IntoResponse {
-    if body.allowed_chains.is_none()
-        && body.allowed_protocols.is_none()
-        && body.allowed_actions.is_none()
-        && body.allowed_targets.is_none()
-        && body.max_value_wei.is_none()
-        && body.max_execution_fee_usd.is_none()
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "policy must restrict at least one of chains, protocols, or actions"
-            })),
-        )
-            .into_response();
-    }
-    if body.allowed_chains.as_ref().is_some_and(|values| {
-        values.is_empty()
-            || values
-                .iter()
-                .any(|value| value != state.config.arc_network.name())
-    }) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "allowed_chains contains an unsupported chain"})),
-        )
-            .into_response();
-    }
-    if body.allowed_protocols.as_ref().is_some_and(|values| {
-        values
-            .iter()
-            .any(|value| !crate::auth::SUPPORTED_PROTOCOLS.contains(&value.as_str()))
-    }) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::json!({"error": "allowed_protocols contains an unsupported protocol"}),
-            ),
-        )
-            .into_response();
-    }
-    if let Some(actions) = &body.allowed_actions {
-        if let Err(error) = crate::auth::validate_policy_actions(actions) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": error.to_string()})),
-            )
-                .into_response();
-        }
-    }
-    if body.allowed_targets.as_ref().is_some_and(|targets| {
-        targets
-            .iter()
-            .any(|target| target != "*" && target.parse::<Address>().is_err())
-    }) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "allowed_targets must contain EVM addresses or *"})),
-        )
-            .into_response();
-    }
-    match db::create_authorization_policy(
-        &state.db_pool,
-        db::CreateAuthorizationPolicyOptions {
-            organization_id: context.organization_id,
-            name: body.name.trim(),
-            allowed_chains: body.allowed_chains.as_deref(),
-            allowed_protocols: body.allowed_protocols.as_deref(),
-            allowed_actions: body.allowed_actions.as_deref(),
-            allowed_targets: body.allowed_targets.as_deref(),
-            allow_raw_execution: body.allow_raw_execution,
-            max_value_wei: body.max_value_wei.as_deref(),
-            max_execution_fee_usd: body.max_execution_fee_usd,
-        },
-    )
-    .await
-    {
-        Ok(id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "authorization_policy_id": id,
-                "organization_id": context.organization_id,
-                "name": body.name
-            })),
-        )
-            .into_response(),
-        Err(error) => {
-            error!(%error, "failed to create authorization policy");
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid authorization policy or organization"
-                })),
-            )
-                .into_response()
-        }
-    }
-}
-
 pub async fn list_authorization_policies_handler(
     State(state): State<AppState>,
     Extension(context): Extension<AuthContext>,
@@ -1968,25 +1588,6 @@ pub async fn list_authorization_policies_handler(
             "updated_at": row.updated_at
         })).collect::<Vec<_>>() }))).into_response(),
         Err(error) => { error!(%error, "failed to list authorization policies"); StatusCode::INTERNAL_SERVER_ERROR.into_response() }
-    }
-}
-
-pub async fn revoke_authorization_policy_handler(
-    State(state): State<AppState>,
-    Extension(context): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-) -> impl IntoResponse {
-    match db::revoke_authorization_policy(&state.db_pool, context.organization_id, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "active authorization policy not found"})),
-        )
-            .into_response(),
-        Err(error) => {
-            error!(%error, "failed to revoke authorization policy");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
     }
 }
 
@@ -2121,14 +1722,6 @@ pub async fn oauth_token_handler(
     Form(request): Form<TokenRequest>,
 ) -> impl IntoResponse {
     let proof = headers.get("dpop").and_then(|value| value.to_str().ok());
-    let Some(proof) = proof else {
-        return (
-            StatusCode::BAD_REQUEST,
-            [("cache-control", "no-store"), ("pragma", "no-cache")],
-            Json(serde_json::json!({"error": "invalid_dpop_proof"})),
-        )
-            .into_response();
-    };
     match auth.exchange_token(request, proof).await {
         Ok(response) => (
             StatusCode::OK,
@@ -2143,7 +1736,7 @@ pub async fn oauth_token_handler(
                 [("cache-control", "no-store"), ("pragma", "no-cache")],
                 Json(serde_json::json!({
                 "error": "invalid_grant",
-                "error_description": "credential, workload identity, or DPoP verification failed"
+                "error_description": "authorization code, credential, workload identity, or proof verification failed"
                 })),
             )
                 .into_response()
@@ -2156,12 +1749,18 @@ pub async fn oauth_authorization_server_metadata_handler(
 ) -> impl IntoResponse {
     Json(serde_json::json!({
         "issuer": auth.issuer(),
+        "authorization_endpoint": format!("{}/oauth/authorize", auth.issuer()),
         "token_endpoint": auth.token_endpoint(),
+        "registration_endpoint": format!("{}/oauth/register", auth.issuer()),
         "grant_types_supported": [
+            "authorization_code",
+            "refresh_token",
             "client_credentials",
             "urn:ietf:params:oauth:grant-type:token-exchange"
         ],
-        "token_endpoint_auth_methods_supported": ["private_key_jwt"],
+        "response_types_supported": ["code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
         "token_endpoint_auth_signing_alg_values_supported": [
             "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384"
         ],

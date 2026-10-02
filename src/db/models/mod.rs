@@ -34,7 +34,7 @@ pub struct CredentialBindingRow {
     pub last_used_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct AuthorizationPolicyRow {
     pub id: Uuid,
     pub organization_id: Uuid,
@@ -53,6 +53,21 @@ pub struct AuthorizationPolicyRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct OwnerApprovalRequestRow {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub principal_id: Uuid,
+    pub oauth_connection_id: Uuid,
+    pub action: String,
+    pub presentation: serde_json::Value,
+    pub status: String,
+    pub result: Option<serde_json::Value>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub approved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct AgentRow {
     pub id: Uuid,
     pub organization_id: Uuid,
@@ -63,6 +78,32 @@ pub struct AgentRow {
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct AgentSignerRotationRow {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub agent_id: Uuid,
+    pub agent_wallet_id: Uuid,
+    pub old_managed_wallet_id: Uuid,
+    pub replacement_managed_wallet_id: Option<Uuid>,
+    pub old_signer_address: String,
+    pub replacement_signer_address: Option<String>,
+    pub smart_account_address: String,
+    pub chain_id: i64,
+    pub status: String,
+    #[serde(skip_serializing)]
+    pub signed_user_operation: Option<serde_json::Value>,
+    pub user_operation_hash: Option<String>,
+    pub provider_call_id: Option<String>,
+    pub tx_hash: Option<String>,
+    pub error_message: Option<String>,
+    pub attempt_count: i32,
+    pub requested_by_principal_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

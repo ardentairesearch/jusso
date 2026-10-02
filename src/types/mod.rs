@@ -281,6 +281,7 @@ pub struct SettledExecutionPayment {
 pub enum CredentialKind {
     LocalJwk,
     WorkloadIdentity,
+    OAuthSession,
 }
 
 /// Authenticated identity attached to every protected request.

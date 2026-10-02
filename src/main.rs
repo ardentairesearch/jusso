@@ -15,8 +15,8 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{
     extract::{Request, State},
     http::{HeaderName, HeaderValue},
-    middleware,
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{any, get, post},
     Router,
 };
@@ -36,13 +36,28 @@ use jusso::{
     },
     auth::{self, AuthService},
     config::AppConfig,
+    connect::{self, ConnectService},
     db,
     execution_engine::ExecutionEngine,
-    queue,
+    mcp, queue,
     rate_limit::{self, RateLimiter},
+    signer_rotation::{self, SignerRotationContext},
     wallet_provider::{TurnkeyWalletProvider, WalletManager},
     worker::{self, WorkerContext},
 };
+
+async fn no_store_sensitive_response(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        HeaderName::from_static("cache-control"),
+        HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("pragma"),
+        HeaderValue::from_static("no-cache"),
+    );
+    response
+}
 
 fn cors_allowed_origins(raw_origins: Option<&str>) -> Vec<HeaderValue> {
     let mut allowed_origins = Vec::new();
@@ -235,6 +250,14 @@ async fn main() -> anyhow::Result<()> {
         workers = num_workers,
         "background workers spawned with supervisors"
     );
+    tokio::spawn(signer_rotation::run_signer_rotation_worker(
+        SignerRotationContext {
+            db_pool: db_pool.clone(),
+            wallet_registry: wallet_registry.clone(),
+            engine: engine.clone(),
+        },
+    ));
+    info!("signer-rotation reconciler spawned");
 
     // ── App State ───────────────────────────────────────────────────
     let state = AppState {
@@ -244,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         wallet_registry,
     };
+    let connect_service = ConnectService::new(db_pool.clone(), redis_conn.clone(), config.clone())?;
 
     // ── Per-principal Rate Limiter ──────────────────────────────────
     let rate_limiter = if config.per_principal_rate_limit_rps > 0.0 {
@@ -292,6 +316,62 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(auth_service.clone());
 
+    let connect_router = Router::new()
+        .route("/oauth/register", post(connect::register_client_handler))
+        .route("/oauth/authorize", get(connect::authorize_handler))
+        .route("/connect/:token", get(connect::connect_page_handler))
+        .route(
+            "/connect/:token/register/start",
+            post(connect::registration_start_handler),
+        )
+        .route(
+            "/connect/:token/register/finish",
+            post(connect::registration_finish_handler),
+        )
+        .route(
+            "/connect/:token/authenticate/start",
+            post(connect::authentication_start_handler),
+        )
+        .route(
+            "/connect/:token/authenticate/finish",
+            post(connect::authentication_finish_handler),
+        )
+        .route("/approve/:token", get(connect::owner_approval_page_handler))
+        .route(
+            "/approve/:token/start",
+            post(connect::owner_approval_start_handler),
+        )
+        .route(
+            "/approve/:token/finish",
+            post(connect::owner_approval_finish_handler),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp/agent",
+            get(connect::agent_resource_metadata_handler),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp/control",
+            get(connect::control_resource_metadata_handler),
+        )
+        .with_state(connect_service);
+
+    let agent_mcp_router = Router::new()
+        .nest_service(
+            "/mcp/agent",
+            mcp::agent_service(state.clone(), auth_service.clone()),
+        )
+        .layer(middleware::from_fn_with_state(
+            auth_service.clone(),
+            auth::authentication_middleware,
+        ));
+    let control_mcp_router = Router::new()
+        .nest_service("/mcp/control", mcp::control_service(state.clone()))
+        .layer(middleware::from_fn(no_store_sensitive_response))
+        .layer(middleware::from_fn_with_state(
+            auth_service.clone(),
+            auth::authentication_middleware,
+        ));
+
     let protected_api_router = Router::new()
         // Execution API — x402 middleware applied
         .route("/execute", post(routes::execute_handler))
@@ -301,38 +381,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/wallet", get(routes::wallet_handler))
         .route("/wallet/balance", get(routes::wallet_balance_handler))
         .route("/agents", get(routes::list_agents_handler))
-        .route("/agents", post(routes::create_agent_handler))
-        .route(
-            "/agents/:id/policy",
-            post(routes::assign_agent_policy_handler),
-        )
-        .route(
-            "/agents/:id/enrollment-grants",
-            post(routes::create_enrollment_grant_handler),
-        )
         .route(
             "/credential-bindings",
             get(routes::list_credential_bindings_handler),
         )
         .route(
-            "/credential-bindings",
-            post(routes::create_credential_binding_handler),
-        )
-        .route(
-            "/credential-bindings/:id",
-            axum::routing::delete(routes::revoke_credential_binding_handler),
-        )
-        .route(
-            "/authorization-policies",
-            post(routes::create_authorization_policy_handler),
-        )
-        .route(
             "/authorization-policies",
             get(routes::list_authorization_policies_handler),
-        )
-        .route(
-            "/authorization-policies/:id",
-            axum::routing::delete(routes::revoke_authorization_policy_handler),
         )
         .route(
             "/federation-trusts",
@@ -410,6 +465,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/register", post(routes::self_service_registration_handler))
         .route("/agents/enroll", post(routes::agent_enrollment_handler))
         .merge(oauth_router)
+        .merge(connect_router)
+        .merge(agent_mcp_router)
+        .merge(control_mcp_router)
         // Admin endpoints use only the bootstrap-token middleware.
         .nest("/admin", admin_router)
         // Protected API endpoints use OAuth, policy, and rate limiting.

@@ -18,6 +18,7 @@ use jsonwebtoken::{
     jwk::{Jwk, JwkSet},
     Algorithm, DecodingKey, EncodingKey, Header, Validation,
 };
+use rand::{rngs::OsRng, RngCore};
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,6 +52,7 @@ pub const DEFAULT_POLICY_ACTIONS: &[&str] = &[
 ];
 
 pub const DEFAULT_MAX_EXECUTION_FEE_USD: f64 = 1.0;
+const OAUTH_REFRESH_TOKEN_TTL_DAYS: i64 = 30;
 
 pub const MANAGEMENT_SCOPES: &[&str] = &[
     "agent:manage",
@@ -410,6 +412,47 @@ impl AuthService {
         &self.token_endpoint
     }
 
+    pub fn protected_resource_metadata_url(&self, resource_path: &str) -> String {
+        format!(
+            "{}/.well-known/oauth-protected-resource{}",
+            self.issuer, resource_path
+        )
+    }
+
+    pub async fn authorize_mcp_action(
+        &self,
+        context: &AuthContext,
+        agent_external_id: &str,
+        chain: Option<&str>,
+        required_scope: &'static str,
+        resource: &'static str,
+        protocol: Option<&'static str>,
+    ) -> Result<AuthContext> {
+        if !context.allows_scope(required_scope) {
+            anyhow::bail!("access token does not grant {required_scope}");
+        }
+        let (agent, policy) =
+            db::authorize_execution_agent(&self.pool, context, agent_external_id).await?;
+        let mut authorized = context.clone();
+        authorized.agent_id = Some(agent.id);
+        authorized.agent_external_id = Some(agent.external_id);
+        let input = AuthorizationInput {
+            agent_id: Some(agent_external_id.to_string()),
+            chain: chain.map(str::to_string),
+            ..AuthorizationInput::default()
+        };
+        self.enforce_policy(
+            &authorized,
+            &policy,
+            required_scope,
+            resource,
+            &input,
+            protocol,
+        )
+        .await?;
+        Ok(authorized)
+    }
+
     pub async fn authenticate(
         &self,
         headers: &HeaderMap,
@@ -422,7 +465,7 @@ impl AuthService {
             .and_then(|value| value.strip_prefix("Bearer "))
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("missing Bearer access token"))?;
-        let proof = dpop_header(headers)?;
+        let proof = dpop_header(headers).ok();
         self.authenticate_access_token(bearer, proof, method, uri)
             .await
     }
@@ -430,13 +473,19 @@ impl AuthService {
     async fn authenticate_access_token(
         &self,
         token: &str,
-        proof: &str,
+        proof: Option<&str>,
         method: &Method,
         uri: &Uri,
     ) -> Result<AuthContext> {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_issuer(&[self.issuer.as_str()]);
-        validation.set_audience(&[self.audience.as_str()]);
+        let mcp_audience = format!("{}{}", self.issuer, uri.path());
+        let expected_audience = if matches!(uri.path(), "/mcp/agent" | "/mcp/control") {
+            mcp_audience.as_str()
+        } else {
+            self.audience.as_str()
+        };
+        validation.set_audience(&[expected_audience]);
         validation.leeway = 0;
         let claims = decode::<AccessTokenClaims>(
             token,
@@ -445,18 +494,87 @@ impl AuthService {
         )
         .context("invalid or expired access token")?
         .claims;
-        let htu = format!("{}{}", self.issuer, uri.path());
-        let thumbprint = self
-            .verify_dpop(proof, method.as_str(), &htu, Some(token))
-            .await?;
-        if claims.cnf.jkt != thumbprint {
-            anyhow::bail!("DPoP key does not match the access token binding");
-        }
+        let thumbprint = match claims.cnf.as_ref() {
+            Some(confirmation) => {
+                let proof = proof.ok_or_else(|| anyhow!("DPoP header is required"))?;
+                let htu = format!("{}{}", self.issuer, uri.path());
+                let thumbprint = self
+                    .verify_dpop(proof, method.as_str(), &htu, Some(token))
+                    .await?;
+                if confirmation.jkt != thumbprint {
+                    anyhow::bail!("DPoP key does not match the access token binding");
+                }
+                Some(thumbprint)
+            }
+            None => None,
+        };
         let principal = db::get_active_principal(&self.pool, claims.sub).await?;
         if principal.organization_id != claims.organization_id
             || principal.auth_version != claims.auth_version
         {
             anyhow::bail!("access token has been revoked");
+        }
+        let credential_is_active: bool = match &claims.credential_kind {
+            CredentialKind::LocalJwk => {
+                sqlx::query_scalar(
+                    r#"SELECT EXISTS(
+                        SELECT 1 FROM credential_bindings
+                        WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+                          AND is_active = TRUE AND agent_id IS NOT DISTINCT FROM $4
+                    )"#,
+                )
+                .bind(claims.credential_id)
+                .bind(claims.organization_id)
+                .bind(claims.sub)
+                .bind(claims.agent_id)
+                .fetch_one(&self.pool)
+                .await?
+            }
+            CredentialKind::WorkloadIdentity => {
+                sqlx::query_scalar(
+                    r#"SELECT EXISTS(
+                        SELECT 1 FROM federation_trusts ft
+                        JOIN agent_instances ai ON ai.federation_trust_id = ft.id
+                        WHERE ft.id = $1 AND ft.organization_id = $2
+                          AND ft.principal_id = $3 AND ft.agent_id = $4
+                          AND ft.is_active = TRUE AND ai.id = $5
+                          AND ai.agent_id = ft.agent_id AND ai.status = 'active'
+                          AND (ai.expires_at IS NULL OR ai.expires_at > now())
+                    )"#,
+                )
+                .bind(claims.credential_id)
+                .bind(claims.organization_id)
+                .bind(claims.sub)
+                .bind(claims.agent_id)
+                .bind(claims.instance_id)
+                .fetch_one(&self.pool)
+                .await?
+            }
+            CredentialKind::OAuthSession => {
+                sqlx::query_scalar(
+                    r#"SELECT EXISTS(
+                        SELECT 1 FROM oauth_connections
+                        WHERE id = $1 AND organization_id = $2 AND principal_id = $3
+                          AND status = 'active' AND resource = $4
+                          AND agent_id IS NOT DISTINCT FROM $5
+                    )"#,
+                )
+                .bind(claims.credential_id)
+                .bind(claims.organization_id)
+                .bind(claims.sub)
+                .bind(expected_audience)
+                .bind(claims.agent_id)
+                .fetch_one(&self.pool)
+                .await?
+            }
+        };
+        if !credential_is_active {
+            anyhow::bail!("access token credential has been revoked");
+        }
+        if let Some(agent_id) = claims.agent_id {
+            if !db::principal_can_access_agent(&self.pool, claims.sub, agent_id).await? {
+                anyhow::bail!("agent access has been suspended or revoked");
+            }
         }
         Ok(AuthContext {
             organization_id: claims.organization_id,
@@ -467,21 +585,48 @@ impl AuthService {
             agent_id: claims.agent_id,
             agent_external_id: claims.agent_external_id,
             instance_id: claims.instance_id,
-            dpop_jkt: Some(thumbprint),
+            dpop_jkt: thumbprint,
         })
     }
 
     pub async fn exchange_token(
         &self,
         request: TokenRequest,
-        proof: &str,
+        proof: Option<&str>,
     ) -> Result<TokenResponse> {
-        let dpop_jkt = self
-            .verify_dpop(proof, "POST", &self.token_endpoint, None)
-            .await?;
         match request.grant_type.as_str() {
-            "client_credentials" => self.exchange_local_credential(request, dpop_jkt).await,
+            "authorization_code" => {
+                let dpop_jkt = match proof {
+                    Some(proof) => Some(
+                        self.verify_dpop(proof, "POST", &self.token_endpoint, None)
+                            .await?,
+                    ),
+                    None => None,
+                };
+                self.exchange_authorization_code(request, dpop_jkt).await
+            }
+            "refresh_token" => {
+                let dpop_jkt = match proof {
+                    Some(proof) => Some(
+                        self.verify_dpop(proof, "POST", &self.token_endpoint, None)
+                            .await?,
+                    ),
+                    None => None,
+                };
+                self.exchange_refresh_token(request, dpop_jkt).await
+            }
+            "client_credentials" => {
+                let proof = proof.ok_or_else(|| anyhow!("DPoP header is required"))?;
+                let dpop_jkt = self
+                    .verify_dpop(proof, "POST", &self.token_endpoint, None)
+                    .await?;
+                self.exchange_local_credential(request, dpop_jkt).await
+            }
             "urn:ietf:params:oauth:grant-type:token-exchange" => {
+                let proof = proof.ok_or_else(|| anyhow!("DPoP header is required"))?;
+                let dpop_jkt = self
+                    .verify_dpop(proof, "POST", &self.token_endpoint, None)
+                    .await?;
                 self.exchange_workload_identity(request, dpop_jkt).await
             }
             _ => anyhow::bail!("unsupported grant_type"),
@@ -550,14 +695,21 @@ impl AuthService {
         let scopes = select_scopes(&account.scopes, request.scope.as_deref())?;
         let principal = db::get_active_principal(&self.pool, account.principal_id).await?;
         let agent_external_id = match account.agent_id {
-            Some(agent_id) => Some(
-                sqlx::query_scalar::<_, String>(
-                    "SELECT external_id FROM agents WHERE id = $1 AND status = 'active'",
+            Some(agent_id) => {
+                if !db::principal_can_access_agent(&self.pool, account.principal_id, agent_id)
+                    .await?
+                {
+                    anyhow::bail!("agent access has been suspended or revoked");
+                }
+                Some(
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT external_id FROM agents WHERE id = $1 AND status = 'active'",
+                    )
+                    .bind(agent_id)
+                    .fetch_one(&self.pool)
+                    .await?,
                 )
-                .bind(agent_id)
-                .fetch_one(&self.pool)
-                .await?,
-            ),
+            }
             None => None,
         };
         db::touch_credential_binding(&self.pool, account.id)
@@ -573,7 +725,8 @@ impl AuthService {
             agent_external_id,
             None,
             scopes,
-            dpop_jkt,
+            self.audience.clone(),
+            Some(dpop_jkt),
         )
     }
 
@@ -609,9 +762,12 @@ impl AuthService {
             anyhow::bail!("workload identity must match exactly one active federation trust");
         }
         let trust = matching.into_iter().next().expect("length checked");
+        if !db::principal_can_access_agent(&self.pool, trust.principal_id, trust.agent_id).await? {
+            anyhow::bail!("agent access has been suspended or revoked");
+        }
         validate_federation_url(&trust.issuer)?;
         validate_federation_url(&trust.jwks_uri)?;
-        let response = federation_http_client(&trust.jwks_uri)
+        let response = hardened_public_https_client(&trust.jwks_uri)
             .await?
             .get(&trust.jwks_uri)
             .send()
@@ -684,8 +840,192 @@ impl AuthService {
             Some(external_id),
             Some(instance_id),
             scopes,
-            dpop_jkt,
+            self.audience.clone(),
+            Some(dpop_jkt),
         )
+    }
+
+    async fn exchange_authorization_code(
+        &self,
+        request: TokenRequest,
+        dpop_jkt: Option<String>,
+    ) -> Result<TokenResponse> {
+        let code = request
+            .code
+            .as_deref()
+            .ok_or_else(|| anyhow!("code is required"))?;
+        let client_id = request
+            .client_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("client_id is required"))?;
+        let redirect_uri = request
+            .redirect_uri
+            .as_deref()
+            .ok_or_else(|| anyhow!("redirect_uri is required"))?;
+        let verifier = request
+            .code_verifier
+            .as_deref()
+            .ok_or_else(|| anyhow!("code_verifier is required"))?;
+        validate_pkce_verifier(verifier)?;
+        let code_hash = hex::encode(Sha256::digest(code.as_bytes()));
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, AuthorizationCodeRow>(
+            r#"SELECT organization_id, principal_id, passkey_id, agent_id,
+                      agent_external_id,
+                      client_id, redirect_uri, code_challenge, resource, scopes, expires_at, used_at
+               FROM oauth_authorization_codes WHERE code_hash = $1 FOR UPDATE"#,
+        )
+        .bind(&code_hash)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| anyhow!("authorization code is invalid"))?;
+        if row.used_at.is_some()
+            || row.expires_at <= Utc::now()
+            || row.client_id != client_id
+            || row.redirect_uri != redirect_uri
+            || row.code_challenge != challenge
+        {
+            anyhow::bail!("authorization code is invalid, expired, or does not match PKCE");
+        }
+        sqlx::query("UPDATE oauth_authorization_codes SET used_at = now() WHERE code_hash = $1")
+            .bind(&code_hash)
+            .execute(&mut *transaction)
+            .await?;
+        let connection_id = Uuid::new_v4();
+        let refresh_token = random_oauth_token();
+        let refresh_token_hash = hex::encode(Sha256::digest(refresh_token.as_bytes()));
+        sqlx::query(
+            r#"INSERT INTO oauth_connections (
+                id, organization_id, principal_id, passkey_id, agent_id,
+                agent_external_id, client_id, resource, scopes, dpop_jkt
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+        )
+        .bind(connection_id)
+        .bind(row.organization_id)
+        .bind(row.principal_id)
+        .bind(row.passkey_id)
+        .bind(row.agent_id)
+        .bind(&row.agent_external_id)
+        .bind(&row.client_id)
+        .bind(&row.resource)
+        .bind(&row.scopes)
+        .bind(&dpop_jkt)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO oauth_refresh_tokens (token_hash, connection_id, expires_at)
+               VALUES ($1, $2, $3)"#,
+        )
+        .bind(refresh_token_hash)
+        .bind(connection_id)
+        .bind(Utc::now() + Duration::days(OAUTH_REFRESH_TOKEN_TTL_DAYS))
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        let principal = db::get_active_principal(&self.pool, row.principal_id).await?;
+        let mut response = self.issue_access_token(
+            principal.auth_version,
+            row.organization_id,
+            row.principal_id,
+            connection_id,
+            CredentialKind::OAuthSession,
+            row.agent_id,
+            row.agent_external_id,
+            None,
+            row.scopes.into_iter().collect(),
+            row.resource,
+            dpop_jkt,
+        )?;
+        response.refresh_token = Some(refresh_token);
+        Ok(response)
+    }
+
+    async fn exchange_refresh_token(
+        &self,
+        request: TokenRequest,
+        dpop_jkt: Option<String>,
+    ) -> Result<TokenResponse> {
+        let refresh_token = request
+            .refresh_token
+            .as_deref()
+            .ok_or_else(|| anyhow!("refresh_token is required"))?;
+        let client_id = request
+            .client_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("client_id is required"))?;
+        let token_hash = hex::encode(Sha256::digest(refresh_token.as_bytes()));
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, RefreshTokenRow>(
+            r#"SELECT rt.connection_id, rt.expires_at, rt.used_at,
+                      c.organization_id, c.principal_id, c.agent_id,
+                      c.agent_external_id, c.client_id, c.resource, c.scopes,
+                      c.dpop_jkt, c.status
+               FROM oauth_refresh_tokens rt
+               JOIN oauth_connections c ON c.id = rt.connection_id
+               WHERE rt.token_hash = $1
+               FOR UPDATE OF rt, c"#,
+        )
+        .bind(&token_hash)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| anyhow!("refresh token is invalid"))?;
+        if row.used_at.is_some() {
+            sqlx::query(
+                "UPDATE oauth_connections SET status = 'revoked', revoked_at = now(), updated_at = now() WHERE id = $1",
+            )
+            .bind(row.connection_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            anyhow::bail!("refresh token reuse detected; OAuth connection was revoked");
+        }
+        if row.status != "active" || row.expires_at <= Utc::now() || row.client_id != client_id {
+            anyhow::bail!("refresh token is expired, revoked, or belongs to another client");
+        }
+        validate_refresh_dpop_binding(row.dpop_jkt.as_deref(), dpop_jkt.as_deref())?;
+        let scopes = select_scopes(&row.scopes, request.scope.as_deref())?;
+        let replacement = random_oauth_token();
+        let replacement_hash = hex::encode(Sha256::digest(replacement.as_bytes()));
+        sqlx::query(
+            r#"INSERT INTO oauth_refresh_tokens (token_hash, connection_id, expires_at)
+               VALUES ($1, $2, $3)"#,
+        )
+        .bind(&replacement_hash)
+        .bind(row.connection_id)
+        .bind(Utc::now() + Duration::days(OAUTH_REFRESH_TOKEN_TTL_DAYS))
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE oauth_refresh_tokens SET used_at = now(), replaced_by_hash = $2 WHERE token_hash = $1",
+        )
+        .bind(&token_hash)
+        .bind(&replacement_hash)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE oauth_connections SET last_used_at = now(), updated_at = now() WHERE id = $1",
+        )
+        .bind(row.connection_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        let principal = db::get_active_principal(&self.pool, row.principal_id).await?;
+        let mut response = self.issue_access_token(
+            principal.auth_version,
+            row.organization_id,
+            row.principal_id,
+            row.connection_id,
+            CredentialKind::OAuthSession,
+            row.agent_id,
+            row.agent_external_id,
+            None,
+            scopes,
+            row.resource,
+            dpop_jkt,
+        )?;
+        response.refresh_token = Some(replacement);
+        Ok(response)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -700,13 +1040,14 @@ impl AuthService {
         agent_external_id: Option<String>,
         instance_id: Option<Uuid>,
         scopes: BTreeSet<String>,
-        dpop_jkt: String,
+        audience: String,
+        dpop_jkt: Option<String>,
     ) -> Result<TokenResponse> {
         let issued_at = Utc::now();
         let expires_at = issued_at + Duration::seconds(self.token_ttl_seconds);
         let claims = AccessTokenClaims {
             iss: self.issuer.clone(),
-            aud: self.audience.clone(),
+            aud: audience,
             sub: principal_id,
             organization_id,
             credential_id,
@@ -716,7 +1057,7 @@ impl AuthService {
             instance_id,
             scopes: scopes.iter().cloned().collect(),
             auth_version,
-            cnf: Confirmation { jkt: dpop_jkt },
+            cnf: dpop_jkt.map(|jkt| Confirmation { jkt }),
             iat: issued_at.timestamp(),
             exp: expires_at.timestamp(),
             jti: Uuid::new_v4(),
@@ -728,9 +1069,14 @@ impl AuthService {
         )?;
         Ok(TokenResponse {
             access_token,
-            token_type: "DPoP",
+            token_type: if claims.cnf.is_some() {
+                "DPoP"
+            } else {
+                "Bearer"
+            },
             expires_in: self.token_ttl_seconds,
             scope: scopes.into_iter().collect::<Vec<_>>().join(" "),
+            refresh_token: None,
         })
     }
 
@@ -899,7 +1245,8 @@ struct AccessTokenClaims {
     instance_id: Option<Uuid>,
     scopes: Vec<String>,
     auth_version: i64,
-    cnf: Confirmation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cnf: Option<Confirmation>,
     iat: i64,
     exp: i64,
     jti: Uuid,
@@ -961,6 +1308,10 @@ pub struct TokenRequest {
     pub subject_token_type: Option<String>,
     pub subject_token: Option<String>,
     pub scope: Option<String>,
+    pub code: Option<String>,
+    pub redirect_uri: Option<String>,
+    pub code_verifier: Option<String>,
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -969,6 +1320,64 @@ pub struct TokenResponse {
     pub token_type: &'static str,
     pub expires_in: i64,
     pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AuthorizationCodeRow {
+    organization_id: Uuid,
+    principal_id: Uuid,
+    passkey_id: Uuid,
+    agent_id: Option<Uuid>,
+    agent_external_id: Option<String>,
+    client_id: String,
+    redirect_uri: String,
+    code_challenge: String,
+    resource: String,
+    scopes: Vec<String>,
+    expires_at: chrono::DateTime<Utc>,
+    used_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct RefreshTokenRow {
+    connection_id: Uuid,
+    expires_at: chrono::DateTime<Utc>,
+    used_at: Option<chrono::DateTime<Utc>>,
+    organization_id: Uuid,
+    principal_id: Uuid,
+    agent_id: Option<Uuid>,
+    agent_external_id: Option<String>,
+    client_id: String,
+    resource: String,
+    scopes: Vec<String>,
+    dpop_jkt: Option<String>,
+    status: String,
+}
+
+fn random_oauth_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn validate_refresh_dpop_binding(expected: Option<&str>, supplied: Option<&str>) -> Result<()> {
+    if expected != supplied {
+        anyhow::bail!("refresh token proof does not match the OAuth connection");
+    }
+    Ok(())
+}
+
+fn validate_pkce_verifier(verifier: &str) -> Result<()> {
+    if !(43..=128).contains(&verifier.len())
+        || !verifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+    {
+        anyhow::bail!("code_verifier is not a valid RFC 7636 verifier");
+    }
+    Ok(())
 }
 
 fn dpop_header(headers: &HeaderMap) -> Result<&str> {
@@ -1048,7 +1457,7 @@ pub fn validate_federation_url(value: &str) -> Result<()> {
     Ok(())
 }
 
-async fn federation_http_client(value: &str) -> Result<reqwest::Client> {
+pub(crate) async fn hardened_public_https_client(value: &str) -> Result<reqwest::Client> {
     validate_federation_url(value)?;
     let url = reqwest::Url::parse(value)?;
     let host = url
@@ -1094,14 +1503,24 @@ pub async fn authentication_middleware(
         }
         Err(error) => {
             tracing::warn!(%error, "request authentication failed");
-            (
+            let resource_path = match request.uri().path() {
+                "/mcp/agent" => "/mcp/agent",
+                "/mcp/control" => "/mcp/control",
+                _ => "",
+            };
+            let metadata = auth.protected_resource_metadata_url(resource_path);
+            let mut response = (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
                     "error": "invalid_credentials",
                     "message": "credentials or proof-of-possession are missing, invalid, expired, or revoked"
                 })),
             )
-                .into_response()
+                .into_response();
+            if let Ok(value) = format!("Bearer resource_metadata=\"{metadata}\"").parse() {
+                response.headers_mut().insert("www-authenticate", value);
+            }
+            response
         }
     }
 }
@@ -1476,6 +1895,25 @@ mod tests {
     }
 
     #[test]
+    fn pkce_verifiers_follow_rfc7636_character_and_length_rules() {
+        assert!(validate_pkce_verifier(&"a".repeat(43)).is_ok());
+        assert!(validate_pkce_verifier(&"A0-._~".repeat(10)).is_ok());
+        assert!(validate_pkce_verifier(&"a".repeat(42)).is_err());
+        assert!(validate_pkce_verifier(&"a".repeat(129)).is_err());
+        assert!(validate_pkce_verifier(&format!("{}=", "a".repeat(42))).is_err());
+    }
+
+    #[test]
+    fn refresh_tokens_preserve_their_original_dpop_binding() {
+        let thumbprint = "a".repeat(43);
+        assert!(validate_refresh_dpop_binding(Some(&thumbprint), Some(&thumbprint)).is_ok());
+        assert!(validate_refresh_dpop_binding(None, None).is_ok());
+        assert!(validate_refresh_dpop_binding(Some(&thumbprint), None).is_err());
+        assert!(validate_refresh_dpop_binding(None, Some(&thumbprint)).is_err());
+        assert!(validate_refresh_dpop_binding(Some(&thumbprint), Some(&"b".repeat(43))).is_err());
+    }
+
+    #[test]
     fn public_jwk_validation_uses_stable_rfc7638_thumbprints() {
         let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
         let point = signing_key.verifying_key().to_encoded_point(false);
@@ -1592,9 +2030,13 @@ mod tests {
             subject_token_type: None,
             subject_token: None,
             scope: Some("wallet:read".into()),
+            code: None,
+            redirect_uri: None,
+            code_verifier: None,
+            refresh_token: None,
         };
         let token = auth
-            .exchange_token(request, &token_dpop)
+            .exchange_token(request, Some(&token_dpop))
             .await
             .expect("exchange local credential");
         assert_eq!(token.token_type, "DPoP");

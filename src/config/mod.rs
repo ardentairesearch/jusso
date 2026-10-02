@@ -70,9 +70,12 @@ pub struct AppConfig {
     pub per_principal_rate_limit_burst: f64,
     pub public_registration_enabled: bool,
     pub registration_turnstile_secret: Option<String>,
+    pub registration_turnstile_site_key: Option<String>,
     pub registration_allowed_hostnames: Vec<String>,
     pub registration_client_ip_header: Option<String>,
     pub registration_hourly_limit: u64,
+    pub webauthn_rp_id: String,
+    pub webauthn_origin: String,
 }
 
 #[derive(Clone)]
@@ -140,6 +143,8 @@ impl fmt::Debug for AppConfig {
             .field("bootstrap_admin_token", &"[REDACTED]")
             .field("oauth_signing_secret", &"[REDACTED]")
             .field("registration_turnstile_secret", &"[REDACTED]")
+            .field("webauthn_rp_id", &self.webauthn_rp_id)
+            .field("webauthn_origin", &self.webauthn_origin)
             .finish()
     }
 }
@@ -239,6 +244,7 @@ impl AppConfig {
         }
         let public_registration_enabled = parse_bool_env("PUBLIC_REGISTRATION_ENABLED", true)?;
         let registration_turnstile_secret = optional_env("REGISTRATION_TURNSTILE_SECRET");
+        let registration_turnstile_site_key = optional_env("REGISTRATION_TURNSTILE_SITE_KEY");
         if public_registration_enabled
             && registration_turnstile_secret.is_none()
             && !is_local_url(&public_api_base_url)
@@ -260,6 +266,30 @@ impl AppConfig {
         {
             bail!("REGISTRATION_ALLOWED_HOSTNAMES is required when Turnstile-protected registration is enabled");
         }
+        if registration_turnstile_secret.is_some() != registration_turnstile_site_key.is_some() {
+            bail!("REGISTRATION_TURNSTILE_SECRET and REGISTRATION_TURNSTILE_SITE_KEY must be configured together");
+        }
+        let webauthn_origin = optional_env("WEBAUTHN_ORIGIN")
+            .unwrap_or_else(|| public_api_base_url.clone())
+            .trim_end_matches('/')
+            .to_string();
+        if !is_https_or_localhost(&webauthn_origin) {
+            bail!("WEBAUTHN_ORIGIN must use HTTPS outside local development");
+        }
+        let parsed_webauthn_origin = reqwest::Url::parse(&webauthn_origin)
+            .context("WEBAUTHN_ORIGIN must be an absolute URL")?;
+        if parsed_webauthn_origin.path() != "/"
+            || parsed_webauthn_origin.query().is_some()
+            || parsed_webauthn_origin.fragment().is_some()
+        {
+            bail!("WEBAUTHN_ORIGIN must contain only scheme and authority");
+        }
+        let webauthn_rp_id = optional_env("WEBAUTHN_RP_ID").unwrap_or_else(|| {
+            parsed_webauthn_origin
+                .host_str()
+                .unwrap_or("localhost")
+                .to_string()
+        });
         let registration_client_ip_header = optional_env("REGISTRATION_CLIENT_IP_HEADER")
             .map(|value| {
                 value
@@ -307,9 +337,12 @@ impl AppConfig {
             per_principal_rate_limit_burst,
             public_registration_enabled,
             registration_turnstile_secret,
+            registration_turnstile_site_key,
             registration_allowed_hostnames,
             registration_client_ip_header,
             registration_hourly_limit: parse_positive_u64_env("REGISTRATION_HOURLY_LIMIT", "5")?,
+            webauthn_rp_id,
+            webauthn_origin,
         })
     }
 

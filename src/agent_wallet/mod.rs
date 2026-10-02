@@ -94,6 +94,17 @@ impl AgentWalletRegistry {
         organization_id: Uuid,
         agent_id: &str,
     ) -> Result<Option<AgentWallet>> {
+        let rotation_active = crate::db::agent_has_unresolved_signer_rotation(
+            &self.db_pool,
+            organization_id,
+            agent_id,
+        )
+        .await?;
+        if rotation_active {
+            anyhow::bail!(
+                "agent execution is paused while its onchain signer rotation is unresolved"
+            );
+        }
         let row = sqlx::query_as::<_, AgentWalletRow>(
             r#"
             SELECT

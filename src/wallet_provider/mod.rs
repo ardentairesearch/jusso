@@ -203,6 +203,28 @@ impl WalletManager {
         }
         Ok(signature)
     }
+
+    pub async fn get_by_id(&self, scope: WalletScope, id: Uuid) -> Result<ManagedWallet> {
+        let row = sqlx::query_as::<_, ManagedWalletRow>(
+            r#"
+            SELECT id, wallet_provider, provider_organization_id,
+                   provider_wallet_id, provider_account_id, provider_external_id,
+                   scope_kind, scope_organization_id, address
+            FROM managed_wallets
+            WHERE id = $1 AND wallet_provider = $2
+              AND scope_kind = $3
+              AND scope_organization_id IS NOT DISTINCT FROM $4
+            "#,
+        )
+        .bind(id)
+        .bind(self.provider.kind().as_str())
+        .bind(scope.kind())
+        .bind(scope.organization_id())
+        .fetch_optional(&self.db_pool)
+        .await?
+        .context("managed wallet was not found in the expected custody scope")?;
+        ManagedWallet::try_from(row)
+    }
 }
 
 async fn lock_external_id(
@@ -282,6 +304,12 @@ pub(crate) fn validate_provider_wallet(
 pub fn deterministic_wallet_name(organization_id: Uuid, agent_id: &str) -> String {
     let digest = Sha256::digest(format!("{organization_id}:{agent_id}").as_bytes());
     format!("jusso-{}", &hex::encode(digest)[..28])
+}
+
+pub fn replacement_wallet_name(agent_wallet_id: Uuid, rotation_id: Uuid) -> String {
+    let digest =
+        Sha256::digest(format!("{agent_wallet_id}:{rotation_id}:signer-rotation").as_bytes());
+    format!("jusso-r-{}", &hex::encode(digest)[..32])
 }
 
 pub fn validate_external_id(external_id: &str) -> Result<()> {

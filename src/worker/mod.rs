@@ -204,21 +204,6 @@ async fn execute_arc(
             bail!("settled x402 fee differs from its authorization permit");
         }
     }
-    let wallet = ctx
-        .wallet_registry
-        .get_existing(job.organization_id, &job.agent_id)
-        .await?
-        .context("agent wallet no longer exists")?;
-    let account = ctx
-        .engine
-        .smart_accounts
-        .get_or_create(&wallet, ctx.engine.config.arc_network)
-        .await?;
-    if !format!("{:?}", account.address).eq_ignore_ascii_case(&job.smart_wallet_address)
-        || account.signer_address != wallet.managed_wallet.provider_wallet.address
-    {
-        bail!("queued wallet does not match the tenant-owned Arc smart account");
-    }
     let mut calls = execution_calls(
         &job.target_contract,
         &job.calldata,
@@ -231,14 +216,39 @@ async fn execute_arc(
 
     // A transaction-scoped advisory lock covers preparation through receipt, so
     // two workers cannot prepare different nonces for the same smart account.
+    let queued_account = job
+        .smart_wallet_address
+        .parse::<Address>()
+        .context("queued smart-wallet address is invalid")?;
+    if queued_account == Address::zero() {
+        bail!("queued smart-wallet address cannot be zero");
+    }
     let mut nonce_lock = ctx.db_pool.begin().await?;
-    let digest = keccak256(account.address.as_bytes());
+    let digest = keccak256(queued_account.as_bytes());
     let lock_key = i64::from_be_bytes(digest[..8].try_into().expect("fixed digest length"));
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(lock_key)
         .execute(&mut *nonce_lock)
         .await
         .context("failed to acquire Arc account lock")?;
+    // Resolve custody only after taking the account lock. This prevents an
+    // execution from retaining the old signer while a concurrent rotation
+    // changes ownership and reconciles the database binding.
+    let wallet = ctx
+        .wallet_registry
+        .get_existing(job.organization_id, &job.agent_id)
+        .await?
+        .context("agent wallet no longer exists")?;
+    let account = ctx
+        .engine
+        .smart_accounts
+        .get_or_create(&wallet, ctx.engine.config.arc_network)
+        .await?;
+    if account.address != queued_account
+        || account.signer_address != wallet.managed_wallet.provider_wallet.address
+    {
+        bail!("queued wallet does not match the tenant-owned Arc smart account");
+    }
     let current = db::get_execution_request(&ctx.db_pool, job.request_id)
         .await?
         .context("queued execution disappeared")?;

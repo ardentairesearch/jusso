@@ -14,14 +14,13 @@ use chrono::Utc;
 use jsonwebtoken::{encode, jwk::Jwk, Algorithm, EncodingKey, Header};
 use p256::{
     ecdsa::SigningKey,
-    pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding},
+    pkcs8::{EncodePrivateKey, LineEnding},
 };
 use rand::rngs::OsRng;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -32,12 +31,9 @@ async fn main() -> Result<()> {
     match args.next().as_deref() {
         Some("onboard") => onboard(parse_options(args.collect())?).await,
         Some("enroll") => enroll(parse_enroll_options(args.collect())?).await,
-        Some("agent") if args.next().as_deref() == Some("create") => {
-            create_agent(parse_create_agent_options(args.collect())?).await
-        }
         _ => {
             eprintln!(
-                "Usage:\n  jusso onboard --organization NAME --agent-id ID --accept-terms [--display-name NAME] [--api-url URL] [--challenge-token TOKEN]\n  jusso agent create --profile FILE --agent-id ID --display-name NAME [--policy-id UUID] [--parent-agent-id UUID] [--enrollment-ttl-seconds N]\n  jusso enroll --enrollment-token TOKEN --display-name NAME [--api-url URL]"
+                "Usage:\n  jusso onboard --organization NAME --agent-id ID --accept-terms [--display-name NAME] [--api-url URL] [--challenge-token TOKEN]\n  jusso enroll --enrollment-token TOKEN --display-name NAME [--api-url URL]"
             );
             std::process::exit(2);
         }
@@ -92,25 +88,6 @@ struct EnrollOptions {
     api_url: String,
 }
 
-#[derive(Debug)]
-struct CreateAgentOptions {
-    profile: PathBuf,
-    agent_id: String,
-    display_name: String,
-    policy_id: Option<String>,
-    parent_agent_id: Option<String>,
-    enrollment_ttl_seconds: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalProfile {
-    version: u8,
-    api_url: String,
-    client_id: String,
-    private_key_file: PathBuf,
-    policy_id: Option<String>,
-}
-
 fn parse_enroll_options(arguments: Vec<String>) -> Result<EnrollOptions> {
     let (mut values, _) = parse_arguments(arguments, None)?;
     let enrollment_token = values
@@ -129,39 +106,6 @@ fn parse_enroll_options(arguments: Vec<String>) -> Result<EnrollOptions> {
         enrollment_token,
         display_name,
         api_url,
-    })
-}
-
-fn parse_create_agent_options(arguments: Vec<String>) -> Result<CreateAgentOptions> {
-    let (mut values, _) = parse_arguments(arguments, None)?;
-    let profile = values
-        .remove("--profile")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("--profile is required"))?;
-    let agent_id = values
-        .remove("--agent-id")
-        .ok_or_else(|| anyhow!("--agent-id is required"))?;
-    let display_name = values
-        .remove("--display-name")
-        .ok_or_else(|| anyhow!("--display-name is required"))?;
-    let policy_id = values.remove("--policy-id");
-    let parent_agent_id = values.remove("--parent-agent-id");
-    let enrollment_ttl_seconds = values
-        .remove("--enrollment-ttl-seconds")
-        .unwrap_or_else(|| "900".into())
-        .parse::<i64>()
-        .context("--enrollment-ttl-seconds must be an integer")?;
-    if !(60..=86_400).contains(&enrollment_ttl_seconds) {
-        anyhow::bail!("--enrollment-ttl-seconds must be between 60 and 86400");
-    }
-    reject_unknown_options(&values)?;
-    Ok(CreateAgentOptions {
-        profile,
-        agent_id,
-        display_name,
-        policy_id,
-        parent_agent_id,
-        enrollment_ttl_seconds,
     })
 }
 
@@ -261,76 +205,6 @@ async fn enroll(options: EnrollOptions) -> Result<()> {
         registration,
     )
     .await
-}
-
-async fn create_agent(options: CreateAgentOptions) -> Result<()> {
-    let profile: LocalProfile = serde_json::from_slice(
-        &fs::read(&options.profile)
-            .with_context(|| format!("failed to read profile {}", options.profile.display()))?,
-    )
-    .context("profile is not valid Jusso JSON")?;
-    if profile.version != 1 {
-        anyhow::bail!("unsupported Jusso profile version {}", profile.version);
-    }
-    let policy_id = options
-        .policy_id
-        .as_deref()
-        .or(profile.policy_id.as_deref())
-        .ok_or_else(|| anyhow!("--policy-id is required because this profile has no default"))?;
-    Uuid::parse_str(policy_id).context("policy_id must be a UUID")?;
-    if let Some(parent) = options.parent_agent_id.as_deref() {
-        Uuid::parse_str(parent).context("parent_agent_id must be a UUID")?;
-    }
-
-    let private_pem = Zeroizing::new(fs::read(&profile.private_key_file).with_context(|| {
-        format!(
-            "failed to read private key {}",
-            profile.private_key_file.display()
-        )
-    })?);
-    let signing_key = SigningKey::from_pkcs8_pem(
-        std::str::from_utf8(&private_pem).context("private key is not UTF-8 PEM")?,
-    )
-    .context("profile private key is not a P-256 PKCS#8 key")?;
-    let public_jwk = public_jwk(&signing_key)?;
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()?;
-    let (issuer, access_token) = obtain_access_token(
-        &http,
-        &profile.api_url,
-        &profile.client_id,
-        &public_jwk,
-        &private_pem,
-    )
-    .await?;
-    let path = "/agents";
-    let proof = dpop_proof(
-        "POST",
-        &format!("{issuer}{path}"),
-        Some(&access_token),
-        &public_jwk,
-        &private_pem,
-    )?;
-    let response = json_response(
-        http.post(format!("{}{path}", profile.api_url.trim_end_matches('/')))
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("DPoP", proof)
-            .json(&json!({
-                "agent_id": options.agent_id,
-                "display_name": options.display_name,
-                "parent_agent_id": options.parent_agent_id,
-                "policy_id": policy_id,
-                "scopes": [],
-                "enrollment_ttl_seconds": options.enrollment_ttl_seconds,
-            }))
-            .send()
-            .await?,
-        "agent creation",
-    )
-    .await?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
-    Ok(())
 }
 
 async fn finish_onboarding(
@@ -613,20 +487,5 @@ mod tests {
         .unwrap();
         assert_eq!(options.display_name, "Treasury worker");
         assert_eq!(options.api_url, "http://127.0.0.1:8080");
-    }
-
-    #[test]
-    fn parses_owner_driven_agent_creation() {
-        let options = parse_create_agent_options(vec![
-            "--profile".into(),
-            "/tmp/owner.json".into(),
-            "--agent-id".into(),
-            "researcher".into(),
-            "--display-name".into(),
-            "Research agent".into(),
-        ])
-        .unwrap();
-        assert_eq!(options.agent_id, "researcher");
-        assert_eq!(options.enrollment_ttl_seconds, 900);
     }
 }
