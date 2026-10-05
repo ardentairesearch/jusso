@@ -89,6 +89,12 @@ struct WalletParams {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct ExecutionStatusParams {
+    /// Execution request UUID returned by an execute tool.
+    request_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct PoolsParams {
     /// First token contract address.
     token_a: String,
@@ -266,6 +272,23 @@ impl AgentMcp {
         )
         .await
         .map_err(tool_error)?;
+        json_output(response)
+    }
+
+    #[tool(description = "Read the current status and transaction hash of an execution request.")]
+    async fn get_execution_status(
+        &self,
+        Parameters(params): Parameters<ExecutionStatusParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "execution:read")?;
+        let request_id = Uuid::parse_str(params.request_id.trim())
+            .map_err(|_| tool_error("request_id must be a UUID"))?;
+        let response = services::handle_execution_status(&self.state.db_pool, &auth, request_id)
+            .await
+            .map_err(tool_error)?
+            .ok_or_else(|| tool_error("execution request was not found"))?;
         json_output(response)
     }
 
@@ -1342,6 +1365,7 @@ mod tests {
         let runtime = [
             AgentMcp::get_wallet_tool_attr().name.to_string(),
             AgentMcp::get_wallet_balance_tool_attr().name.to_string(),
+            AgentMcp::get_execution_status_tool_attr().name.to_string(),
             AgentMcp::discover_uniswap_v4_pools_tool_attr()
                 .name
                 .to_string(),

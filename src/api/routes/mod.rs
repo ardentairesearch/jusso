@@ -879,50 +879,8 @@ pub async fn status_handler(
         }
     };
 
-    match db::get_execution_request_for_organization(&state.db_pool, uuid, api_ctx.organization_id)
-        .await
-    {
-        Ok(Some(row)) => {
-            let can_access = !api_ctx.is_bound_to_other_agent(row.agent_uuid)
-                && db::principal_can_access_agent(
-                    &state.db_pool,
-                    api_ctx.principal_id,
-                    row.agent_uuid,
-                )
-                .await
-                .unwrap_or(false);
-            if !can_access {
-                db::insert_auth_audit_event(
-                    &state.db_pool,
-                    &api_ctx,
-                    "execution:read",
-                    Some("/status/:id"),
-                    "deny",
-                    serde_json::json!({
-                        "reason": "agent_not_allowed",
-                        "request_id": row.id
-                    }),
-                )
-                .await
-                .ok();
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "request not found" })),
-                )
-                    .into_response();
-            }
-            let resp = StatusResponse {
-                request_id: row.id,
-                status: serde_json::from_value(serde_json::Value::String(row.status.clone()))
-                    .unwrap_or(ExecutionStatus::Pending),
-                chain: row.chain,
-                tx_hash: row.tx_hash,
-                cost_usd: row.cost_usd,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-            };
-            (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response()
-        }
+    match services::handle_execution_status(&state.db_pool, &api_ctx, uuid).await {
+        Ok(Some(response)) => (StatusCode::OK, Json(response)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "request not found" })),
@@ -1761,6 +1719,8 @@ pub async fn oauth_authorization_server_metadata_handler(
         "response_types_supported": ["code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+        "client_id_metadata_document_supported": true,
+        "authorization_response_iss_parameter_supported": true,
         "token_endpoint_auth_signing_alg_values_supported": [
             "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384"
         ],

@@ -513,20 +513,35 @@ impl AuthService {
         method: &Method,
         uri: &Uri,
     ) -> Result<AuthContext> {
-        let bearer = headers
+        let authorization = headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or_else(|| anyhow!("missing access token"))?;
+        let mut parts = authorization.split_ascii_whitespace();
+        let scheme = parts
+            .next()
+            .filter(|value| {
+                value.eq_ignore_ascii_case("Bearer") || value.eq_ignore_ascii_case("DPoP")
+            })
+            .ok_or_else(|| {
+                anyhow!("access token must use the Bearer or DPoP authorization scheme")
+            })?;
+        let token = parts
+            .next()
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("missing Bearer access token"))?;
+            .ok_or_else(|| anyhow!("missing access token"))?;
+        if parts.next().is_some() {
+            anyhow::bail!("authorization header is malformed");
+        }
         let proof = dpop_header(headers).ok();
-        self.authenticate_access_token(bearer, proof, method, uri)
+        self.authenticate_access_token(token, scheme, proof, method, uri)
             .await
     }
 
     async fn authenticate_access_token(
         &self,
         token: &str,
+        scheme: &str,
         proof: Option<&str>,
         method: &Method,
         uri: &Uri,
@@ -550,6 +565,11 @@ impl AuthService {
         .claims;
         let thumbprint = match claims.cnf.as_ref() {
             Some(confirmation) => {
+                if !scheme.eq_ignore_ascii_case("DPoP") {
+                    anyhow::bail!(
+                        "DPoP-bound access tokens must use the DPoP authorization scheme"
+                    );
+                }
                 let proof = proof.ok_or_else(|| anyhow!("DPoP header is required"))?;
                 let htu = format!("{}{}", self.issuer, uri.path());
                 let thumbprint = self
@@ -560,7 +580,15 @@ impl AuthService {
                 }
                 Some(thumbprint)
             }
-            None => None,
+            None => {
+                if !scheme.eq_ignore_ascii_case("Bearer") {
+                    anyhow::bail!("unbound access tokens must use the Bearer authorization scheme");
+                }
+                if proof.is_some() {
+                    anyhow::bail!("Bearer access tokens must not include a DPoP proof");
+                }
+                None
+            }
         };
         let principal = db::get_active_principal(&self.pool, claims.sub).await?;
         if principal.organization_id != claims.organization_id
@@ -2187,9 +2215,18 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            format!("Bearer {}", token.access_token).parse().unwrap(),
+            format!("DPoP {}", token.access_token).parse().unwrap(),
         );
         headers.insert("dpop", resource_dpop.parse().unwrap());
+        let mut wrong_scheme = headers.clone();
+        wrong_scheme.insert(
+            AUTHORIZATION,
+            format!("Bearer {}", token.access_token).parse().unwrap(),
+        );
+        assert!(auth
+            .authenticate(&wrong_scheme, &Method::GET, &"/wallet".parse().unwrap())
+            .await
+            .is_err());
         let context = auth
             .authenticate(&headers, &Method::GET, &"/wallet".parse().unwrap())
             .await

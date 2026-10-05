@@ -680,17 +680,7 @@ fn existing_execution_response(
     row: db::models::ExecutionRequestRow,
     execution_token: &crate::config::ExecutionTokenConfig,
 ) -> Result<ExecutionResponse> {
-    let status = match row.status.as_str() {
-        "pending" => ExecutionStatus::Pending,
-        "payment_required" => ExecutionStatus::PaymentRequired,
-        "payment_verified" => ExecutionStatus::PaymentVerified,
-        "queued" => ExecutionStatus::Queued,
-        "broadcasting" => ExecutionStatus::Broadcasting,
-        "confirmed" => ExecutionStatus::Confirmed,
-        "failed" => ExecutionStatus::Failed,
-        "reverted" => ExecutionStatus::Reverted,
-        other => anyhow::bail!("stored execution has unknown status {other}"),
-    };
+    let status = parse_execution_status(&row.status)?;
     let execution_fee_raw = row
         .cost_usd
         .map(|cost| usd_to_token_raw_amount(cost, execution_token.decimals))
@@ -709,6 +699,60 @@ fn existing_execution_response(
         tx_hash: row.tx_hash,
         message: "request already accepted for this Idempotency-Key".into(),
     })
+}
+
+fn parse_execution_status(status: &str) -> Result<ExecutionStatus> {
+    Ok(match status {
+        "pending" => ExecutionStatus::Pending,
+        "payment_required" => ExecutionStatus::PaymentRequired,
+        "payment_verified" => ExecutionStatus::PaymentVerified,
+        "queued" => ExecutionStatus::Queued,
+        "broadcasting" => ExecutionStatus::Broadcasting,
+        "confirmed" => ExecutionStatus::Confirmed,
+        "failed" => ExecutionStatus::Failed,
+        "reverted" => ExecutionStatus::Reverted,
+        other => anyhow::bail!("stored execution has unknown status {other}"),
+    })
+}
+
+pub async fn handle_execution_status(
+    pool: &PgPool,
+    auth_context: &AuthContext,
+    request_id: Uuid,
+) -> Result<Option<StatusResponse>> {
+    let Some(row) =
+        db::get_execution_request_for_organization(pool, request_id, auth_context.organization_id)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let can_access = !auth_context.is_bound_to_other_agent(row.agent_uuid)
+        && db::principal_can_access_agent(pool, auth_context.principal_id, row.agent_uuid).await?;
+    if !can_access {
+        db::insert_auth_audit_event(
+            pool,
+            auth_context,
+            "execution:read",
+            Some("/status/:id"),
+            "deny",
+            serde_json::json!({
+                "reason": "agent_not_allowed",
+                "request_id": row.id
+            }),
+        )
+        .await?;
+        return Ok(None);
+    }
+
+    Ok(Some(StatusResponse {
+        request_id: row.id,
+        status: parse_execution_status(&row.status)?,
+        chain: row.chain,
+        tx_hash: row.tx_hash,
+        cost_usd: row.cost_usd,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }))
 }
 
 struct AtomicFeePreparation {

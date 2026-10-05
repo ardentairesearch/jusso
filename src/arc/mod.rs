@@ -1,6 +1,6 @@
 //! Arc network constants, RPC checks, and exact USDC gas accounting.
 //!
-//! Arc transaction submission uses ERC-4337 rather than Base native AA.
+//! Arc transaction submission uses dedicated ERC-4337 smart accounts.
 
 pub mod execution;
 pub mod smart_account;

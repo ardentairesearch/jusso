@@ -784,7 +784,7 @@ async fn finish_registration(
     )
     .await
     .context("owner account registration failed")?;
-    authorization_redirect(&session, &raw_code)
+    authorization_redirect(&session, &raw_code, &service.config.oauth_issuer)
 }
 
 #[derive(Debug, Deserialize)]
@@ -985,24 +985,33 @@ async fn finish_authentication(
         }
     }
     let passkey = matched.ok_or_else(|| anyhow!("authenticated passkey is not registered"))?;
+    let owner = ConnectOwner {
+        organization_id: passkey.organization_id,
+        principal_id: passkey.principal_id,
+        passkey_id: passkey.id,
+    };
     complete_connect_session(
         &service.pool,
         &session,
-        passkey.organization_id,
-        passkey.principal_id,
-        passkey.id,
+        &service.config.oauth_issuer,
+        &owner,
         stored.agent_id,
         stored.agent_external_id.as_deref(),
     )
     .await
 }
 
-async fn complete_connect_session(
-    pool: &PgPool,
-    session: &ConnectSessionRow,
+struct ConnectOwner {
     organization_id: Uuid,
     principal_id: Uuid,
     passkey_id: Uuid,
+}
+
+async fn complete_connect_session(
+    pool: &PgPool,
+    session: &ConnectSessionRow,
+    issuer: &str,
+    owner: &ConnectOwner,
     agent_id: Option<Uuid>,
     agent_external_id: Option<&str>,
 ) -> Result<String> {
@@ -1022,9 +1031,9 @@ async fn complete_connect_session(
              )"#,
     )
     .bind(session.id)
-    .bind(organization_id)
-    .bind(principal_id)
-    .bind(passkey_id)
+    .bind(owner.organization_id)
+    .bind(owner.principal_id)
+    .bind(owner.passkey_id)
     .bind(agent_id)
     .bind(agent_external_id)
     .execute(&mut *transaction)
@@ -1041,9 +1050,9 @@ async fn complete_connect_session(
     )
     .bind(code_hash)
     .bind(session.id)
-    .bind(organization_id)
-    .bind(principal_id)
-    .bind(passkey_id)
+    .bind(owner.organization_id)
+    .bind(owner.principal_id)
+    .bind(owner.passkey_id)
     .bind(agent_id)
     .bind(agent_external_id)
     .bind(&session.client_id)
@@ -1056,7 +1065,7 @@ async fn complete_connect_session(
     .await?;
     transaction.commit().await?;
 
-    authorization_redirect(session, &raw_code)
+    authorization_redirect(session, &raw_code, issuer)
 }
 
 #[derive(Debug, FromRow)]
@@ -1751,9 +1760,14 @@ document.querySelector('#approve').onclick=async()=>{{message.textContent='';try
     )
 }
 
-fn authorization_redirect(session: &ConnectSessionRow, raw_code: &str) -> Result<String> {
+fn authorization_redirect(
+    session: &ConnectSessionRow,
+    raw_code: &str,
+    issuer: &str,
+) -> Result<String> {
     let mut redirect = reqwest::Url::parse(&session.redirect_uri)?;
     redirect.query_pairs_mut().append_pair("code", raw_code);
+    redirect.query_pairs_mut().append_pair("iss", issuer);
     if let Some(state) = &session.client_state {
         redirect.query_pairs_mut().append_pair("state", state);
     }
@@ -1979,6 +1993,36 @@ mod tests {
         assert_eq!(token.len(), 43);
         assert_eq!(token_hash(&token).len(), 64);
         assert!(!token_hash(&token).contains(&token));
+    }
+
+    #[test]
+    fn authorization_redirect_binds_code_to_issuer_and_preserves_state() {
+        let session = ConnectSessionRow {
+            id: Uuid::new_v4(),
+            client_name: "Assistant".to_string(),
+            client_id: "https://assistant.example/client-metadata.json".to_string(),
+            redirect_uri: "https://assistant.example/callback?existing=value".to_string(),
+            client_state: Some("client-state".to_string()),
+            code_challenge: "challenge".to_string(),
+            resource: "https://api.jusso.example/mcp/agent".to_string(),
+            scopes: vec!["wallet:read".to_string()],
+        };
+
+        let redirect = authorization_redirect(&session, "raw-code", "https://api.jusso.example")
+            .expect("authorization redirect");
+        let redirect = reqwest::Url::parse(&redirect).expect("redirect URL");
+        let query = redirect
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(query.get("existing").map(String::as_str), Some("value"));
+        assert_eq!(query.get("code").map(String::as_str), Some("raw-code"));
+        assert_eq!(
+            query.get("iss").map(String::as_str),
+            Some("https://api.jusso.example")
+        );
+        assert_eq!(query.get("state").map(String::as_str), Some("client-state"));
     }
 
     #[test]

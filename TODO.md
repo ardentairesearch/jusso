@@ -11,6 +11,12 @@ than retained as a historical checklist.
   become available; keep it disabled until then.
 - [ ] Complete a separately gated Arc mainnet rollout.
 
+## MCP Client Certification
+
+- [ ] Run end-to-end remote MCP OAuth tests with the supported production
+  clients and an official SDK client, covering discovery, PKCE, callback issuer
+  binding, token refresh, revocation, and agent/control endpoint separation.
+
 ## Bring Your Own Wallet
 
 - [ ] Keep BYOW disabled until the managed-account path is production-proven

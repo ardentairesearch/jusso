@@ -62,27 +62,37 @@ Every smart-account load independently checks the official factory derivation,
 EntryPoint, implementation, and embedded Turnkey owner. Bring-your-own-wallet
 is disabled.
 
+## Integration Surfaces
+
+Jusso exposes two remote Streamable HTTP MCP endpoints:
+
+| Endpoint | Audience |
+| --- | --- |
+| `/mcp/agent` | Agent runtime tools: wallet, balance, Uniswap discovery, quotes, simulation, execution, and status |
+| `/mcp/control` | Owner tools: agents, policies, connections, approvals, and signer lifecycle |
+
+Compatible MCP clients connect directly over HTTPS and complete OAuth in a
+browser. There is no local stdio MCP server or installer to keep synchronized.
+Direct REST/OAuth access remains available for custom runtimes and services.
+Client-specific certification is tracked in [TODO.md](TODO.md).
+
 ## Authentication
 
 Organizations own stable agents. Principals have grants to those agents;
 credentials authenticate principals; hosted runs become short-lived instances.
-Access tokens are short-lived and DPoP-bound. Local onboarding creates a P-256
-key on the developer's machine, registers only its public JWK, stores the key
-with `0600` permissions, and verifies wallet access:
+Local and workload-federated access tokens are short-lived and DPoP-bound.
+Remote MCP clients use Authorization Code + PKCE and receive a bearer or
+DPoP-bound token according to the client authorization request. Local
+onboarding creates a P-256 key on the developer's machine, registers only its
+public JWK, stores the key with `0600` permissions, and verifies wallet access:
 
 ```bash
 cargo run --bin jusso -- onboard --organization "Acme" --agent-id treasury --accept-terms
 ```
 
-Owners create another stable agent and a one-time enrollment token:
-
-```bash
-cargo run --bin jusso -- agent create \
-  --profile ~/.config/jusso/profiles/jso_client_OWNER.json \
-  --agent-id research --display-name "Research agent"
-```
-
-The child runtime enrolls with its own key, without receiving the owner key:
+Owners create another stable agent and one-time enrollment token through the
+control MCP endpoint. The child runtime then enrolls with its own key, without
+receiving the owner key:
 
 ```bash
 cargo run --bin jusso -- enroll \
@@ -119,8 +129,8 @@ outside the runtime.
 Requires Rust, PostgreSQL, Redis, a Turnkey parent organization with a P-256
 API key permitted to create tenant sub-organizations, an Alchemy app with Arc
 testnet Wallet API access and a funded gas sponsorship policy, and an Arc USDC
-fee-recipient address. Configure a fresh Beta database; `001_init.sql` is the
-undeployed Beta schema, not a migration from the previous Base prototype.
+fee-recipient address. Configure a fresh database; `001_init.sql` contains the
+current schema.
 
 ```dotenv
 ARC_NETWORK=arc-testnet
@@ -161,6 +171,18 @@ pinned Uniswap V4 contracts.
 The probe is read-only and accepts `ARC_BALANCE_ADDRESS` or
 `ARC_BUNDLER_RPC_URL` for additional checks.
 
+## Railway Deployment
+
+Deploy the repository as one Railway service using the included `Dockerfile`
+and `railway.toml`, with separate managed PostgreSQL and Redis services. Give
+only the Jusso service a public domain and pass the databases through Railway's
+private `DATABASE_URL` and `REDIS_URL` references. Set `PUBLIC_API_BASE_URL`,
+`WEBAUTHN_ORIGIN`, and `WEBAUTHN_RP_ID` to the final HTTPS domain before testing
+passkey onboarding; WebAuthn credentials are bound to that origin and relying
+party ID. The server applies migrations at startup and `/health` verifies both
+datastores. Keep one application replica until queue-worker coordination and
+multi-replica operations are separately certified.
+
 ## Verification
 
 ```bash
@@ -175,9 +197,8 @@ counterfactual account derivation, first-operation deployment, sponsored
 execution, and atomic fee settlement. Account loads now independently verify
 Alchemy's official MAv2 factory derivation, embedded owner, implementation, and
 EntryPoint. Crash recovery, sponsorship rejection, and protocol-specific Arc
-deployment tests remain release gates. The old Vibenet tests and Base native-AA
-executor have been removed. Other preserved adapters are intentionally not
-compiled or routed until they have a verified Arc deployment.
+deployment tests remain release gates. Other preserved adapters are
+intentionally not compiled or routed until they have a verified Arc deployment.
 
 ## License
 
