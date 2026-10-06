@@ -68,13 +68,17 @@ Jusso exposes two remote Streamable HTTP MCP endpoints:
 
 | Endpoint | Audience |
 | --- | --- |
-| `/mcp/agent` | Agent runtime tools: wallet, balance, Uniswap discovery, quotes, simulation, execution, and status |
+| `/mcp/agent` | Agent runtime tools: wallet, balance, status, Uniswap actions, and policy-gated raw simulation/execution |
 | `/mcp/control` | Owner tools: agents, policies, connections, approvals, and signer lifecycle |
 
 Compatible MCP clients connect directly over HTTPS and complete OAuth in a
-browser. There is no local stdio MCP server or installer to keep synchronized.
-Direct REST/OAuth access remains available for custom runtimes and services.
-Client-specific certification is tracked in [TODO.md](TODO.md).
+browser. The agent selected during authorization is bound to that connection,
+so runtime tools resolve its wallet and executions without asking for an agent
+ID again. Raw single-call and atomic-batch tools remain unusable unless the
+assigned policy explicitly enables raw execution. There is no local stdio MCP
+server or installer to keep synchronized. Direct REST/OAuth access remains
+available for custom runtimes and services. Client-specific certification is
+tracked in [TODO.md](TODO.md).
 
 ## Authentication
 

@@ -98,6 +98,17 @@ pub fn validate_runtime_scopes(scopes: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn bound_agent_external_id(context: &AuthContext) -> Result<&str> {
+    if context.agent_id.is_none() {
+        anyhow::bail!("agent MCP access token is not bound to an agent");
+    }
+    context
+        .agent_external_id
+        .as_deref()
+        .filter(|agent_id| !agent_id.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("agent MCP access token is not bound to an agent"))
+}
+
 pub fn validate_policy_actions(actions: &[String]) -> Result<()> {
     if let Some(action) = actions.iter().find(|action| {
         action.as_str() != "*"
@@ -476,7 +487,6 @@ impl AuthService {
     pub async fn authorize_mcp_action(
         &self,
         context: &AuthContext,
-        agent_external_id: &str,
         chain: Option<&str>,
         required_scope: &'static str,
         resource: &'static str,
@@ -485,6 +495,7 @@ impl AuthService {
         if !context.allows_scope(required_scope) {
             anyhow::bail!("access token does not grant {required_scope}");
         }
+        let agent_external_id = bound_agent_external_id(context)?;
         let (agent, policy) =
             db::authorize_execution_agent(&self.pool, context, agent_external_id).await?;
         let mut authorized = context.clone();
@@ -1328,19 +1339,7 @@ impl AuthService {
                 }
             }
         }
-        if let Some(allowed) = &policy.allowed_protocols {
-            match protocol {
-                Some(protocol)
-                    if allowed
-                        .iter()
-                        .any(|candidate| candidate == "*" || candidate == protocol) => {}
-                Some(_) => anyhow::bail!("protocol is denied by authorization policy"),
-                None if action.starts_with("transaction:") => {
-                    anyhow::bail!("raw transaction routes are denied by the protocol allow-list")
-                }
-                None => {}
-            }
-        }
+        enforce_protocol_permission(policy.allowed_protocols.as_deref(), protocol)?;
         if let Some(allowed) = &policy.allowed_actions {
             if !allowed
                 .iter()
@@ -1393,6 +1392,23 @@ impl AuthService {
         .await
         .ok();
         Ok(())
+    }
+}
+
+fn enforce_protocol_permission(
+    allowed_protocols: Option<&[String]>,
+    protocol: Option<&str>,
+) -> Result<()> {
+    let (Some(allowed), Some(protocol)) = (allowed_protocols, protocol) else {
+        return Ok(());
+    };
+    if allowed
+        .iter()
+        .any(|candidate| candidate == "*" || candidate == protocol)
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("protocol is denied by authorization policy")
     }
 }
 
@@ -2063,6 +2079,28 @@ mod tests {
     }
 
     #[test]
+    fn agent_mcp_context_requires_a_complete_agent_binding() {
+        let mut context = AuthContext {
+            organization_id: Uuid::new_v4(),
+            principal_id: Uuid::new_v4(),
+            credential_id: Uuid::new_v4(),
+            credential_kind: crate::types::CredentialKind::OAuthSession,
+            scopes: BTreeSet::new(),
+            agent_id: None,
+            agent_external_id: None,
+            instance_id: None,
+            dpop_jkt: None,
+        };
+        assert!(bound_agent_external_id(&context).is_err());
+
+        context.agent_id = Some(Uuid::new_v4());
+        assert!(bound_agent_external_id(&context).is_err());
+
+        context.agent_external_id = Some("primary-agent".into());
+        assert_eq!(bound_agent_external_id(&context).unwrap(), "primary-agent");
+    }
+
+    #[test]
     fn uniswap_protocol_action_is_exact() {
         assert_eq!(
             protocol_action_from_path("/protocols/uniswap-v4/swap"),
@@ -2074,6 +2112,14 @@ mod tests {
         );
         assert_eq!(protocol_action_from_path("/protocols/morpho/borrow"), None);
         assert!(DEFAULT_POLICY_ACTIONS.contains(&"protocol:uniswap-v4:swap"));
+    }
+
+    #[test]
+    fn protocol_allow_list_does_not_disable_separately_opted_in_raw_routes() {
+        let allowed = vec!["uniswap-v4".to_string()];
+        assert!(enforce_protocol_permission(Some(&allowed), None).is_ok());
+        assert!(enforce_protocol_permission(Some(&allowed), Some("uniswap-v4")).is_ok());
+        assert!(enforce_protocol_permission(Some(&allowed), Some("other-protocol")).is_err());
     }
 
     #[test]

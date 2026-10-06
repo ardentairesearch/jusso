@@ -27,7 +27,7 @@ use crate::{
     protocols::uniswap_v4::{
         adapter::UniswapSwapKind, service as uniswap_service, UniswapPoolsQuery, UniswapSwapRequest,
     },
-    types::AuthContext,
+    types::{AuthContext, BatchCall, ExecutionRequest},
 };
 
 pub type AgentMcpService = StreamableHttpService<AgentMcp, LocalSessionManager>;
@@ -98,10 +98,22 @@ fn json_output(value: impl Serialize) -> Result<McpJson<serde_json::Value>, Erro
         .map_err(|error| ErrorData::internal_error(error.to_string(), None))
 }
 
+fn mcp_idempotency_key(
+    explicit: Option<&str>,
+    auth: &AuthContext,
+    context: &RequestContext<RoleServer>,
+    params: &impl std::fmt::Debug,
+) -> Result<String, ErrorData> {
+    let key = explicit.map(str::to_owned).unwrap_or_else(|| {
+        let material = format!("{}:{:?}:{params:?}", auth.credential_id, context.id);
+        format!("mcp-{}", hex::encode(Sha256::digest(material.as_bytes())))
+    });
+    db::validate_idempotency_key(&key).map_err(tool_error)?;
+    Ok(key)
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct WalletParams {
-    /// Logical Jusso agent ID.
-    agent_id: String,
     /// Arc network name. Defaults to the server's configured Arc network.
     chain: Option<String>,
 }
@@ -126,8 +138,6 @@ struct PoolsParams {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct SwapParams {
-    /// Logical Jusso agent ID.
-    agent_id: String,
     /// Input ERC-20 token address.
     token_in: String,
     /// Output token address. The zero address means native Arc USDC.
@@ -163,14 +173,18 @@ struct SwapParams {
 }
 
 impl SwapParams {
-    fn to_request(&self, default_chain: &str) -> Result<UniswapSwapRequest, ErrorData> {
+    fn to_request(
+        &self,
+        default_chain: &str,
+        agent_id: String,
+    ) -> Result<UniswapSwapRequest, ErrorData> {
         let swap_kind = match self.swap_kind.as_deref().unwrap_or("exact_in") {
             "exact_in" => UniswapSwapKind::ExactIn,
             "exact_out" => UniswapSwapKind::ExactOut,
             _ => return Err(tool_error("swap_kind must be exact_in or exact_out")),
         };
         Ok(UniswapSwapRequest {
-            agent_id: self.agent_id.clone(),
+            agent_id,
             chain: self
                 .chain
                 .clone()
@@ -193,6 +207,74 @@ impl SwapParams {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct RawCallParams {
+    /// Destination contract address.
+    target_contract: String,
+    /// 0x-prefixed contract calldata.
+    calldata: String,
+    /// Native Arc value in wei as a decimal string. Defaults to zero.
+    value: Option<String>,
+}
+
+impl From<RawCallParams> for BatchCall {
+    fn from(call: RawCallParams) -> Self {
+        Self {
+            target_contract: call.target_contract,
+            calldata: call.calldata,
+            value: call.value.unwrap_or_else(|| "0".into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct RawTransactionParams {
+    /// Destination contract for a single call. Omit when batch_calls is used.
+    target_contract: Option<String>,
+    /// 0x-prefixed calldata for a single call. Omit when batch_calls is used.
+    calldata: Option<String>,
+    /// Native Arc value in wei as a decimal string. Defaults to zero.
+    value: Option<String>,
+    /// Calls to execute atomically in one UserOperation. Maximum 16.
+    batch_calls: Option<Vec<RawCallParams>>,
+    /// Arc network name. Defaults to the configured Arc network.
+    chain: Option<String>,
+    /// Optional strategy correlation identifier.
+    strategy_id: Option<String>,
+    /// Optional HTTPS completion webhook.
+    callback_url: Option<String>,
+}
+
+impl RawTransactionParams {
+    fn to_request(&self, default_chain: &str, agent_id: String) -> ExecutionRequest {
+        ExecutionRequest {
+            agent_id,
+            chain: self
+                .chain
+                .clone()
+                .unwrap_or_else(|| default_chain.to_string()),
+            target_contract: self.target_contract.clone().unwrap_or_default(),
+            calldata: self.calldata.clone().unwrap_or_default(),
+            value: self.value.clone().unwrap_or_else(|| "0".into()),
+            strategy_id: self.strategy_id.clone(),
+            batch_calls: self
+                .batch_calls
+                .clone()
+                .map(|calls| calls.into_iter().map(Into::into).collect()),
+            callback_url: self.callback_url.clone(),
+            policy_impact: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct RawExecutionParams {
+    #[serde(flatten)]
+    transaction: RawTransactionParams,
+    /// Stable retry key. Omit to derive it from the MCP request ID and arguments.
+    idempotency_key: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AgentMcp {
     state: AppState,
@@ -213,23 +295,30 @@ impl AgentMcp {
     async fn authorize(
         &self,
         context: &RequestContext<RoleServer>,
-        agent_id: &str,
         chain: Option<&str>,
         scope: &'static str,
         resource: &'static str,
         protocol: Option<&'static str>,
-    ) -> Result<AuthContext, ErrorData> {
+    ) -> Result<(AuthContext, String), ErrorData> {
         let auth = request_auth(context)?;
-        self.auth
-            .authorize_mcp_action(&auth, agent_id, chain, scope, resource, protocol)
+        let authorized = self
+            .auth
+            .authorize_mcp_action(&auth, chain, scope, resource, protocol)
             .await
-            .map_err(tool_error)
+            .map_err(tool_error)?;
+        let agent_id = authorized
+            .agent_external_id
+            .clone()
+            .ok_or_else(|| tool_error("agent MCP access token is not bound to an agent"))?;
+        Ok((authorized, agent_id))
     }
 }
 
 #[tool_router]
 impl AgentMcp {
-    #[tool(description = "Get or provision an agent's dedicated Arc smart-account address.")]
+    #[tool(
+        description = "Get or provision the connected agent's dedicated Arc smart-account address."
+    )]
     async fn get_wallet(
         &self,
         Parameters(params): Parameters<WalletParams>,
@@ -239,21 +328,14 @@ impl AgentMcp {
             .chain
             .as_deref()
             .unwrap_or(self.state.config.arc_network.name());
-        let auth = self
-            .authorize(
-                &context,
-                &params.agent_id,
-                Some(chain),
-                "wallet:read",
-                "/wallet",
-                None,
-            )
+        let (auth, agent_id) = self
+            .authorize(&context, Some(chain), "wallet:read", "/wallet", None)
             .await?;
         let response = services::handle_get_wallet(
             &self.state.engine,
             &self.state.wallet_registry,
             auth.organization_id,
-            &params.agent_id,
+            &agent_id,
             chain,
         )
         .await
@@ -261,7 +343,7 @@ impl AgentMcp {
         json_output(response)
     }
 
-    #[tool(description = "Read the Arc USDC balance held by an agent's smart account.")]
+    #[tool(description = "Read the Arc USDC balance held by the connected agent's smart account.")]
     async fn get_wallet_balance(
         &self,
         Parameters(params): Parameters<WalletParams>,
@@ -271,10 +353,9 @@ impl AgentMcp {
             .chain
             .as_deref()
             .unwrap_or(self.state.config.arc_network.name());
-        let auth = self
+        let (auth, agent_id) = self
             .authorize(
                 &context,
-                &params.agent_id,
                 Some(chain),
                 "wallet:read",
                 "/wallet/balance",
@@ -285,7 +366,7 @@ impl AgentMcp {
             &self.state.engine,
             &self.state.wallet_registry,
             auth.organization_id,
-            &params.agent_id,
+            &agent_id,
             chain,
         )
         .await
@@ -339,17 +420,20 @@ impl AgentMcp {
         Parameters(params): Parameters<SwapParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<McpJson<serde_json::Value>, ErrorData> {
-        let request = params.to_request(self.state.config.arc_network.name())?;
-        let auth = self
+        let chain = params
+            .chain
+            .as_deref()
+            .unwrap_or(self.state.config.arc_network.name());
+        let (auth, agent_id) = self
             .authorize(
                 &context,
-                &request.agent_id,
-                Some(&request.chain),
+                Some(chain),
                 "transaction:simulate",
                 "/protocols/uniswap-v4/swap/quote",
                 Some("uniswap-v4"),
             )
             .await?;
+        let request = params.to_request(self.state.config.arc_network.name(), agent_id)?;
         json_output(
             uniswap_service::handle_quote(
                 &self.state.engine,
@@ -368,17 +452,20 @@ impl AgentMcp {
         Parameters(params): Parameters<SwapParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<McpJson<serde_json::Value>, ErrorData> {
-        let request = params.to_request(self.state.config.arc_network.name())?;
-        let auth = self
+        let chain = params
+            .chain
+            .as_deref()
+            .unwrap_or(self.state.config.arc_network.name());
+        let (auth, agent_id) = self
             .authorize(
                 &context,
-                &request.agent_id,
-                Some(&request.chain),
+                Some(chain),
                 "transaction:simulate",
                 "/protocols/uniswap-v4/swap/simulate",
                 Some("uniswap-v4"),
             )
             .await?;
+        let request = params.to_request(self.state.config.arc_network.name(), agent_id)?;
         json_output(
             uniswap_service::handle_swap_simulate(
                 &self.state.engine,
@@ -400,22 +487,22 @@ impl AgentMcp {
         Parameters(params): Parameters<SwapParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<McpJson<serde_json::Value>, ErrorData> {
-        let request = params.to_request(self.state.config.arc_network.name())?;
-        let auth = self
+        let chain = params
+            .chain
+            .as_deref()
+            .unwrap_or(self.state.config.arc_network.name());
+        let (auth, agent_id) = self
             .authorize(
                 &context,
-                &request.agent_id,
-                Some(&request.chain),
+                Some(chain),
                 "transaction:execute",
                 "/protocols/uniswap-v4/swap",
                 Some("uniswap-v4"),
             )
             .await?;
-        let idempotency_key = params.idempotency_key.clone().unwrap_or_else(|| {
-            let material = format!("{}:{:?}:{:?}", auth.credential_id, context.id, params);
-            format!("mcp-{}", hex::encode(Sha256::digest(material.as_bytes())))
-        });
-        db::validate_idempotency_key(&idempotency_key).map_err(tool_error)?;
+        let request = params.to_request(self.state.config.arc_network.name(), agent_id)?;
+        let idempotency_key =
+            mcp_idempotency_key(params.idempotency_key.as_deref(), &auth, &context, &params)?;
         if let Some(existing) = services::handle_existing_protocol_execution(
             &self.state.engine,
             &self.state.db_pool,
@@ -430,6 +517,82 @@ impl AgentMcp {
         }
         let mut redis = self.state.redis_conn.clone();
         let response = uniswap_service::handle_swap(
+            &self.state.engine,
+            &self.state.db_pool,
+            &mut redis,
+            &self.state.wallet_registry,
+            &auth,
+            &request,
+            &idempotency_key,
+        )
+        .await
+        .map_err(tool_error)?;
+        json_output(response)
+    }
+
+    #[tool(
+        description = "Simulate a raw single-call or atomic-batch Arc UserOperation for the connected agent. Requires the agent policy to explicitly allow raw execution."
+    )]
+    async fn simulate_raw_transaction(
+        &self,
+        Parameters(params): Parameters<RawTransactionParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let chain = params
+            .chain
+            .as_deref()
+            .unwrap_or(self.state.config.arc_network.name());
+        let (auth, agent_id) = self
+            .authorize(
+                &context,
+                Some(chain),
+                "transaction:simulate",
+                "/simulate",
+                None,
+            )
+            .await?;
+        let request = params.to_request(self.state.config.arc_network.name(), agent_id);
+        let response = services::handle_simulate_authenticated(
+            &self.state.engine,
+            &self.state.db_pool,
+            &self.state.wallet_registry,
+            &auth,
+            &request,
+        )
+        .await
+        .map_err(tool_error)?;
+        json_output(response)
+    }
+
+    #[tool(
+        description = "Execute a raw single-call or atomic-batch transaction through sponsored Arc ERC-4337 for the connected agent. Requires explicit raw-execution policy permission and is always simulated before queueing."
+    )]
+    async fn execute_raw_transaction(
+        &self,
+        Parameters(params): Parameters<RawExecutionParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let chain = params
+            .transaction
+            .chain
+            .as_deref()
+            .unwrap_or(self.state.config.arc_network.name());
+        let (auth, agent_id) = self
+            .authorize(
+                &context,
+                Some(chain),
+                "transaction:execute",
+                "/execute",
+                None,
+            )
+            .await?;
+        let request = params
+            .transaction
+            .to_request(self.state.config.arc_network.name(), agent_id);
+        let idempotency_key =
+            mcp_idempotency_key(params.idempotency_key.as_deref(), &auth, &context, &params)?;
+        let mut redis = self.state.redis_conn.clone();
+        let response = services::handle_execute_idempotent(
             &self.state.engine,
             &self.state.db_pool,
             &mut redis,
@@ -1394,6 +1557,12 @@ mod tests {
             AgentMcp::execute_uniswap_v4_swap_tool_attr()
                 .name
                 .to_string(),
+            AgentMcp::simulate_raw_transaction_tool_attr()
+                .name
+                .to_string(),
+            AgentMcp::execute_raw_transaction_tool_attr()
+                .name
+                .to_string(),
         ];
         let control = [
             ControlMcp::list_agents_tool_attr().name.to_string(),
@@ -1451,6 +1620,10 @@ mod tests {
                 .to_string(),
         ];
         assert!(runtime.iter().any(|name| name == "execute_uniswap_v4_swap"));
+        assert!(runtime
+            .iter()
+            .any(|name| name == "simulate_raw_transaction"));
+        assert!(runtime.iter().any(|name| name == "execute_raw_transaction"));
         assert!(control.iter().all(|name| !name.contains("execute")));
         assert!(control
             .iter()
@@ -1465,6 +1638,50 @@ mod tests {
             .iter()
             .any(|name| name == "request_revoke_owner_passkey_approval"));
         assert!(runtime.iter().all(|name| !control.contains(name)));
+    }
+
+    #[test]
+    fn agent_runtime_tool_inputs_use_the_oauth_bound_agent() {
+        let wallet_schema = serde_json::to_value(schemars::schema_for!(WalletParams)).unwrap();
+        let swap_schema = serde_json::to_value(schemars::schema_for!(SwapParams)).unwrap();
+        let raw_schema = serde_json::to_value(schemars::schema_for!(RawExecutionParams)).unwrap();
+
+        for schema in [&wallet_schema, &swap_schema, &raw_schema] {
+            let properties = schema
+                .pointer("/properties")
+                .and_then(serde_json::Value::as_object)
+                .expect("tool schema properties");
+            assert!(!properties.contains_key("agent_id"));
+        }
+        let raw_properties = raw_schema["properties"].as_object().unwrap();
+        assert!(raw_properties.contains_key("target_contract"));
+        assert!(raw_properties.contains_key("batch_calls"));
+        assert!(raw_properties.contains_key("idempotency_key"));
+        assert!(!raw_properties.contains_key("transaction"));
+    }
+
+    #[test]
+    fn raw_tool_request_uses_bound_agent_and_preserves_atomic_batch() {
+        let params = RawTransactionParams {
+            target_contract: None,
+            calldata: None,
+            value: None,
+            batch_calls: Some(vec![RawCallParams {
+                target_contract: "0x0000000000000000000000000000000000000001".into(),
+                calldata: "0x12345678".into(),
+                value: None,
+            }]),
+            chain: None,
+            strategy_id: Some("strategy-1".into()),
+            callback_url: None,
+        };
+        let request = params.to_request("arc-testnet", "primary-agent".into());
+        assert_eq!(request.agent_id, "primary-agent");
+        assert_eq!(request.chain, "arc-testnet");
+        assert!(request.target_contract.is_empty());
+        let calls = request.batch_calls.expect("batch calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].value, "0");
     }
 
     #[test]
