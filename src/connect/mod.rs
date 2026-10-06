@@ -182,21 +182,22 @@ fn validate_client_registration(body: &ClientRegistrationRequest) -> Result<()> 
     {
         anyhow::bail!("public MCP clients must use token_endpoint_auth_method none");
     }
-    if body.grant_types.as_ref().is_some_and(|values| {
-        !values.iter().any(|value| value == "authorization_code")
-            || values
-                .iter()
-                .any(|value| !matches!(value.as_str(), "authorization_code" | "refresh_token"))
-    }) {
-        anyhow::bail!("clients must use authorization_code and may also use refresh_token");
+    for (name, values) in [
+        ("grant_types", body.grant_types.as_ref()),
+        ("response_types", body.response_types.as_ref()),
+    ] {
+        if values.is_some_and(|values| {
+            values.len() > 10
+                || values
+                    .iter()
+                    .any(|value| value.is_empty() || value.len() > 128)
+        }) {
+            anyhow::bail!("{name} contains invalid client metadata");
+        }
     }
-    if body
-        .response_types
-        .as_ref()
-        .is_some_and(|values| values.is_empty() || values.iter().any(|value| value != "code"))
-    {
-        anyhow::bail!("only the code response type is supported");
-    }
+    // Registration metadata describes client capabilities. Jusso deliberately
+    // narrows them in its registration response to authorization_code,
+    // refresh_token, code, PKCE, and public-client authentication.
     for redirect_uri in &body.redirect_uris {
         validate_redirect_uri(redirect_uri)?;
     }
@@ -1956,7 +1957,7 @@ mod tests {
     }
 
     #[test]
-    fn public_clients_may_request_refresh_tokens_but_no_other_grants() {
+    fn public_client_capabilities_are_safely_narrowed_by_the_server() {
         let request = |grant_types: Option<Vec<&str>>| ClientRegistrationRequest {
             client_name: Some("Test client".to_string()),
             redirect_uris: vec!["https://assistant.example/callback".to_string()],
@@ -1970,12 +1971,13 @@ mod tests {
             "refresh_token",
         ])))
         .is_ok());
-        assert!(validate_client_registration(&request(Some(vec!["refresh_token"]))).is_err());
+        assert!(validate_client_registration(&request(Some(vec!["refresh_token"]))).is_ok());
         assert!(validate_client_registration(&request(Some(vec![
             "authorization_code",
             "client_credentials",
         ])))
-        .is_err());
+        .is_ok());
+        assert!(validate_client_registration(&request(Some(vec![&"x".repeat(129)]))).is_err());
     }
 
     #[test]
