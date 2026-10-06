@@ -678,6 +678,7 @@ impl AuthService {
     ) -> Result<TokenResponse> {
         match request.grant_type.as_str() {
             "authorization_code" => {
+                self.authenticate_oauth_client(&request).await?;
                 let dpop_jkt = match proof {
                     Some(proof) => Some(
                         self.verify_dpop(proof, "POST", &self.token_endpoint, None)
@@ -688,6 +689,7 @@ impl AuthService {
                 self.exchange_authorization_code(request, dpop_jkt).await
             }
             "refresh_token" => {
+                self.authenticate_oauth_client(&request).await?;
                 let dpop_jkt = match proof {
                     Some(proof) => Some(
                         self.verify_dpop(proof, "POST", &self.token_endpoint, None)
@@ -712,6 +714,68 @@ impl AuthService {
                 self.exchange_workload_identity(request, dpop_jkt).await
             }
             _ => anyhow::bail!("unsupported grant_type"),
+        }
+    }
+
+    async fn authenticate_oauth_client(&self, request: &TokenRequest) -> Result<()> {
+        let client_id = request
+            .client_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("client_id is required"))?;
+        let client = sqlx::query_as::<_, OAuthClientAuthenticationRow>(
+            r#"SELECT token_endpoint_auth_method, jwks_uri,
+                      token_endpoint_auth_signing_alg
+               FROM oauth_clients
+               WHERE client_id = $1"#,
+        )
+        .bind(client_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow!("unknown OAuth client"))?;
+
+        match client.token_endpoint_auth_method.as_str() {
+            "none" => {
+                if request.client_assertion_type.is_some() || request.client_assertion.is_some() {
+                    anyhow::bail!("public OAuth clients must not send client credentials");
+                }
+                Ok(())
+            }
+            "private_key_jwt" => {
+                if request.client_assertion_type.as_deref()
+                    != Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+                {
+                    anyhow::bail!("unsupported client_assertion_type");
+                }
+                let assertion = request
+                    .client_assertion
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("client_assertion is required"))?;
+                let jwks_uri = client
+                    .jwks_uri
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("OAuth client JWKS is not configured"))?;
+                let expected_algorithm = client
+                    .token_endpoint_auth_signing_alg
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("OAuth client signing algorithm is not configured"))?;
+                let jwks = fetch_public_jwks(jwks_uri, "OAuth client").await?;
+                let claims = verify_oauth_client_assertion(
+                    assertion,
+                    client_id,
+                    &self.token_endpoint,
+                    expected_algorithm,
+                    &jwks,
+                )?;
+                db::consume_oauth_proof_jti(
+                    &self.pool,
+                    &format!("mcp-client-assertion:{client_id}"),
+                    &claims.jti,
+                    claims.exp,
+                )
+                .await?;
+                Ok(())
+            }
+            _ => anyhow::bail!("OAuth client authentication method is unsupported"),
         }
     }
 
@@ -1441,6 +1505,13 @@ struct AuthorizationCodeRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct OAuthClientAuthenticationRow {
+    token_endpoint_auth_method: String,
+    jwks_uri: Option<String>,
+    token_endpoint_auth_signing_alg: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
 struct RefreshTokenRow {
     connection_id: Uuid,
     expires_at: chrono::DateTime<Utc>,
@@ -1512,6 +1583,78 @@ fn validate_proof_time(iat: i64, exp: i64, maximum_lifetime: i64) -> Result<()> 
         anyhow::bail!("authentication proof must be current and short-lived");
     }
     Ok(())
+}
+
+async fn fetch_public_jwks(uri: &str, label: &str) -> Result<JwkSet> {
+    let response = hardened_public_https_client(uri)
+        .await?
+        .get(uri)
+        .send()
+        .await
+        .with_context(|| format!("{label} JWKS request failed"))?;
+    if !response.status().is_success() {
+        anyhow::bail!("{label} JWKS endpoint returned an error");
+    }
+    const MAX_JWKS_BYTES: u64 = 1024 * 1024;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_JWKS_BYTES)
+    {
+        anyhow::bail!("{label} JWKS response exceeds 1 MiB");
+    }
+    let body = response
+        .bytes()
+        .await
+        .with_context(|| format!("{label} JWKS response could not be read"))?;
+    if body.len() as u64 > MAX_JWKS_BYTES {
+        anyhow::bail!("{label} JWKS response exceeds 1 MiB");
+    }
+    serde_json::from_slice(&body).with_context(|| format!("{label} JWKS response is invalid"))
+}
+
+fn verify_oauth_client_assertion(
+    assertion: &str,
+    client_id: &str,
+    token_endpoint: &str,
+    expected_algorithm: &str,
+    jwks: &JwkSet,
+) -> Result<ClientAssertionClaims> {
+    let header = decode_header(assertion).context("invalid OAuth client assertion header")?;
+    if !allowed_algorithm(header.alg) || algorithm_name(header.alg) != expected_algorithm {
+        anyhow::bail!("OAuth client assertion algorithm is not allowed");
+    }
+    let jwk = match header.kid.as_deref() {
+        Some(kid) => jwks
+            .find(kid)
+            .ok_or_else(|| anyhow!("OAuth client signing key was not found"))?,
+        None if jwks.keys.len() == 1 => &jwks.keys[0],
+        None => {
+            anyhow::bail!("OAuth client assertion kid is required when JWKS contains multiple keys")
+        }
+    };
+    let jwk_value = serde_json::to_value(jwk)?;
+    if jwk_value
+        .get("alg")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|algorithm| algorithm != expected_algorithm)
+    {
+        anyhow::bail!("OAuth client signing key algorithm does not match metadata");
+    }
+    let key = DecodingKey::from_jwk(jwk).context("OAuth client signing key is unsupported")?;
+    let mut validation = Validation::new(header.alg);
+    validation.set_audience(&[token_endpoint]);
+    validation.leeway = 0;
+    let claims = decode::<ClientAssertionClaims>(assertion, &key, &validation)
+        .context("OAuth client assertion verification failed")?
+        .claims;
+    if claims.iss != client_id || claims.sub != client_id {
+        anyhow::bail!("OAuth client assertion iss and sub must equal client_id");
+    }
+    validate_proof_time(claims.iat, claims.exp, 300)?;
+    if claims.jti.trim().is_empty() {
+        anyhow::bail!("OAuth client assertion jti is required");
+    }
+    Ok(claims)
 }
 
 fn decode_unverified_workload(token: &str, algorithm: Algorithm) -> Result<WorkloadClaims> {
@@ -2075,6 +2218,60 @@ mod tests {
         assert!(validate_refresh_dpop_binding(Some(&thumbprint), None).is_err());
         assert!(validate_refresh_dpop_binding(None, Some(&thumbprint)).is_err());
         assert!(validate_refresh_dpop_binding(Some(&thumbprint), Some(&"b".repeat(43))).is_err());
+    }
+
+    #[test]
+    fn oauth_client_assertions_are_bound_to_client_audience_and_key() {
+        let (signing_key, mut public_jwk) = test_key_material();
+        public_jwk["kid"] = serde_json::Value::String("test-key".into());
+        let jwks: JwkSet =
+            serde_json::from_value(serde_json::json!({"keys": [public_jwk]})).unwrap();
+        let pem = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let client_id = "https://client.example/oauth/client.json";
+        let token_endpoint = "https://api.jusso.example/oauth/token";
+        let now = Utc::now().timestamp();
+        let sign = |audience: &str| {
+            let mut header = Header::new(Algorithm::ES256);
+            header.kid = Some("test-key".into());
+            encode(
+                &header,
+                &TestAssertion {
+                    iss: client_id,
+                    sub: client_id,
+                    aud: audience,
+                    iat: now,
+                    exp: now + 120,
+                    jti: Uuid::new_v4().to_string(),
+                },
+                &EncodingKey::from_ec_pem(pem.as_bytes()).unwrap(),
+            )
+            .unwrap()
+        };
+
+        assert!(verify_oauth_client_assertion(
+            &sign(token_endpoint),
+            client_id,
+            token_endpoint,
+            "ES256",
+            &jwks,
+        )
+        .is_ok());
+        assert!(verify_oauth_client_assertion(
+            &sign("https://other.example/oauth/token"),
+            client_id,
+            token_endpoint,
+            "ES256",
+            &jwks,
+        )
+        .is_err());
+        assert!(verify_oauth_client_assertion(
+            &sign(token_endpoint),
+            "https://different.example/oauth/client.json",
+            token_endpoint,
+            "ES256",
+            &jwks,
+        )
+        .is_err());
     }
 
     #[test]

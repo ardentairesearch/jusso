@@ -1,5 +1,6 @@
 //! Hosted MCP servers with separate runtime and control-plane capabilities.
 
+use anyhow::Context;
 use chrono::{Duration, Utc};
 use rmcp::{
     handler::server::{
@@ -32,22 +33,39 @@ use crate::{
 pub type AgentMcpService = StreamableHttpService<AgentMcp, LocalSessionManager>;
 pub type ControlMcpService = StreamableHttpService<ControlMcp, LocalSessionManager>;
 
-pub fn agent_service(state: AppState, auth: AuthService) -> AgentMcpService {
-    let config = StreamableHttpServerConfig::default().with_json_response(true);
-    StreamableHttpService::new(
+pub fn agent_service(state: AppState, auth: AuthService) -> anyhow::Result<AgentMcpService> {
+    let config = streamable_http_config(&state.config.public_api_base_url)?;
+    Ok(StreamableHttpService::new(
         move || Ok(AgentMcp::new(state.clone(), auth.clone())),
         Default::default(),
         config,
-    )
+    ))
 }
 
-pub fn control_service(state: AppState) -> ControlMcpService {
-    let config = StreamableHttpServerConfig::default().with_json_response(true);
-    StreamableHttpService::new(
+pub fn control_service(state: AppState) -> anyhow::Result<ControlMcpService> {
+    let config = streamable_http_config(&state.config.public_api_base_url)?;
+    Ok(StreamableHttpService::new(
         move || Ok(ControlMcp::new(state.clone())),
         Default::default(),
         config,
-    )
+    ))
+}
+
+fn streamable_http_config(public_api_base_url: &str) -> anyhow::Result<StreamableHttpServerConfig> {
+    let url = reqwest::Url::parse(public_api_base_url)
+        .context("PUBLIC_API_BASE_URL must be an absolute URL")?;
+    let host = url
+        .host_str()
+        .context("PUBLIC_API_BASE_URL must include a hostname")?;
+    let mut config = StreamableHttpServerConfig::default().with_json_response(true);
+    if !config
+        .allowed_hosts
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(host))
+    {
+        config.allowed_hosts.push(host.to_ascii_lowercase());
+    }
+    Ok(config)
 }
 
 fn request_auth(context: &RequestContext<RoleServer>) -> Result<AuthContext, ErrorData> {
@@ -1447,5 +1465,16 @@ mod tests {
             .iter()
             .any(|name| name == "request_revoke_owner_passkey_approval"));
         assert!(runtime.iter().all(|name| !control.contains(name)));
+    }
+
+    #[test]
+    fn public_mcp_host_is_allowed_without_disabling_host_validation() {
+        let config = streamable_http_config("https://api.jusso.tech").expect("MCP config");
+        assert!(config
+            .allowed_hosts
+            .iter()
+            .any(|host| host == "api.jusso.tech"));
+        assert!(config.allowed_hosts.iter().any(|host| host == "localhost"));
+        assert!(!config.allowed_hosts.is_empty());
     }
 }

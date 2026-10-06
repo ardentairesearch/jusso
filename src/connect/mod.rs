@@ -85,7 +85,7 @@ pub async fn register_client_handler(
     headers: HeaderMap,
     Json(body): Json<ClientRegistrationRequest>,
 ) -> Response {
-    if let Err(error) = validate_client_registration(&body) {
+    if let Err(error) = validate_dynamic_client_registration(&body) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -164,7 +164,7 @@ pub async fn register_client_handler(
     }
 }
 
-fn validate_client_registration(body: &ClientRegistrationRequest) -> Result<()> {
+fn validate_client_metadata(body: &ClientRegistrationRequest) -> Result<()> {
     if body.redirect_uris.is_empty() || body.redirect_uris.len() > 10 {
         anyhow::bail!("redirect_uris must contain between one and ten URLs");
     }
@@ -178,9 +178,9 @@ fn validate_client_registration(body: &ClientRegistrationRequest) -> Result<()> 
     if body
         .token_endpoint_auth_method
         .as_deref()
-        .is_some_and(|method| method != "none")
+        .is_some_and(|method| method.is_empty() || method.len() > 128)
     {
-        anyhow::bail!("public MCP clients must use token_endpoint_auth_method none");
+        anyhow::bail!("token_endpoint_auth_method contains invalid client metadata");
     }
     for (name, values) in [
         ("grant_types", body.grant_types.as_ref()),
@@ -200,6 +200,18 @@ fn validate_client_registration(body: &ClientRegistrationRequest) -> Result<()> 
     // refresh_token, code, PKCE, and public-client authentication.
     for redirect_uri in &body.redirect_uris {
         validate_redirect_uri(redirect_uri)?;
+    }
+    Ok(())
+}
+
+fn validate_dynamic_client_registration(body: &ClientRegistrationRequest) -> Result<()> {
+    validate_client_metadata(body)?;
+    if body
+        .token_endpoint_auth_method
+        .as_deref()
+        .is_some_and(|method| method != "none")
+    {
+        anyhow::bail!("dynamic public MCP clients must use token_endpoint_auth_method none");
     }
     Ok(())
 }
@@ -401,8 +413,92 @@ struct ClientMetadataDocument {
     client_name: Option<String>,
     redirect_uris: Vec<String>,
     token_endpoint_auth_method: Option<String>,
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
+    token_endpoint_auth_signing_alg: Option<String>,
+    jwks_uri: Option<String>,
     grant_types: Option<Vec<String>>,
     response_types: Option<Vec<String>>,
+}
+
+struct ClientAuthentication {
+    method: &'static str,
+    jwks_uri: Option<String>,
+    signing_algorithm: Option<String>,
+}
+
+fn select_client_authentication(
+    client_id: &str,
+    metadata: &ClientMetadataDocument,
+) -> Result<ClientAuthentication> {
+    let methods = metadata
+        .token_endpoint_auth_methods_supported
+        .as_deref()
+        .map_or_else(
+            || {
+                vec![metadata
+                    .token_endpoint_auth_method
+                    .as_deref()
+                    .unwrap_or("none")]
+            },
+            |methods| methods.iter().map(String::as_str).collect(),
+        );
+    if methods.is_empty()
+        || methods.len() > 10
+        || methods
+            .iter()
+            .any(|method| method.is_empty() || method.len() > 128)
+    {
+        anyhow::bail!("token endpoint authentication methods contain invalid client metadata");
+    }
+
+    let preferred = metadata.token_endpoint_auth_method.as_deref();
+    let method = if preferred == Some("private_key_jwt") && methods.contains(&"private_key_jwt") {
+        "private_key_jwt"
+    } else if preferred == Some("none") && methods.contains(&"none") {
+        "none"
+    } else if methods.contains(&"private_key_jwt") {
+        "private_key_jwt"
+    } else if methods.contains(&"none") {
+        "none"
+    } else {
+        anyhow::bail!(
+            "client and authorization server have no compatible token authentication method"
+        );
+    };
+
+    if method == "none" {
+        return Ok(ClientAuthentication {
+            method,
+            jwks_uri: None,
+            signing_algorithm: None,
+        });
+    }
+
+    let jwks_uri = metadata
+        .jwks_uri
+        .as_deref()
+        .ok_or_else(|| anyhow!("private_key_jwt clients must publish jwks_uri"))?;
+    auth::validate_federation_url(jwks_uri).context("client jwks_uri is invalid")?;
+    let client_url = reqwest::Url::parse(client_id)?;
+    let jwks_url = reqwest::Url::parse(jwks_uri)?;
+    if client_url.scheme() != jwks_url.scheme()
+        || client_url.host_str() != jwks_url.host_str()
+        || client_url.port_or_known_default() != jwks_url.port_or_known_default()
+    {
+        anyhow::bail!("client jwks_uri must use the client metadata document origin");
+    }
+    let signing_algorithm = metadata
+        .token_endpoint_auth_signing_alg
+        .as_deref()
+        .ok_or_else(|| anyhow!("private_key_jwt clients must publish a signing algorithm"))?;
+    if !auth::allowed_assertion_algorithm(signing_algorithm) {
+        anyhow::bail!("client assertion signing algorithm is not allowed");
+    }
+    Ok(ClientAuthentication {
+        method,
+        jwks_uri: Some(jwks_uri.to_string()),
+        signing_algorithm: Some(signing_algorithm.to_string()),
+    })
 }
 
 async fn resolve_oauth_client(service: &ConnectService, client_id: &str) -> Result<OAuthClientRow> {
@@ -443,6 +539,7 @@ async fn resolve_oauth_client(service: &ConnectService, client_id: &str) -> Resu
     if metadata.client_id != client_id {
         anyhow::bail!("client metadata client_id must exactly match its document URL");
     }
+    let authentication = select_client_authentication(client_id, &metadata)?;
     let registration = ClientRegistrationRequest {
         client_name: metadata.client_name,
         redirect_uris: metadata.redirect_uris,
@@ -450,10 +547,13 @@ async fn resolve_oauth_client(service: &ConnectService, client_id: &str) -> Resu
         grant_types: metadata.grant_types,
         response_types: metadata.response_types,
     };
-    validate_client_registration(&registration)?;
+    validate_client_metadata(&registration)?;
     sqlx::query(
-        r#"INSERT INTO oauth_clients (client_id, client_name, redirect_uris)
-           VALUES ($1, $2, $3) ON CONFLICT (client_id) DO NOTHING"#,
+        r#"INSERT INTO oauth_clients (
+               client_id, client_name, redirect_uris, token_endpoint_auth_method,
+               jwks_uri, token_endpoint_auth_signing_alg
+           ) VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (client_id) DO NOTHING"#,
     )
     .bind(client_id)
     .bind(
@@ -463,6 +563,9 @@ async fn resolve_oauth_client(service: &ConnectService, client_id: &str) -> Resu
             .unwrap_or("MCP metadata client"),
     )
     .bind(&registration.redirect_uris)
+    .bind(authentication.method)
+    .bind(authentication.jwks_uri)
+    .bind(authentication.signing_algorithm)
     .execute(&service.pool)
     .await?;
     Ok(OAuthClientRow {
@@ -1966,18 +2069,72 @@ mod tests {
             response_types: Some(vec!["code".to_string()]),
         };
 
-        assert!(validate_client_registration(&request(Some(vec![
+        assert!(validate_dynamic_client_registration(&request(Some(vec![
             "authorization_code",
             "refresh_token",
         ])))
         .is_ok());
-        assert!(validate_client_registration(&request(Some(vec!["refresh_token"]))).is_ok());
-        assert!(validate_client_registration(&request(Some(vec![
+        assert!(
+            validate_dynamic_client_registration(&request(Some(vec!["refresh_token"]))).is_ok()
+        );
+        assert!(validate_dynamic_client_registration(&request(Some(vec![
             "authorization_code",
             "client_credentials",
         ])))
         .is_ok());
-        assert!(validate_client_registration(&request(Some(vec![&"x".repeat(129)]))).is_err());
+        assert!(
+            validate_dynamic_client_registration(&request(Some(vec![&"x".repeat(129)]))).is_err()
+        );
+        let mut confidential = request(Some(vec!["authorization_code"]));
+        confidential.token_endpoint_auth_method = Some("private_key_jwt".to_string());
+        assert!(validate_dynamic_client_registration(&confidential).is_err());
+    }
+
+    #[test]
+    fn cimd_authentication_uses_the_supported_legacy_preference() {
+        let metadata = ClientMetadataDocument {
+            client_id: "https://chatgpt.com/oauth/client.json".to_string(),
+            client_name: Some("ChatGPT".to_string()),
+            redirect_uris: vec!["https://chatgpt.com/connector_platform_oauth_redirect".to_string()],
+            token_endpoint_auth_method: Some("private_key_jwt".to_string()),
+            token_endpoint_auth_methods_supported: Some(vec![
+                "none".to_string(),
+                "private_key_jwt".to_string(),
+            ]),
+            token_endpoint_auth_signing_alg: Some("RS256".to_string()),
+            jwks_uri: Some("https://chatgpt.com/oauth/jwks.json".to_string()),
+            grant_types: Some(vec![
+                "authorization_code".to_string(),
+                "refresh_token".to_string(),
+            ]),
+            response_types: Some(vec!["code".to_string()]),
+        };
+
+        let authentication =
+            select_client_authentication(&metadata.client_id, &metadata).expect("selection");
+        assert_eq!(authentication.method, "private_key_jwt");
+        assert_eq!(
+            authentication.jwks_uri.as_deref(),
+            Some("https://chatgpt.com/oauth/jwks.json")
+        );
+        assert_eq!(authentication.signing_algorithm.as_deref(), Some("RS256"));
+    }
+
+    #[test]
+    fn cimd_private_key_jwt_requires_same_origin_jwks() {
+        let metadata = ClientMetadataDocument {
+            client_id: "https://client.example/oauth/client.json".to_string(),
+            client_name: None,
+            redirect_uris: vec!["https://client.example/callback".to_string()],
+            token_endpoint_auth_method: Some("private_key_jwt".to_string()),
+            token_endpoint_auth_methods_supported: Some(vec!["private_key_jwt".to_string()]),
+            token_endpoint_auth_signing_alg: Some("RS256".to_string()),
+            jwks_uri: Some("https://keys.example/jwks.json".to_string()),
+            grant_types: Some(vec!["authorization_code".to_string()]),
+            response_types: Some(vec!["code".to_string()]),
+        };
+
+        assert!(select_client_authentication(&metadata.client_id, &metadata).is_err());
     }
 
     #[test]

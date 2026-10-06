@@ -374,14 +374,14 @@ async fn main() -> anyhow::Result<()> {
     let agent_mcp_router = Router::new()
         .nest_service(
             "/mcp/agent",
-            mcp::agent_service(state.clone(), auth_service.clone()),
+            mcp::agent_service(state.clone(), auth_service.clone())?,
         )
         .layer(middleware::from_fn_with_state(
             auth_service.clone(),
             auth::authentication_middleware,
         ));
     let control_mcp_router = Router::new()
-        .nest_service("/mcp/control", mcp::control_service(state.clone()))
+        .nest_service("/mcp/control", mcp::control_service(state.clone())?)
         .layer(middleware::from_fn(no_store_sensitive_response))
         .layer(middleware::from_fn_with_state(
             auth_service.clone(),
