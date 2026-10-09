@@ -2,11 +2,10 @@
 
 use axum::{
     extract::{ConnectInfo, Extension, Form, Path, Query, Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use ethers_core::types::{Address, U256};
 use hmac::{Hmac, Mac};
 use redis::aio::ConnectionManager;
 use sha2::Sha256;
@@ -22,9 +21,6 @@ use crate::auth::{AuthService, TokenRequest};
 use crate::config::AppConfig;
 use crate::db;
 use crate::execution_engine::ExecutionEngine;
-use crate::payments::x402::{
-    self, FacilitatorClient, PaymentRequired, PaymentRequirements, ResourceInfo,
-};
 use crate::types::*;
 
 #[derive(Debug, serde::Deserialize)]
@@ -106,17 +102,6 @@ mod feed_tests {
     }
 }
 
-fn usd_to_raw_amount_ceil(usd: f64, decimals: u8) -> Option<String> {
-    if !usd.is_finite() || usd < 0.0 {
-        return None;
-    }
-    let scaled = usd * 10f64.powi(decimals as i32);
-    if !scaled.is_finite() || scaled < 0.0 || scaled > u128::MAX as f64 {
-        return None;
-    }
-    Some((scaled.ceil() as u128).to_string())
-}
-
 /// Shared application state injected into every handler.
 #[derive(Clone)]
 pub struct AppState {
@@ -125,30 +110,6 @@ pub struct AppState {
     pub engine: ExecutionEngine,
     pub config: AppConfig,
     pub wallet_registry: AgentWalletRegistry,
-}
-
-type RequestValidationError = (StatusCode, Json<serde_json::Value>);
-
-fn required_idempotency_key(headers: &HeaderMap) -> Result<&str, RequestValidationError> {
-    let value = headers
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "missing_idempotency_key",
-                    "message": "Idempotency-Key is required for execution requests"
-                })),
-            )
-        })?;
-    db::validate_idempotency_key(value).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": error.to_string()})),
-        )
-    })?;
-    Ok(value)
 }
 
 #[derive(Clone)]
@@ -168,495 +129,6 @@ impl AdminAuthState {
             token: Arc::new(Zeroizing::new(token)),
         }
     }
-}
-
-// ────────────────────── POST /execute ────────────────────────────────
-
-pub async fn execute_handler(
-    State(state): State<AppState>,
-    Extension(api_ctx): Extension<AuthContext>,
-    headers: HeaderMap,
-    Json(req): Json<ExecutionRequest>,
-) -> impl IntoResponse {
-    info!(agent_id = %req.agent_id, chain = %req.chain, "POST /execute");
-
-    let idempotency_key = match required_idempotency_key(&headers) {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
-    let mut redis = state.redis_conn.clone();
-
-    match services::handle_execute_idempotent(
-        &state.engine,
-        &state.db_pool,
-        &mut redis,
-        &state.wallet_registry,
-        &api_ctx,
-        &req,
-        idempotency_key,
-    )
-    .await
-    {
-        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
-        Err(e) => {
-            error!(error = %e, "execute failed");
-            // Distinguish client errors from internal server errors.
-            // Validation / parsing errors are client faults (400);
-            // DB / RPC / queue errors are server faults (500).
-            let err_str = e.to_string();
-            let is_client_error = err_str.contains("unsupported chain")
-                || err_str.contains("not configured")
-                || err_str.contains("agent_id")
-                || err_str.contains("invalid target contract")
-                || err_str.contains("calldata")
-                || err_str.contains("malformed");
-            let status = if err_str.contains("idempotency key was already used") {
-                StatusCode::CONFLICT
-            } else if is_client_error || err_str.contains("Idempotency-Key") {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status, Json(serde_json::json!({ "error": err_str }))).into_response()
-        }
-    }
-}
-
-// ─────────────────── POST /x402/execute ─────────────────────────────
-
-pub async fn x402_execute_handler(
-    State(state): State<AppState>,
-    Extension(api_ctx): Extension<AuthContext>,
-    headers: HeaderMap,
-    Json(req): Json<ExecutionRequest>,
-) -> impl IntoResponse {
-    let idempotency_key = match required_idempotency_key(&headers) {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
-    let signature = headers
-        .get(x402::PAYMENT_SIGNATURE_HEADER)
-        .and_then(|value| value.to_str().ok());
-    let mut redis = state.redis_conn.clone();
-
-    if signature.is_none() {
-        let response = services::handle_x402_quote(
-            &state.engine,
-            &state.db_pool,
-            &mut redis,
-            &state.wallet_registry,
-            &api_ctx,
-            &req,
-            idempotency_key,
-        )
-        .await;
-        return match response {
-            Ok(resp) if resp.status == ExecutionStatus::PaymentRequired => {
-                match build_x402_payment_required(&state, &req, &resp).await {
-                    Ok(required) => {
-                        let encoded = match x402::encode_header(&required) {
-                            Ok(value) => value,
-                            Err(error) => return execution_error_to_http(error),
-                        };
-                        let mut response = (
-                            StatusCode::PAYMENT_REQUIRED,
-                            Json(serde_json::to_value(&required).unwrap()),
-                        )
-                            .into_response();
-                        response.headers_mut().insert(
-                            HeaderName::from_static(x402::PAYMENT_REQUIRED_HEADER),
-                            HeaderValue::from_str(&encoded)
-                                .expect("base64 is a valid header value"),
-                        );
-                        response
-                    }
-                    Err(error) => execution_error_to_http(error),
-                }
-            }
-            Ok(resp) => execution_response_to_http(resp),
-            Err(error) => execution_error_to_http(error),
-        };
-    }
-
-    let payload = match x402::decode_payment_signature(signature.unwrap()) {
-        Ok(payload) => payload,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": error.to_string()})),
-            )
-                .into_response()
-        }
-    };
-    let quote_id = match payload
-        .extensions
-        .get("executeRequestId")
-        .and_then(|value| value.as_str())
-        .and_then(|value| Uuid::parse_str(value).ok())
-    {
-        Some(id) => id,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "PAYMENT-SIGNATURE is missing extensions.executeRequestId"
-                })),
-            )
-                .into_response()
-        }
-    };
-
-    let result: anyhow::Result<_> = async {
-        let chain = state.engine.validate(&req)?;
-        let agent_wallet = state
-            .wallet_registry
-            .get_or_create(api_ctx.organization_id, &req.agent_id)
-            .await?;
-        let smart_wallet =
-            services::resolve_chain_smart_wallet_address(&state.engine, &chain, &agent_wallet)
-                .await?;
-        let smart_wallet_str = format!("{smart_wallet:?}");
-        let quoted_usd = db::get_locked_quote_cost(
-            &state.db_pool,
-            api_ctx.organization_id,
-            quote_id,
-            &req,
-            &smart_wallet_str,
-        )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("invalid, expired, or mismatched x402 quote"))?;
-        let chain_cfg = state.config.chain_config(&chain)?;
-        let execution_token = &chain_cfg.execution_token;
-        let token_address = format!("{:?}", execution_token.address);
-        if payload.accepted.asset.parse::<Address>().ok() != Some(execution_token.address) {
-            anyhow::bail!(
-                "x402 payment asset must be {} on {}",
-                execution_token.symbol,
-                chain
-            );
-        }
-        let chain_id = chain_cfg.chain_id;
-        let expected = x402_requirement(
-            &state,
-            chain_id,
-            &token_address,
-            &format!("{:?}", state.config.execution_fee_recipient),
-            usd_to_raw_amount_ceil(quoted_usd, execution_token.decimals)
-                .ok_or_else(|| anyhow::anyhow!("invalid locked x402 quote amount"))?,
-        );
-        x402::validate_accepted(&payload.accepted, &expected)?;
-
-        let preflight =
-            services::handle_x402_preflight(&state.engine, &state.wallet_registry, &api_ctx, &req)
-                .await?;
-        if !preflight.success {
-            anyhow::bail!(
-                "execution preflight failed before x402 settlement: {}",
-                preflight
-                    .error
-                    .unwrap_or_else(|| "unknown simulation failure".into())
-            );
-        }
-        let existing_payment =
-            db::get_verified_payment_for_request(&state.db_pool, quote_id).await?;
-        if existing_payment.is_none() {
-            let preflight_fee_cap = preflight
-                .max_fee_per_gas_wei
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("Arc preflight omitted max fee per gas"))
-                .and_then(|raw| {
-                    U256::from_dec_str(raw)
-                        .map_err(|_| anyhow::anyhow!("Arc preflight returned an invalid fee cap"))
-                })?;
-            let current_cost = state
-                .engine
-                .estimate_arc_cost(&chain, preflight.gas_estimate, preflight_fee_cap, true)
-                .await?;
-            let current_amount = usd_to_raw_amount_ceil(current_cost, execution_token.decimals)
-                .ok_or_else(|| anyhow::anyhow!("invalid Arc preflight cost"))?;
-            if U256::from_dec_str(&current_amount)? > U256::from_dec_str(&expected.amount)? {
-                anyhow::bail!(
-                    "x402 quote no longer covers current execution cost; request a new quote"
-                );
-            }
-        }
-
-        if let Some(existing) = existing_payment {
-            let payment = SettledExecutionPayment {
-                payment_id: existing.id,
-                quote_request_id: Some(quote_id),
-                payer: existing.payer.clone(),
-                amount_usd: quoted_usd,
-                token: existing.token.clone(),
-                chain: existing.payment_chain.clone(),
-                tx_hash: existing.payment_tx_hash.clone(),
-                confirmed_amount_raw: Some(existing.amount_raw.clone()),
-                token_contract: Some(existing.token_contract.clone()),
-            };
-            let execution = services::handle_x402_execute(
-                &state.engine,
-                &state.db_pool,
-                &mut redis,
-                &state.wallet_registry,
-                &api_ctx,
-                &req,
-                services::X402Settlement {
-                    payment: &payment,
-                    idempotency_key,
-                },
-            )
-            .await?;
-            let settled = x402::SettleResponse {
-                success: true,
-                transaction: Some(existing.payment_tx_hash),
-                network: expected.network,
-                payer: Some(existing.payer),
-                amount: Some(existing.amount_raw),
-                error_reason: None,
-                extensions: None,
-            };
-            return Ok((execution, settled));
-        }
-
-        let facilitator_url = state
-            .config
-            .x402_facilitator_url
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("x402 execution is not configured"))?;
-        let facilitator = FacilitatorClient::new(facilitator_url)?;
-        let verified = facilitator.verify(&payload, &expected).await?;
-        if !verified.is_valid {
-            anyhow::bail!(
-                "x402 payment verification failed: {}",
-                verified
-                    .invalid_reason
-                    .unwrap_or_else(|| "facilitator rejected payment".into())
-            );
-        }
-        let settled = facilitator.settle(&payload, &expected).await?;
-        if !settled.success {
-            anyhow::bail!(
-                "x402 payment settlement failed: {}",
-                settled
-                    .error_reason
-                    .clone()
-                    .unwrap_or_else(|| "facilitator rejected settlement".into())
-            );
-        }
-        if settled.network != expected.network {
-            anyhow::bail!("x402 facilitator settled on an unexpected network");
-        }
-        let transaction = settled
-            .transaction
-            .clone()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("x402 settlement omitted its transaction hash"))?;
-        if !transaction.starts_with("0x") || transaction.len() != 66 {
-            anyhow::bail!("x402 facilitator returned an invalid EVM transaction hash");
-        }
-        if let Some(settled_amount) = settled.amount.as_deref() {
-            let settled_amount = U256::from_dec_str(settled_amount)
-                .map_err(|_| anyhow::anyhow!("x402 facilitator returned an invalid amount"))?;
-            let required_amount = U256::from_dec_str(&expected.amount)?;
-            if settled_amount < required_amount {
-                anyhow::bail!("x402 facilitator reported an underpayment");
-            }
-        }
-        let payer = settled
-            .payer
-            .clone()
-            .or(verified.payer)
-            .ok_or_else(|| anyhow::anyhow!("x402 facilitator omitted the payer address"))?;
-        let _: Address = payer
-            .parse()
-            .map_err(|_| anyhow::anyhow!("x402 facilitator returned an invalid payer address"))?;
-
-        let payment = SettledExecutionPayment {
-            payment_id: Uuid::new_v4(),
-            quote_request_id: Some(quote_id),
-            payer,
-            amount_usd: quoted_usd,
-            token: execution_token.symbol.clone(),
-            chain: chain.to_string(),
-            tx_hash: transaction,
-            confirmed_amount_raw: Some(expected.amount.clone()),
-            token_contract: Some(token_address),
-        };
-        let execution = services::handle_x402_execute(
-            &state.engine,
-            &state.db_pool,
-            &mut redis,
-            &state.wallet_registry,
-            &api_ctx,
-            &req,
-            services::X402Settlement {
-                payment: &payment,
-                idempotency_key,
-            },
-        )
-        .await?;
-        Ok((execution, settled))
-    }
-    .await;
-
-    match result {
-        Ok((execution, settled)) => {
-            let encoded = match x402::encode_header(&settled) {
-                Ok(value) => value,
-                Err(error) => return execution_error_to_http(error),
-            };
-            let mut response = execution_response_to_http(execution);
-            response.headers_mut().insert(
-                HeaderName::from_static(x402::PAYMENT_RESPONSE_HEADER),
-                HeaderValue::from_str(&encoded).expect("base64 is a valid header value"),
-            );
-            response
-        }
-        Err(error) => (
-            StatusCode::PAYMENT_REQUIRED,
-            Json(serde_json::json!({
-                "error": "x402_payment_failed",
-                "reason": error.to_string()
-            })),
-        )
-            .into_response(),
-    }
-}
-
-async fn build_x402_payment_required(
-    state: &AppState,
-    req: &ExecutionRequest,
-    response: &ExecutionResponse,
-) -> anyhow::Result<PaymentRequired> {
-    let chain = state.engine.validate(req)?;
-    let chain_id = state.config.chain_config(&chain)?.chain_id;
-    let quoted_usd = response
-        .estimated_cost_usd
-        .ok_or_else(|| anyhow::anyhow!("x402 quote omitted its cost"))?;
-    let chain_cfg = state.config.chain_config(&chain)?;
-    let execution_token = &chain_cfg.execution_token;
-    let amount = usd_to_raw_amount_ceil(quoted_usd, execution_token.decimals)
-        .ok_or_else(|| anyhow::anyhow!("invalid x402 quote amount"))?;
-    let token_address = format!("{:?}", execution_token.address);
-    let accepts = vec![x402_requirement(
-        state,
-        chain_id,
-        &token_address,
-        &format!("{:?}", state.config.execution_fee_recipient),
-        amount,
-    )];
-    let mut extensions = serde_json::Map::new();
-    extensions.insert(
-        "executeRequestId".into(),
-        serde_json::Value::String(response.request_id.to_string()),
-    );
-    Ok(PaymentRequired {
-        x402_version: x402::X402_VERSION,
-        resource: x402_resource(state),
-        accepts,
-        extensions,
-    })
-}
-
-fn x402_requirement(
-    state: &AppState,
-    chain_id: u64,
-    asset: &str,
-    pay_to: &str,
-    amount: String,
-) -> PaymentRequirements {
-    PaymentRequirements {
-        scheme: "exact".into(),
-        network: format!("eip155:{chain_id}"),
-        amount,
-        asset: asset.to_string(),
-        pay_to: pay_to.to_string(),
-        max_timeout_seconds: state.config.x402_max_timeout_seconds,
-        extra: None,
-    }
-}
-
-fn x402_resource(state: &AppState) -> ResourceInfo {
-    ResourceInfo {
-        url: format!("{}/x402/execute", state.config.public_api_base_url),
-        description: "Run one sponsored Jusso Arc UserOperation".into(),
-        mime_type: "application/json".into(),
-    }
-}
-
-// ──────────────────── POST /simulate ───────────────────────
-
-pub async fn simulate_handler(
-    State(state): State<AppState>,
-    Extension(api_ctx): Extension<AuthContext>,
-    Json(req): Json<ExecutionRequest>,
-) -> impl IntoResponse {
-    info!(agent_id = %req.agent_id, chain = %req.chain, "POST /simulate");
-
-    match services::handle_simulate_authenticated(
-        &state.engine,
-        &state.db_pool,
-        &state.wallet_registry,
-        &api_ctx,
-        &req,
-    )
-    .await
-    {
-        Ok(resp) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
-        Err(e) => {
-            error!(error = %format!("{e:#}"), "simulate failed");
-            let err_str = e.to_string();
-            let is_client_error = err_str.contains("unsupported chain")
-                || err_str.contains("not configured")
-                || err_str.contains("agent_id")
-                || err_str.contains("invalid target contract")
-                || err_str.contains("calldata")
-                || err_str.contains("malformed");
-            let status = if is_client_error {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status, Json(serde_json::json!({ "error": err_str }))).into_response()
-        }
-    }
-}
-
-fn execution_response_to_http(response: ExecutionResponse) -> Response {
-    let status = if response.status == ExecutionStatus::PaymentRequired {
-        StatusCode::PAYMENT_REQUIRED
-    } else {
-        StatusCode::OK
-    };
-    (status, Json(serde_json::to_value(response).unwrap())).into_response()
-}
-
-fn execution_error_to_http(error: anyhow::Error) -> Response {
-    error!(%error, "execution request failed");
-    let message = error.to_string();
-    let status = if message.contains("idempotency key") {
-        StatusCode::CONFLICT
-    } else if message.contains("authorization policy") {
-        StatusCode::FORBIDDEN
-    } else if [
-        "unsupported",
-        "required",
-        "invalid",
-        "malformed",
-        "not configured",
-        "not found",
-        "does not match",
-        "rejected",
-        "exceeds",
-    ]
-    .iter()
-    .any(|candidate| message.contains(candidate))
-    {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
-    (status, Json(serde_json::json!({"error": message}))).into_response()
 }
 
 // ────────────────────── GET /status/:id ──────────────────────────────
@@ -748,7 +220,7 @@ pub async fn public_feed_handler(
                 .map(|row| {
                     let normalized_status = row.status.to_lowercase();
                     let (feed_type, type_label) = match normalized_status.as_str() {
-                        "payment_required" | "payment_verified" => ("pay", "PAY"),
+                        "payment_verified" => ("pay", "PAY"),
                         "pending" => ("reg", "REG"),
                         "broadcasting" => ("relay", "RELAY"),
                         _ => ("exec", "EXEC"),
@@ -760,7 +232,6 @@ pub async fn public_feed_handler(
                     let confirm = match normalized_status.as_str() {
                         "confirmed" | "payment_verified" => "Confirmed",
                         "failed" | "reverted" => "Failed",
-                        "payment_required" => "Payment Required",
                         _ => "Pending...",
                     };
 
@@ -785,10 +256,7 @@ pub async fn public_feed_handler(
                                 .payment_token
                                 .clone()
                                 .unwrap_or_else(|| "token".to_string());
-                            format!("x402 verify · {amount} {token} · {display_chain}")
-                        }
-                        "payment_required" => {
-                            format!("x402 quote required · {display_chain}")
+                            format!("fee settled · {amount} {token} · {display_chain}")
                         }
                         "broadcasting" => {
                             format!("native relay · {display_chain}")
@@ -1338,7 +806,6 @@ pub async fn list_authorization_policies_handler(
             "allowed_protocols": row.allowed_protocols,
             "allowed_actions": row.allowed_actions,
             "allowed_targets": row.allowed_targets,
-            "allow_raw_execution": row.allow_raw_execution,
             "max_value_wei": row.max_value_wei,
             "max_execution_fee_usd": row.max_execution_fee_usd,
             "is_active": row.is_active,

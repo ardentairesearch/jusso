@@ -64,7 +64,6 @@ impl Chain {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
     Pending,
-    PaymentRequired,
     PaymentVerified,
     Queued,
     Broadcasting,
@@ -259,22 +258,18 @@ pub struct SimulationResult {
     pub error: Option<String>,
 }
 
-/// A payment settled by an x402 facilitator before execution is queued.
+/// An execution fee proven by a successful atomic workflow receipt.
 #[derive(Debug, Clone)]
-pub struct SettledExecutionPayment {
-    pub payment_id: Uuid,
-    /// Optional original quote request ID from a prior 402 response.
-    /// When present, server can lock required payment to that quote.
-    pub quote_request_id: Option<Uuid>,
+pub struct SettledExecutionFee {
+    pub fee_id: Uuid,
+    pub request_id: Uuid,
     pub payer: String,
     pub amount_usd: f64,
     pub token: String,
     pub chain: String,
     pub tx_hash: String,
-    /// The on-chain amount transferred in token-native units.
-    pub confirmed_amount_raw: Option<String>,
-    /// The token contract address settled by the facilitator.
-    pub token_contract: Option<String>,
+    pub amount_raw: String,
+    pub token_contract: String,
 }
 
 // ─────────────────────── Authentication Context ───────────────────────
@@ -369,10 +364,6 @@ mod tests {
     #[test]
     fn test_execution_status_display() {
         assert_eq!(ExecutionStatus::Pending.to_string(), "pending");
-        assert_eq!(
-            ExecutionStatus::PaymentRequired.to_string(),
-            "payment_required"
-        );
         assert_eq!(
             ExecutionStatus::PaymentVerified.to_string(),
             "payment_verified"

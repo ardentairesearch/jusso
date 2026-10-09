@@ -1,4 +1,4 @@
-//! Hosted MCP servers with separate runtime and control-plane capabilities.
+//! Hosted MCP server for agent runtime and owner-approved management.
 
 use anyhow::Context;
 use chrono::{Duration, Utc};
@@ -25,26 +25,16 @@ use crate::{
     auth::AuthService,
     db,
     funding::FundingSessionRequest,
-    types::{AuthContext, BatchCall, ExecutionRequest},
+    types::AuthContext,
     workflows::{PaymentPlanInput, PaymentPlanStatusChange},
 };
 
 pub type AgentMcpService = StreamableHttpService<AgentMcp, LocalSessionManager>;
-pub type ControlMcpService = StreamableHttpService<ControlMcp, LocalSessionManager>;
 
 pub fn agent_service(state: AppState, auth: AuthService) -> anyhow::Result<AgentMcpService> {
     let config = streamable_http_config(&state.config.public_api_base_url)?;
     Ok(StreamableHttpService::new(
         move || Ok(AgentMcp::new(state.clone(), auth.clone())),
-        Default::default(),
-        config,
-    ))
-}
-
-pub fn control_service(state: AppState) -> anyhow::Result<ControlMcpService> {
-    let config = streamable_http_config(&state.config.public_api_base_url)?;
-    Ok(StreamableHttpService::new(
-        move || Ok(ControlMcp::new(state.clone())),
         Default::default(),
         config,
     ))
@@ -97,20 +87,6 @@ fn json_output(value: impl Serialize) -> Result<McpJson<serde_json::Value>, Erro
         .map_err(|error| ErrorData::internal_error(error.to_string(), None))
 }
 
-fn mcp_idempotency_key(
-    explicit: Option<&str>,
-    auth: &AuthContext,
-    context: &RequestContext<RoleServer>,
-    params: &impl std::fmt::Debug,
-) -> Result<String, ErrorData> {
-    let key = explicit.map(str::to_owned).unwrap_or_else(|| {
-        let material = format!("{}:{:?}:{params:?}", auth.credential_id, context.id);
-        format!("mcp-{}", hex::encode(Sha256::digest(material.as_bytes())))
-    });
-    db::validate_idempotency_key(&key).map_err(tool_error)?;
-    Ok(key)
-}
-
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct WalletParams {
     /// Arc network name. Defaults to the server's configured Arc network.
@@ -137,88 +113,21 @@ struct PaymentPlanRunsParams {
     limit: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct RawCallParams {
-    /// Destination contract address.
-    target_contract: String,
-    /// 0x-prefixed contract calldata.
-    calldata: String,
-    /// Native Arc value in wei as a decimal string. Defaults to zero.
-    value: Option<String>,
-}
-
-impl From<RawCallParams> for BatchCall {
-    fn from(call: RawCallParams) -> Self {
-        Self {
-            target_contract: call.target_contract,
-            calldata: call.calldata,
-            value: call.value.unwrap_or_else(|| "0".into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct RawTransactionParams {
-    /// Destination contract for a single call. Omit when batch_calls is used.
-    target_contract: Option<String>,
-    /// 0x-prefixed calldata for a single call. Omit when batch_calls is used.
-    calldata: Option<String>,
-    /// Native Arc value in wei as a decimal string. Defaults to zero.
-    value: Option<String>,
-    /// Calls to execute atomically in one UserOperation. Maximum 16.
-    batch_calls: Option<Vec<RawCallParams>>,
-    /// Arc network name. Defaults to the configured Arc network.
-    chain: Option<String>,
-    /// Optional strategy correlation identifier.
-    strategy_id: Option<String>,
-    /// Optional HTTPS completion webhook.
-    callback_url: Option<String>,
-}
-
-impl RawTransactionParams {
-    fn to_request(&self, default_chain: &str, agent_id: String) -> ExecutionRequest {
-        ExecutionRequest {
-            agent_id,
-            chain: self
-                .chain
-                .clone()
-                .unwrap_or_else(|| default_chain.to_string()),
-            target_contract: self.target_contract.clone().unwrap_or_default(),
-            calldata: self.calldata.clone().unwrap_or_default(),
-            value: self.value.clone().unwrap_or_else(|| "0".into()),
-            strategy_id: self.strategy_id.clone(),
-            batch_calls: self
-                .batch_calls
-                .clone()
-                .map(|calls| calls.into_iter().map(Into::into).collect()),
-            callback_url: self.callback_url.clone(),
-            policy_impact: Default::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct RawExecutionParams {
-    #[serde(flatten)]
-    transaction: RawTransactionParams,
-    /// Stable retry key. Omit to derive it from the MCP request ID and arguments.
-    idempotency_key: Option<String>,
-}
-
 #[derive(Clone)]
 pub struct AgentMcp {
     state: AppState,
     auth: AuthService,
-    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 impl AgentMcp {
     fn new(state: AppState, auth: AuthService) -> Self {
+        let mut tool_router = Self::runtime_tool_router();
+        tool_router.merge(Self::management_tool_router());
         Self {
             state,
             auth,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -243,7 +152,7 @@ impl AgentMcp {
     }
 }
 
-#[tool_router]
+#[tool_router(router = runtime_tool_router)]
 impl AgentMcp {
     #[tool(
         description = "Get or provision the connected agent's dedicated Arc smart-account address."
@@ -382,88 +291,6 @@ impl AgentMcp {
             .map_err(tool_error)?,
         )
     }
-
-    #[tool(
-        description = "Simulate a raw single-call or atomic-batch Arc UserOperation for the connected agent. Requires the agent policy to explicitly allow raw execution."
-    )]
-    async fn simulate_raw_transaction(
-        &self,
-        Parameters(params): Parameters<RawTransactionParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
-        let chain = params
-            .chain
-            .as_deref()
-            .unwrap_or(self.state.config.arc_network.name());
-        let (auth, agent_id) = self
-            .authorize(&context, Some(chain), "transaction:simulate", "/simulate")
-            .await?;
-        let request = params.to_request(self.state.config.arc_network.name(), agent_id);
-        let response = services::handle_simulate_authenticated(
-            &self.state.engine,
-            &self.state.db_pool,
-            &self.state.wallet_registry,
-            &auth,
-            &request,
-        )
-        .await
-        .map_err(tool_error)?;
-        json_output(response)
-    }
-
-    #[tool(
-        description = "Execute a raw single-call or atomic-batch transaction through sponsored Arc ERC-4337 for the connected agent. Requires explicit raw-execution policy permission and is always simulated before queueing."
-    )]
-    async fn execute_raw_transaction(
-        &self,
-        Parameters(params): Parameters<RawExecutionParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
-        let chain = params
-            .transaction
-            .chain
-            .as_deref()
-            .unwrap_or(self.state.config.arc_network.name());
-        let (auth, agent_id) = self
-            .authorize(&context, Some(chain), "transaction:execute", "/execute")
-            .await?;
-        let request = params
-            .transaction
-            .to_request(self.state.config.arc_network.name(), agent_id);
-        let idempotency_key =
-            mcp_idempotency_key(params.idempotency_key.as_deref(), &auth, &context, &params)?;
-        let mut redis = self.state.redis_conn.clone();
-        let response = services::handle_execute_idempotent(
-            &self.state.engine,
-            &self.state.db_pool,
-            &mut redis,
-            &self.state.wallet_registry,
-            &auth,
-            &request,
-            &idempotency_key,
-        )
-        .await
-        .map_err(tool_error)?;
-        json_output(response)
-    }
-}
-
-#[tool_handler]
-impl ServerHandler for AgentMcp {
-    fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("jusso-agent", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "Jusso runtime tools. Execute only for the authenticated organization and within the agent's assigned policy.",
-            )
-    }
-}
-
-#[derive(Clone)]
-pub struct ControlMcp {
-    state: AppState,
-    #[allow(dead_code)]
-    tool_router: ToolRouter<Self>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -504,9 +331,6 @@ struct CreatePolicyApprovalParams {
     allowed_actions: Option<Vec<String>>,
     /// Allowed EVM target addresses. A wildcard is an explicit dangerous opt-in.
     allowed_targets: Option<Vec<String>>,
-    /// Explicitly permit raw transaction routes.
-    #[serde(default)]
-    allow_raw_execution: bool,
     /// Maximum native value in wei.
     max_value_wei: Option<String>,
     /// Maximum execution fee in USDC-denominated dollars.
@@ -547,9 +371,6 @@ struct UpdatePolicyApprovalParams {
     allowed_actions: Option<Vec<String>>,
     /// Allowed EVM target addresses. A wildcard is an explicit dangerous opt-in.
     allowed_targets: Option<Vec<String>>,
-    /// Explicitly permit raw transaction routes.
-    #[serde(default)]
-    allow_raw_execution: bool,
     /// Maximum native value in wei.
     max_value_wei: Option<String>,
     /// Maximum execution fee in USDC-denominated dollars.
@@ -656,14 +477,7 @@ struct RevokeOwnerPasskeyApprovalParams {
     passkey_id: String,
 }
 
-impl ControlMcp {
-    fn new(state: AppState) -> Self {
-        Self {
-            state,
-            tool_router: Self::tool_router(),
-        }
-    }
-
+impl AgentMcp {
     async fn request_owner_approval(
         &self,
         auth: &AuthContext,
@@ -711,8 +525,8 @@ impl ControlMcp {
     }
 }
 
-#[tool_router]
-impl ControlMcp {
+#[tool_router(router = management_tool_router)]
+impl AgentMcp {
     #[tool(description = "List the organization's recurring USDC payment plans.")]
     async fn list_organization_payment_plans(
         &self,
@@ -870,7 +684,6 @@ impl ControlMcp {
                     "allowed_protocols": row.allowed_protocols,
                     "allowed_actions": row.allowed_actions,
                     "allowed_targets": row.allowed_targets,
-                    "allow_raw_execution": row.allow_raw_execution,
                     "max_value_wei": row.max_value_wei,
                     "max_execution_fee_usd": row.max_execution_fee_usd,
                     "token_spend_limits": row.token_spend_limits,
@@ -906,7 +719,6 @@ impl ControlMcp {
                 allowed_protocols: params.allowed_protocols,
                 allowed_actions: params.allowed_actions,
                 allowed_targets: params.allowed_targets,
-                allow_raw_execution: params.allow_raw_execution,
                 max_value_wei: params.max_value_wei,
                 max_execution_fee_usd: params
                     .max_execution_fee_usd
@@ -953,7 +765,6 @@ impl ControlMcp {
                 allowed_protocols: params.allowed_protocols,
                 allowed_actions: params.allowed_actions,
                 allowed_targets: params.allowed_targets,
-                allow_raw_execution: params.allow_raw_execution,
                 max_value_wei: params.max_value_wei,
                 max_execution_fee_usd: params.max_execution_fee_usd,
                 token_spend_limits: serde_json::to_value(params.token_spend_limits)
@@ -1505,13 +1316,13 @@ struct OwnerPasskeyView {
     is_current_connection: bool,
 }
 
-#[tool_handler]
-impl ServerHandler for ControlMcp {
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for AgentMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("jusso-control", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("jusso", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Jusso control-plane tools. Policy changes alter agent authority and should be owner-approved.",
+                "Jusso workflow and organization tools. Onchain execution is available only through supported workflows; authority-changing actions require owner approval.",
             )
     }
 }
@@ -1521,115 +1332,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_and_control_tool_catalogs_are_separate() {
-        let runtime = [
-            AgentMcp::get_wallet_tool_attr().name.to_string(),
-            AgentMcp::get_wallet_balance_tool_attr().name.to_string(),
-            AgentMcp::create_funding_session_tool_attr()
-                .name
-                .to_string(),
-            AgentMcp::get_execution_status_tool_attr().name.to_string(),
-            AgentMcp::list_payment_plans_tool_attr().name.to_string(),
-            AgentMcp::list_payment_plan_runs_tool_attr()
-                .name
-                .to_string(),
-            AgentMcp::simulate_raw_transaction_tool_attr()
-                .name
-                .to_string(),
-            AgentMcp::execute_raw_transaction_tool_attr()
-                .name
-                .to_string(),
-        ];
-        let control = [
-            ControlMcp::list_organization_payment_plans_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::list_organization_payment_plan_runs_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_create_payment_plan_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_update_payment_plan_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::pause_payment_plan_tool_attr().name.to_string(),
-            ControlMcp::request_change_payment_plan_status_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::list_agents_tool_attr().name.to_string(),
-            ControlMcp::list_authorization_policies_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::list_oauth_connections_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::revoke_oauth_connection_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_create_policy_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_update_policy_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_assign_policy_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_revoke_policy_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_create_agent_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_suspend_agent_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_reactivate_agent_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_rotate_agent_runtime_credential_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_rotate_agent_onchain_signer_approval_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::get_agent_onchain_signer_rotation_status_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::get_owner_approval_status_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::list_owner_passkeys_tool_attr().name.to_string(),
-            ControlMcp::request_add_or_replace_owner_passkey_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::get_owner_passkey_enrollment_status_tool_attr()
-                .name
-                .to_string(),
-            ControlMcp::request_revoke_owner_passkey_approval_tool_attr()
-                .name
-                .to_string(),
-        ];
-        assert!(runtime.iter().any(|name| name == "list_payment_plans"));
-        assert!(runtime
+    fn unified_catalog_contains_runtime_and_owner_approved_management_tools() {
+        let mut router = AgentMcp::runtime_tool_router();
+        router.merge(AgentMcp::management_tool_router());
+        let names = router
+            .into_iter()
+            .map(|route| route.attr.name.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "get_wallet"));
+        assert!(names.iter().any(|name| name == "list_payment_plans"));
+        assert!(names
             .iter()
-            .any(|name| name == "simulate_raw_transaction"));
-        assert!(runtime.iter().any(|name| name == "execute_raw_transaction"));
-        assert!(control.iter().all(|name| !name.contains("raw_transaction")));
-        assert!(control
-            .iter()
-            .filter(|name| {
-                name.contains("policy") && name.as_str() != "list_authorization_policies"
-            })
-            .all(|name| name.contains("approval")));
-        assert!(control
-            .iter()
-            .any(|name| name == "get_agent_onchain_signer_rotation_status"));
-        assert!(control
+            .any(|name| name == "request_create_payment_plan_approval"));
+        assert!(names.iter().any(|name| name == "list_agents"));
+        assert!(names
             .iter()
             .any(|name| name == "request_revoke_owner_passkey_approval"));
-        assert!(runtime.iter().all(|name| !control.contains(name)));
+        assert!(names.iter().all(|name| !name.contains("raw_transaction")));
     }
 
     #[test]
@@ -1637,44 +1357,14 @@ mod tests {
         let wallet_schema = serde_json::to_value(schemars::schema_for!(WalletParams)).unwrap();
         let funding_schema =
             serde_json::to_value(schemars::schema_for!(FundingSessionRequest)).unwrap();
-        let raw_schema = serde_json::to_value(schemars::schema_for!(RawExecutionParams)).unwrap();
 
-        for schema in [&wallet_schema, &funding_schema, &raw_schema] {
+        for schema in [&wallet_schema, &funding_schema] {
             let properties = schema
                 .pointer("/properties")
                 .and_then(serde_json::Value::as_object)
                 .expect("tool schema properties");
             assert!(!properties.contains_key("agent_id"));
         }
-        let raw_properties = raw_schema["properties"].as_object().unwrap();
-        assert!(raw_properties.contains_key("target_contract"));
-        assert!(raw_properties.contains_key("batch_calls"));
-        assert!(raw_properties.contains_key("idempotency_key"));
-        assert!(!raw_properties.contains_key("transaction"));
-    }
-
-    #[test]
-    fn raw_tool_request_uses_bound_agent_and_preserves_atomic_batch() {
-        let params = RawTransactionParams {
-            target_contract: None,
-            calldata: None,
-            value: None,
-            batch_calls: Some(vec![RawCallParams {
-                target_contract: "0x0000000000000000000000000000000000000001".into(),
-                calldata: "0x12345678".into(),
-                value: None,
-            }]),
-            chain: None,
-            strategy_id: Some("strategy-1".into()),
-            callback_url: None,
-        };
-        let request = params.to_request("arc-testnet", "primary-agent".into());
-        assert_eq!(request.agent_id, "primary-agent");
-        assert_eq!(request.chain, "arc-testnet");
-        assert!(request.target_contract.is_empty());
-        let calls = request.batch_calls.expect("batch calls");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].value, "0");
     }
 
     #[test]

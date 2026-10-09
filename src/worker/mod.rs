@@ -22,7 +22,7 @@ use crate::{
     db,
     execution_engine::ExecutionEngine,
     queue::{self, MAX_JOB_ATTEMPTS},
-    types::{ExecutionJob, ExecutionRequest, ExecutionStatus, SettledExecutionPayment},
+    types::{ExecutionJob, ExecutionRequest, ExecutionStatus, SettledExecutionFee},
     webhook,
 };
 
@@ -185,25 +185,20 @@ async fn execute_arc(
         bail!("queued execution differs from its authenticated record");
     }
     let token = &ctx.engine.config.chain_config(&job.chain)?.execution_token;
-    if let Some(fee) = &job.execution_fee {
-        if record.cost_usd.is_none()
-            || U256::from_dec_str(&fee.amount_raw)
-                .context("invalid queued fee")?
-                .is_zero()
-            || permit.execution_fee_raw.as_deref() != Some(fee.amount_raw.as_str())
-            || fee.token_contract.parse::<Address>().ok() != Some(token.address)
-            || fee.recipient_address.parse::<Address>().ok()
-                != Some(ctx.engine.config.execution_fee_recipient)
-        {
-            bail!("queued fee differs from authorized Arc fee");
-        }
-    } else {
-        let settled = db::get_verified_payment_for_request(&ctx.db_pool, job.request_id)
-            .await?
-            .context("verified x402 payment disappeared")?;
-        if permit.execution_fee_raw.as_deref() != Some(settled.amount_raw.as_str()) {
-            bail!("settled x402 fee differs from its authorization permit");
-        }
+    let fee = job
+        .execution_fee
+        .as_ref()
+        .context("queued execution is missing its atomic execution fee")?;
+    if record.cost_usd.is_none()
+        || U256::from_dec_str(&fee.amount_raw)
+            .context("invalid queued fee")?
+            .is_zero()
+        || permit.execution_fee_raw.as_deref() != Some(fee.amount_raw.as_str())
+        || fee.token_contract.parse::<Address>().ok() != Some(token.address)
+        || fee.recipient_address.parse::<Address>().ok()
+            != Some(ctx.engine.config.execution_fee_recipient)
+    {
+        bail!("queued fee differs from authorized Arc fee");
     }
     let mut calls = execution_calls(
         &job.target_contract,
@@ -211,9 +206,7 @@ async fn execute_arc(
         &job.value,
         job.batch_calls.as_deref(),
     )?;
-    if let Some(fee) = &job.execution_fee {
-        calls.insert(0, fee_transfer_call(fee)?);
-    }
+    calls.insert(0, fee_transfer_call(fee)?);
 
     // A transaction-scoped advisory lock covers preparation through receipt, so
     // two workers cannot prepare different nonces for the same smart account.
@@ -292,15 +285,7 @@ async fn execute_arc(
                 true,
             )
             .await?;
-        let paid_raw = match &job.execution_fee {
-            Some(fee) => U256::from_dec_str(&fee.amount_raw)?,
-            None => U256::from_dec_str(
-                &db::get_verified_payment_for_request(&ctx.db_pool, job.request_id)
-                    .await?
-                    .context("verified x402 payment disappeared")?
-                    .amount_raw,
-            )?,
-        };
+        let paid_raw = U256::from_dec_str(&fee.amount_raw)?;
         if paid_raw < required_raw {
             bail!("execution fee no longer covers current sponsored gas quote");
         }
@@ -400,19 +385,17 @@ async fn finalize_onchain_result(
     };
     let error_message = (!receipt.succeeded).then_some("Arc UserOperation reverted");
     let payment = if receipt.succeeded {
-        job.execution_fee
-            .as_ref()
-            .map(|fee| SettledExecutionPayment {
-                payment_id: Uuid::new_v4(),
-                quote_request_id: Some(job.request_id),
-                payer: job.smart_wallet_address.clone(),
-                amount_usd: fee.amount_usd,
-                token: fee.token_symbol.clone(),
-                chain: job.chain.to_string(),
-                tx_hash: tx_hash.clone(),
-                confirmed_amount_raw: Some(fee.amount_raw.clone()),
-                token_contract: Some(fee.token_contract.clone()),
-            })
+        job.execution_fee.as_ref().map(|fee| SettledExecutionFee {
+            fee_id: Uuid::new_v4(),
+            request_id: job.request_id,
+            payer: job.smart_wallet_address.clone(),
+            amount_usd: fee.amount_usd,
+            token: fee.token_symbol.clone(),
+            chain: job.chain.to_string(),
+            tx_hash: tx_hash.clone(),
+            amount_raw: fee.amount_raw.clone(),
+            token_contract: fee.token_contract.clone(),
+        })
     } else {
         None
     };

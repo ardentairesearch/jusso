@@ -1,4 +1,4 @@
-//! Decimal conversion for USD-denominated execution policy and x402 amounts.
+//! Decimal conversion for USD-denominated execution policy and token fees.
 
 use anyhow::{bail, Result};
 use ethers_core::types::U256;

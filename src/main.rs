@@ -91,10 +91,6 @@ fn configured_cors_layer() -> CorsLayer {
         ))
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any)
-        .expose_headers([
-            HeaderName::from_static("payment-required"),
-            HeaderName::from_static("payment-response"),
-        ])
 }
 
 /// Supervisor that restarts a worker if it panics.  Each restart recovers
@@ -371,10 +367,6 @@ async fn main() -> anyhow::Result<()> {
             "/.well-known/oauth-protected-resource/mcp/agent",
             get(connect::agent_resource_metadata_handler),
         )
-        .route(
-            "/.well-known/oauth-protected-resource/mcp/control",
-            get(connect::control_resource_metadata_handler),
-        )
         .with_state(connect_service);
 
     let agent_mcp_router = Router::new()
@@ -385,20 +377,9 @@ async fn main() -> anyhow::Result<()> {
         .layer(middleware::from_fn_with_state(
             auth_service.clone(),
             auth::authentication_middleware,
-        ));
-    let control_mcp_router = Router::new()
-        .nest_service("/mcp/control", mcp::control_service(state.clone())?)
-        .layer(middleware::from_fn(no_store_sensitive_response))
-        .layer(middleware::from_fn_with_state(
-            auth_service.clone(),
-            auth::authentication_middleware,
-        ));
-
+        ))
+        .layer(middleware::from_fn(no_store_sensitive_response));
     let protected_api_router = Router::new()
-        // Execution API — x402 middleware applied
-        .route("/execute", post(routes::execute_handler))
-        .route("/x402/execute", post(routes::x402_execute_handler))
-        .route("/simulate", post(routes::simulate_handler))
         .route("/status/:id", get(routes::status_handler))
         .route("/wallet", get(routes::wallet_handler))
         .route("/wallet/balance", get(routes::wallet_balance_handler))
@@ -460,7 +441,6 @@ async fn main() -> anyhow::Result<()> {
         .merge(oauth_router)
         .merge(connect_router)
         .merge(agent_mcp_router)
-        .merge(control_mcp_router)
         // Admin endpoints use only the bootstrap-token middleware.
         .nest("/admin", admin_router)
         // Protected API endpoints use OAuth, policy, and rate limiting.

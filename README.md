@@ -30,7 +30,7 @@ the reserve and fee buffer, the run is skipped. Jusso never borrows, partially
 pays a list, or silently catches up multiple missed periods after downtime.
 
 ```text
-Owner or control agent
+Owner or authorized assistant
   -> drafts payment plan
   -> reviews exact schedule, recipients, limits, and effects
   -> approves with passkey
@@ -79,21 +79,22 @@ splitting assets across two wallet models or advertising a nonfunctional route.
 - Per-execution and rolling token/gas budgets are reserved atomically.
 - Execution is always fully simulated before queueing.
 - Stable idempotency keys and persisted signed operations make retries safe.
-- Raw transaction tools remain disabled unless a policy explicitly opts in.
+- Arbitrary target/calldata submission is not exposed through MCP or HTTP.
+- Only Jusso-defined workflows can compile transactions for the execution engine.
 - Bring-your-own-wallet is disabled.
 
-## MCP Surfaces
+## MCP
 
 Jusso exposes remote Streamable HTTP MCP over HTTPS:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `/mcp/agent` | Wallet, USDC balance, funding session, execution status, plan/run reads, and explicitly opted-in raw execution |
-| `/mcp/control` | Organization plan management, owner approvals, agents, policies, connections, passkeys, and signer lifecycle |
+| `/mcp/agent` | Wallet and balance reads, funding, payment workflows, run history, owner-approved organization management, policies, connections, passkeys, and signer lifecycle |
 
-The runtime connection is agent-bound, so tools do not repeatedly ask for an
-agent ID. Control tools can select an organization agent when drafting a plan.
-Compatible clients complete OAuth Authorization Code + PKCE in a browser.
+The connection is agent-bound, so runtime tools do not repeatedly ask for an
+agent ID. Organization management lives on the same connection; sensitive
+changes still require an owner passkey approval in the browser. Compatible
+clients complete OAuth Authorization Code + PKCE during onboarding.
 
 Owners may also onboard locally:
 
@@ -101,7 +102,7 @@ Owners may also onboard locally:
 cargo run --bin jusso -- onboard --organization "Acme" --agent-id treasury --accept-terms
 ```
 
-Child agents enroll with a one-time token created by an owner-approved control
+Child agents enroll with a one-time token created by an owner-approved
 operation:
 
 ```bash
@@ -117,15 +118,12 @@ cargo run --bin jusso -- enroll \
 | `POST /register` | Public, protected organization onboarding |
 | `GET /wallet` | Agent's Arc smart-account address and deployment state |
 | `GET /wallet/balance` | Agent's Arc USDC balance |
-| `POST /simulate` | Simulate an explicitly permitted raw call or batch |
-| `POST /execute` | Idempotently queue an explicitly permitted raw execution |
-| `POST /x402/execute` | Optional facilitator-paid execution |
 | `GET /status/{id}` | Execution status and transaction hash |
 | `GET /admin/fee-recipient/status` | Fee-recipient and sponsor status |
 
-`POST /execute` and `POST /x402/execute` require `Idempotency-Key`. The normal
-payment-plan path is MCP-first and uses the same simulation, policy, queue, and
-receipt-verification engine internally.
+Payment plans are MCP-first. Jusso compiles each due run into a deterministic
+internal batch, then applies simulation, policy, idempotency, queueing, and
+receipt verification. Clients cannot submit arbitrary contracts or calldata.
 
 ## Local Setup
 
@@ -188,20 +186,20 @@ cargo run --bin jusso-arc-probe
 cargo run --bin jusso-server
 ```
 
-Migrations run at startup. `001_init.sql` is the single pre-beta baseline. This
-pivot intentionally requires a newly provisioned empty PostgreSQL database;
-do not edit SQLx checksums or point the build at a database created by an older
-Jusso revision. Resetting the registry does not move or recover assets from old
-onchain accounts, so verify every old test wallet is empty before retiring its
-database. Keep one application replica until the scheduler, queue workers, and
-recovery paths have completed multi-replica certification.
+Migrations run at startup. `001_init.sql` is the pre-beta baseline and later
+migrations upgrade deployed Beta databases. Migration `002` unifies the MCP
+resource and revokes existing OAuth connections; remove and reconnect Jusso in
+each MCP client once after deploying this revision. Keep one application
+replica until the scheduler, queue workers, and recovery paths have completed
+multi-replica certification.
 
 ## Railway Testnet Deployment
 
-Deploy this Beta as a new Railway project with three services: `jusso-api`, a
-new PostgreSQL service, and a new Redis service. Do not reuse the database from
-an older Jusso deployment because this revision intentionally replaces the
-migration history with a new `001_init.sql` baseline.
+For a first deployment, create a Railway project with three services:
+`jusso-api`, PostgreSQL, and Redis. Do not reuse a database from a pre-Beta
+Jusso architecture. An existing Beta deployment created from `001_init.sql`
+should keep its current database; startup applies later migrations such as
+`002_unified_mcp_remove_raw_execution.sql` automatically.
 
 Railway detects the root `Dockerfile`; `railway.toml` selects `/health` as the
 deployment health check. Keep the API at one replica because the scheduler and

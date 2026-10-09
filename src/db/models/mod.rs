@@ -44,7 +44,6 @@ pub struct AuthorizationPolicyRow {
     pub allowed_protocols: Option<Vec<String>>,
     pub allowed_actions: Option<Vec<String>>,
     pub allowed_targets: Option<Vec<String>>,
-    pub allow_raw_execution: bool,
     pub max_value_wei: Option<String>,
     pub max_execution_fee_usd: Option<f64>,
     pub token_spend_limits: serde_json::Value,

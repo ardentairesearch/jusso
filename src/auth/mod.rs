@@ -30,13 +30,7 @@ use crate::{
     types::{AuthContext, BatchCall, CredentialKind, ExecutionRequest},
 };
 
-pub const RUNTIME_SCOPES: &[&str] = &[
-    "wallet:read",
-    "workflow:read",
-    "execution:read",
-    "transaction:simulate",
-    "transaction:execute",
-];
+pub const RUNTIME_SCOPES: &[&str] = &["wallet:read", "workflow:read", "execution:read"];
 
 pub const SUPPORTED_PROTOCOLS: &[&str] = &[];
 
@@ -46,8 +40,6 @@ pub const DEFAULT_POLICY_ACTIONS: &[&str] = &[
     "wallet:read",
     "workflow:read",
     "execution:read",
-    "transaction:simulate",
-    "transaction:execute",
     "payment_plan:execute",
 ];
 
@@ -70,8 +62,6 @@ pub const DEFAULT_SCOPES: &[&str] = &[
     "wallet:read",
     "workflow:read",
     "execution:read",
-    "transaction:simulate",
-    "transaction:execute",
     "agent:manage",
     "credential:manage",
     "trust:manage",
@@ -555,7 +545,7 @@ impl AuthService {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_issuer(&[self.issuer.as_str()]);
         let mcp_audience = format!("{}{}", self.issuer, uri.path());
-        let expected_audience = if matches!(uri.path(), "/mcp/agent" | "/mcp/control") {
+        let expected_audience = if uri.path() == "/mcp/agent" {
             mcp_audience.as_str()
         } else {
             self.audience.as_str()
@@ -1320,9 +1310,6 @@ impl AuthService {
         resource: &str,
         input: &AuthorizationInput,
     ) -> Result<()> {
-        if action.starts_with("transaction:") && !policy.allow_raw_execution {
-            anyhow::bail!("raw transaction routes require an explicit policy opt-in");
-        }
         if let Some(allowed) = &policy.allowed_chains {
             if let Some(chain) = input.chain.as_deref() {
                 if !allowed
@@ -1728,7 +1715,6 @@ pub async fn authentication_middleware(
             tracing::warn!(%error, "request authentication failed");
             let resource_path = match request.uri().path() {
                 "/mcp/agent" => "/mcp/agent",
-                "/mcp/control" => "/mcp/control",
                 _ => "",
             };
             let metadata = auth.protected_resource_metadata_url(resource_path);
@@ -1930,10 +1916,8 @@ fn scope_for(path: &str) -> &'static str {
         "execution:read"
     } else if path.starts_with("/wallet") {
         "wallet:read"
-    } else if path.ends_with("/simulate") || path.ends_with("/quote") || path == "/simulate" {
-        "transaction:simulate"
     } else {
-        "transaction:execute"
+        "unsupported"
     }
 }
 
@@ -2009,6 +1993,8 @@ mod tests {
     fn maps_route_scopes() {
         assert_eq!(scope_for("/wallet"), "wallet:read");
         assert_eq!(scope_for("/agents"), "agent:manage");
+        assert_eq!(scope_for("/execute"), "unsupported");
+        assert_eq!(scope_for("/simulate"), "unsupported");
     }
 
     #[test]
@@ -2045,7 +2031,6 @@ mod tests {
             allowed_protocols: None,
             allowed_actions: Some(vec!["payment_plan:execute".into()]),
             allowed_targets: Some(vec!["0x0000000000000000000000000000000000000001".into()]),
-            allow_raw_execution: false,
             max_value_wei: Some("0".into()),
             max_execution_fee_usd: Some(1.0),
             token_spend_limits: serde_json::json!([]),
@@ -2094,7 +2079,6 @@ mod tests {
             allowed_protocols: None,
             allowed_actions: Some(vec!["payment_plan:execute".into()]),
             allowed_targets: Some(vec!["*".into()]),
-            allow_raw_execution: false,
             max_value_wei: Some("0".into()),
             max_execution_fee_usd: Some(1.0),
             token_spend_limits: serde_json::json!([{

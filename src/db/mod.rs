@@ -1115,8 +1115,8 @@ pub async fn create_owner_passkey_enrollment_request(
     context: &AuthContext,
     options: CreateOwnerPasskeyEnrollmentOptions<'_>,
 ) -> Result<OwnerPasskeyEnrollmentRequestRow> {
-    if context.credential_kind != CredentialKind::OAuthSession || context.agent_id.is_some() {
-        anyhow::bail!("passkey enrollment requires an organization control OAuth session");
+    if context.credential_kind != CredentialKind::OAuthSession {
+        anyhow::bail!("passkey enrollment requires an owner OAuth session");
     }
     validate_passkey_label_and_purpose(options.label, options.purpose)?;
     validate_secret_hash(options.token_hash, "passkey enrollment token")?;
@@ -1137,7 +1137,7 @@ pub async fn create_owner_passkey_enrollment_request(
                JOIN principals p ON p.id = c.principal_id AND p.status = 'active'
                JOIN organizations o ON o.id = c.organization_id AND o.status = 'active'
                WHERE c.id = $1 AND c.organization_id = $2 AND c.principal_id = $3
-                 AND c.status = 'active' AND c.agent_id IS NULL
+                 AND c.status = 'active'
            )"#,
     )
     .bind(context.credential_id)
@@ -1146,7 +1146,7 @@ pub async fn create_owner_passkey_enrollment_request(
     .fetch_one(&mut *transaction)
     .await?;
     if !connection_active {
-        anyhow::bail!("active owner control connection was not found");
+        anyhow::bail!("active owner connection was not found");
     }
     sqlx::query(
         r#"UPDATE owner_passkey_enrollment_requests SET status = 'expired'
@@ -1611,7 +1611,7 @@ async fn revoke_owner_sessions_tx(
         r#"UPDATE oauth_connections
            SET status = 'revoked', revoked_at = now(), updated_at = now()
            WHERE organization_id = $1 AND principal_id = $2 AND status = 'active'
-             AND (passkey_id = $3 OR agent_id IS NULL)"#,
+             AND passkey_id = $3"#,
     )
     .bind(organization_id)
     .bind(principal_id)
@@ -1652,7 +1652,6 @@ pub enum OwnerApprovalAction {
         allowed_protocols: Option<Vec<String>>,
         allowed_actions: Option<Vec<String>>,
         allowed_targets: Option<Vec<String>>,
-        allow_raw_execution: bool,
         max_value_wei: Option<String>,
         max_execution_fee_usd: Option<f64>,
         token_spend_limits: serde_json::Value,
@@ -1672,7 +1671,6 @@ pub enum OwnerApprovalAction {
         allowed_protocols: Option<Vec<String>>,
         allowed_actions: Option<Vec<String>>,
         allowed_targets: Option<Vec<String>>,
-        allow_raw_execution: bool,
         max_value_wei: Option<String>,
         max_execution_fee_usd: Option<f64>,
         token_spend_limits: serde_json::Value,
@@ -1785,7 +1783,6 @@ impl OwnerApprovalAction {
                 allowed_protocols,
                 allowed_actions,
                 allowed_targets,
-                allow_raw_execution,
                 max_value_wei,
                 max_execution_fee_usd,
                 token_spend_limits,
@@ -1804,7 +1801,6 @@ impl OwnerApprovalAction {
                 allowed_protocols,
                 allowed_actions,
                 allowed_targets,
-                allow_raw_execution,
                 max_value_wei,
                 max_execution_fee_usd,
                 token_spend_limits,
@@ -1917,14 +1913,11 @@ impl OwnerApprovalAction {
                         );
                     }
                 }
-                let executes = *allow_raw_execution
-                    || allowed_actions.as_ref().is_some_and(|actions| {
-                        actions.iter().any(|action| {
-                            action == "*"
-                                || action == "transaction:execute"
-                                || action == "payment_plan:execute"
-                        })
-                    });
+                let executes = allowed_actions.as_ref().is_some_and(|actions| {
+                    actions
+                        .iter()
+                        .any(|action| action == "*" || action == "payment_plan:execute")
+                });
                 if executes
                     && (max_execution_fee_usd.is_none()
                         || max_rolling_execution_fee_usd.is_none()
@@ -2097,9 +2090,6 @@ pub fn validate_delegated_policy(
     ) {
         anyhow::bail!("child policy exceeds its parent agent policy");
     }
-    if child.allow_raw_execution && !parent.allow_raw_execution {
-        anyhow::bail!("child policy cannot enable raw execution denied by its parent");
-    }
     match (&parent.max_value_wei, &child.max_value_wei) {
         (Some(_), None) => anyhow::bail!("child policy must retain the parent native-value limit"),
         (Some(parent), Some(child))
@@ -2215,7 +2205,6 @@ fn policy_risk_warnings(action: &OwnerApprovalAction) -> Vec<&'static str> {
         allowed_protocols,
         allowed_actions,
         allowed_targets,
-        allow_raw_execution,
         max_value_wei,
         max_execution_fee_usd,
         ..
@@ -2225,7 +2214,6 @@ fn policy_risk_warnings(action: &OwnerApprovalAction) -> Vec<&'static str> {
         allowed_protocols,
         allowed_actions,
         allowed_targets,
-        allow_raw_execution,
         max_value_wei,
         max_execution_fee_usd,
         ..
@@ -2234,9 +2222,6 @@ fn policy_risk_warnings(action: &OwnerApprovalAction) -> Vec<&'static str> {
         return Vec::new();
     };
     let mut warnings = Vec::new();
-    if *allow_raw_execution {
-        warnings.push("Allows raw transaction execution");
-    }
     if allowed_chains.is_none() {
         warnings.push("Does not restrict the allowed chain set");
     }
@@ -2314,7 +2299,6 @@ fn proposed_policy_update(
         allowed_protocols,
         allowed_actions,
         allowed_targets,
-        allow_raw_execution,
         max_value_wei,
         max_execution_fee_usd,
         token_spend_limits,
@@ -2342,7 +2326,6 @@ fn proposed_policy_update(
     proposed.allowed_protocols = allowed_protocols.clone();
     proposed.allowed_actions = allowed_actions.clone();
     proposed.allowed_targets = allowed_targets.clone();
-    proposed.allow_raw_execution = *allow_raw_execution;
     proposed.max_value_wei = max_value_wei.clone();
     proposed.max_execution_fee_usd = *max_execution_fee_usd;
     proposed.token_spend_limits = token_spend_limits.clone();
@@ -2607,8 +2590,8 @@ pub async fn create_owner_approval_request(
     action: &OwnerApprovalAction,
     expires_at: DateTime<Utc>,
 ) -> Result<OwnerApprovalRequestRow> {
-    if context.credential_kind != CredentialKind::OAuthSession || context.agent_id.is_some() {
-        anyhow::bail!("owner approvals require an organization control OAuth session");
+    if context.credential_kind != CredentialKind::OAuthSession {
+        anyhow::bail!("owner approvals require an owner OAuth session");
     }
     if token_hash.len() != 64
         || !token_hash
@@ -2629,7 +2612,7 @@ pub async fn create_owner_approval_request(
             JOIN organizations o ON o.id = c.organization_id
             JOIN owner_accounts oa ON oa.principal_id = c.principal_id
             WHERE c.id = $1 AND c.organization_id = $2 AND c.principal_id = $3
-              AND c.status = 'active' AND c.agent_id IS NULL
+              AND c.status = 'active'
               AND p.status = 'active' AND o.status = 'active'
         )"#,
     )
@@ -2639,7 +2622,7 @@ pub async fn create_owner_approval_request(
     .fetch_one(pool)
     .await?;
     if !active_owner_connection {
-        anyhow::bail!("active owner control connection was not found");
+        anyhow::bail!("active owner connection was not found");
     }
 
     let presentation = match action {
@@ -3181,7 +3164,7 @@ pub async fn complete_owner_approval(
         r#"SELECT EXISTS(
             SELECT 1 FROM oauth_connections
             WHERE id = $1 AND organization_id = $2 AND principal_id = $3
-              AND status = 'active' AND agent_id IS NULL
+              AND status = 'active'
         )"#,
     )
     .bind(row.oauth_connection_id)
@@ -3222,7 +3205,6 @@ pub async fn complete_owner_approval(
             allowed_protocols,
             allowed_actions,
             allowed_targets,
-            allow_raw_execution,
             max_value_wei,
             max_execution_fee_usd,
             token_spend_limits,
@@ -3238,15 +3220,15 @@ pub async fn complete_owner_approval(
             sqlx::query(
                 r#"INSERT INTO authorization_policies (
                     id, organization_id, name, allowed_chains, allowed_protocols,
-                    allowed_actions, allowed_targets, allow_raw_execution,
-                    max_value_wei, max_execution_fee_usd, token_spend_limits,
+                    allowed_actions, allowed_targets, max_value_wei,
+                    max_execution_fee_usd, token_spend_limits,
                     risk_permissions, rolling_window_seconds,
                     max_rolling_execution_fee_usd, max_sponsored_gas_units,
                     max_rolling_sponsored_gas_units, max_borrowed_value_usd,
                     max_rolling_borrowed_value_usd
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13, $14, $15, $16, $17, $18
+                    $11, $12, $13, $14, $15, $16, $17
                 )"#,
             )
             .bind(policy_id)
@@ -3256,7 +3238,6 @@ pub async fn complete_owner_approval(
             .bind(allowed_protocols)
             .bind(allowed_actions)
             .bind(allowed_targets)
-            .bind(allow_raw_execution)
             .bind(max_value_wei)
             .bind(max_execution_fee_usd)
             .bind(token_spend_limits)
@@ -3324,15 +3305,15 @@ pub async fn complete_owner_approval(
                 r#"UPDATE authorization_policies SET
                        name = $4, version = $5, allowed_chains = $6,
                        allowed_protocols = $7, allowed_actions = $8,
-                       allowed_targets = $9, allow_raw_execution = $10,
-                       max_value_wei = $11, max_execution_fee_usd = $12,
-                       token_spend_limits = $13, risk_permissions = $14,
-                       rolling_window_seconds = $15,
-                       max_rolling_execution_fee_usd = $16,
-                       max_sponsored_gas_units = $17,
-                       max_rolling_sponsored_gas_units = $18,
-                       max_borrowed_value_usd = $19,
-                       max_rolling_borrowed_value_usd = $20,
+                       allowed_targets = $9, max_value_wei = $10,
+                       max_execution_fee_usd = $11,
+                       token_spend_limits = $12, risk_permissions = $13,
+                       rolling_window_seconds = $14,
+                       max_rolling_execution_fee_usd = $15,
+                       max_sponsored_gas_units = $16,
+                       max_rolling_sponsored_gas_units = $17,
+                       max_borrowed_value_usd = $18,
+                       max_rolling_borrowed_value_usd = $19,
                        updated_at = now()
                    WHERE id = $1 AND organization_id = $2 AND version = $3
                      AND is_active = TRUE"#,
@@ -3346,7 +3327,6 @@ pub async fn complete_owner_approval(
             .bind(&proposed.allowed_protocols)
             .bind(&proposed.allowed_actions)
             .bind(&proposed.allowed_targets)
-            .bind(proposed.allow_raw_execution)
             .bind(&proposed.max_value_wei)
             .bind(proposed.max_execution_fee_usd)
             .bind(&proposed.token_spend_limits)
@@ -4805,55 +4785,6 @@ pub async fn get_recent_feed_rows(pool: &PgPool, limit: i64) -> Result<Vec<Recen
     Ok(rows)
 }
 
-/// Resolve a locked quote cost from a prior request, scoped to the same
-/// organization and execution payload.
-pub async fn get_locked_quote_cost(
-    pool: &PgPool,
-    organization_id: Uuid,
-    quote_request_id: Uuid,
-    req: &crate::types::ExecutionRequest,
-    smart_wallet_address: &str,
-) -> Result<Option<f64>> {
-    let payload_hash = execution_payload_hash(req)?;
-    let row: Option<(f64,)> = sqlx::query_as(
-        r#"
-        SELECT er.cost_usd
-        FROM execution_requests er
-        WHERE er.id = $1
-          AND er.organization_id = $9
-          AND er.smart_wallet_address = $2
-          AND er.chain = $3
-          AND er.target_contract = $4
-          AND er.calldata = $5
-          AND er.value = $6
-          AND er.agent_id = $7
-          AND er.payload_hash = $8
-          AND er.cost_usd IS NOT NULL
-          AND (
-              er.created_at >= now() - interval '5 minutes'
-              OR EXISTS (
-                  SELECT 1 FROM payments p
-                  WHERE p.request_id = er.id AND p.verified = TRUE
-              )
-          )
-        LIMIT 1
-        "#,
-    )
-    .bind(quote_request_id)
-    .bind(smart_wallet_address)
-    .bind(&req.chain)
-    .bind(&req.target_contract)
-    .bind(&req.calldata)
-    .bind(&req.value)
-    .bind(&req.agent_id)
-    .bind(payload_hash)
-    .bind(organization_id)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(row.map(|r| r.0))
-}
-
 pub async fn update_execution_status(
     pool: &PgPool,
     id: Uuid,
@@ -4902,7 +4833,7 @@ pub struct ArcExecutionFinalization<'a> {
     pub status: &'a ExecutionStatus,
     pub error_message: Option<&'a str>,
     pub gas_used: Option<i64>,
-    pub payment: Option<&'a crate::types::SettledExecutionPayment>,
+    pub payment: Option<&'a crate::types::SettledExecutionFee>,
 }
 
 /// Atomically persist the on-chain transaction, optional managed execution
@@ -4919,7 +4850,7 @@ pub async fn finalize_arc_execution(
         anyhow::bail!("Arc execution finalization requires a confirmed or reverted status");
     }
     if let Some(payment) = finalization.payment {
-        if payment.quote_request_id != Some(finalization.request_id) {
+        if payment.request_id != finalization.request_id {
             anyhow::bail!("execution fee is not attributed to this request");
         }
         if payment.chain != finalization.chain {
@@ -5002,14 +4933,8 @@ pub async fn finalize_arc_execution(
     }
 
     if let Some(payment) = finalization.payment {
-        let amount_raw = payment
-            .confirmed_amount_raw
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("verified payment is missing amount_raw"))?;
-        let token_contract = payment
-            .token_contract
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("verified payment is missing token_contract"))?;
+        let amount_raw = &payment.amount_raw;
+        let token_contract = &payment.token_contract;
         let inserted_payment = sqlx::query_as::<_, PaymentRow>(
             r#"
             INSERT INTO payments (
@@ -5020,7 +4945,7 @@ pub async fn finalize_arc_execution(
             RETURNING *
             "#,
         )
-        .bind(payment.payment_id)
+        .bind(payment.fee_id)
         .bind(finalization.request_id)
         .bind(&payment.payer)
         .bind(payment.amount_usd)
@@ -5043,7 +4968,7 @@ pub async fn finalize_arc_execution(
                 || !existing
                     .payment_tx_hash
                     .eq_ignore_ascii_case(&payment.tx_hash)
-                || existing.amount_raw != amount_raw
+                || existing.amount_raw != *amount_raw
                 || !existing.payer.eq_ignore_ascii_case(&payment.payer)
                 || existing.token != payment.token
                 || !existing.token_contract.eq_ignore_ascii_case(token_contract)
@@ -5092,80 +5017,6 @@ pub async fn fail_arc_execution_status(pool: &PgPool, id: Uuid, reason: &str) ->
     Ok(updated.rows_affected() == 1)
 }
 
-// ──────────────────────── Payments ───────────────────────────────────
-
-/// Atomically insert a payment record.
-///
-/// Uses `ON CONFLICT (payment_tx_hash) DO NOTHING` so that if two concurrent
-/// requests race with the same tx_hash, exactly one succeeds and the other
-/// gets `None` back — eliminating the TOCTOU window.
-pub async fn insert_payment(
-    pool: &PgPool,
-    request_id: Uuid,
-    payment: &crate::types::SettledExecutionPayment,
-) -> Result<Option<PaymentRow>> {
-    let row = sqlx::query_as::<_, PaymentRow>(
-        r#"
-        INSERT INTO payments
-            (id, request_id, payer, amount_usd, amount_raw, token, token_contract,
-             payment_chain, payment_tx_hash, verified, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        ON CONFLICT (payment_tx_hash) DO NOTHING
-        RETURNING *
-        "#,
-    )
-    .bind(payment.payment_id)
-    .bind(request_id)
-    .bind(&payment.payer)
-    .bind(payment.amount_usd)
-    .bind(
-        payment
-            .confirmed_amount_raw
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("verified payment is missing amount_raw"))?,
-    )
-    .bind(&payment.token)
-    .bind(
-        payment
-            .token_contract
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("verified payment is missing token_contract"))?,
-    )
-    .bind(&payment.chain)
-    .bind(&payment.tx_hash)
-    .bind(true)
-    .bind(Utc::now())
-    .fetch_optional(pool)
-    .await?;
-    Ok(row)
-}
-
-pub async fn has_verified_payment(pool: &PgPool, request_id: Uuid) -> Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM payments WHERE request_id = $1 AND verified = TRUE)",
-    )
-    .bind(request_id)
-    .fetch_one(pool)
-    .await?)
-}
-
-pub async fn get_verified_payment_for_request(
-    pool: &PgPool,
-    request_id: Uuid,
-) -> Result<Option<PaymentRow>> {
-    Ok(sqlx::query_as::<_, PaymentRow>(
-        r#"
-        SELECT * FROM payments
-        WHERE request_id = $1 AND verified = TRUE
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(request_id)
-    .fetch_optional(pool)
-    .await?)
-}
-
 /// Resolve the organization-owned webhook signing secret.
 pub async fn get_webhook_secret_by_organization(
     pool: &PgPool,
@@ -5207,11 +5058,10 @@ pub async fn rotate_webhook_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ExecutionRequest, SettledExecutionPayment};
+    use crate::types::{ExecutionRequest, SettledExecutionFee};
 
     fn test_policy(
         allowed_actions: Option<Vec<String>>,
-        allow_raw_execution: bool,
         max_value_wei: Option<&str>,
         max_execution_fee_usd: Option<f64>,
     ) -> AuthorizationPolicyRow {
@@ -5224,7 +5074,6 @@ mod tests {
             allowed_protocols: None,
             allowed_actions,
             allowed_targets: Some(vec!["0x0000000000000000000000000000000000000001".into()]),
-            allow_raw_execution,
             max_value_wei: max_value_wei.map(str::to_string),
             max_execution_fee_usd,
             token_spend_limits: crate::policy::default_token_spend_limits(),
@@ -5250,7 +5099,6 @@ mod tests {
             allowed_protocols: policy.allowed_protocols.clone(),
             allowed_actions: policy.allowed_actions.clone(),
             allowed_targets: policy.allowed_targets.clone(),
-            allow_raw_execution: policy.allow_raw_execution,
             max_value_wei: policy.max_value_wei.clone(),
             max_execution_fee_usd: policy.max_execution_fee_usd,
             token_spend_limits: policy.token_spend_limits.clone(),
@@ -5272,7 +5120,6 @@ mod tests {
             allowed_protocols: None,
             allowed_actions: Some(vec!["payment_plan:execute".into()]),
             allowed_targets: Some(vec![crate::policy::ARC_USDC_ADDRESS.into()]),
-            allow_raw_execution: false,
             max_value_wei: Some("0".into()),
             max_execution_fee_usd: Some(1.0),
             token_spend_limits: crate::policy::default_token_spend_limits(),
@@ -5292,7 +5139,6 @@ mod tests {
             allowed_protocols: None,
             allowed_actions: None,
             allowed_targets: None,
-            allow_raw_execution: false,
             max_value_wei: None,
             max_execution_fee_usd: None,
             token_spend_limits: serde_json::json!([]),
@@ -5312,7 +5158,6 @@ mod tests {
             allowed_protocols: None,
             allowed_actions: None,
             allowed_targets: None,
-            allow_raw_execution: false,
             max_value_wei: Some("0".into()),
             max_execution_fee_usd: None,
             token_spend_limits: serde_json::json!([]),
@@ -5331,25 +5176,15 @@ mod tests {
     fn delegated_policies_cannot_expand_parent_authority() {
         let parent = test_policy(
             Some(vec!["wallet:read".into(), "payment_plan:execute".into()]),
-            false,
             Some("100"),
             Some(1.0),
         );
-        let child = test_policy(
-            Some(vec!["wallet:read".into()]),
-            false,
-            Some("50"),
-            Some(0.5),
-        );
+        let child = test_policy(Some(vec!["wallet:read".into()]), Some("50"), Some(0.5));
         assert!(validate_delegated_policy(&parent, &child).is_ok());
 
         let mut wildcard = child.clone();
         wildcard.allowed_actions = Some(vec!["*".into()]);
         assert!(validate_delegated_policy(&parent, &wildcard).is_err());
-
-        let mut raw = child.clone();
-        raw.allow_raw_execution = true;
-        assert!(validate_delegated_policy(&parent, &raw).is_err());
 
         let mut unlimited = child.clone();
         unlimited.max_value_wei = None;
@@ -5423,6 +5258,13 @@ mod tests {
             &format!("approval-agent-{}", Uuid::new_v4().simple()),
         )
         .await;
+        let agent = sqlx::query_as::<_, AgentRow>(
+            "SELECT * FROM agents WHERE organization_id = $1 ORDER BY created_at LIMIT 1",
+        )
+        .bind(base.organization_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let passkey_id = Uuid::new_v4();
         let oauth_connection_id = Uuid::new_v4();
         let client_id = format!("approval-client-{}", Uuid::new_v4().simple());
@@ -5461,13 +5303,18 @@ mod tests {
         sqlx::query(
             r#"INSERT INTO oauth_connections (
                 id, organization_id, principal_id, passkey_id,
-                client_id, resource, scopes
-            ) VALUES ($1, $2, $3, $4, $5, 'https://api.example/mcp/control', ARRAY['policy:manage'])"#,
+                agent_id, agent_external_id, client_id, resource, scopes
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                'https://api.example/mcp/agent', ARRAY['policy:manage']
+            )"#,
         )
         .bind(oauth_connection_id)
         .bind(base.organization_id)
         .bind(base.principal_id)
         .bind(passkey_id)
+        .bind(agent.id)
+        .bind(&agent.external_id)
         .bind(client_id)
         .execute(&pool)
         .await
@@ -5475,8 +5322,8 @@ mod tests {
         let context = AuthContext {
             credential_id: oauth_connection_id,
             credential_kind: CredentialKind::OAuthSession,
-            agent_id: None,
-            agent_external_id: None,
+            agent_id: Some(agent.id),
+            agent_external_id: Some(agent.external_id),
             instance_id: None,
             dpop_jkt: None,
             scopes: ["policy:manage".to_string()].into_iter().collect(),
@@ -5489,7 +5336,6 @@ mod tests {
             allowed_protocols: None,
             allowed_actions: Some(vec!["payment_plan:execute".into()]),
             allowed_targets: None,
-            allow_raw_execution: false,
             max_value_wei: Some("0".into()),
             max_execution_fee_usd: Some(1.0),
             token_spend_limits: crate::policy::default_token_spend_limits(),
@@ -5617,9 +5463,9 @@ mod tests {
         sqlx::query(
             r#"INSERT INTO oauth_connections (
                 id, organization_id, principal_id, passkey_id,
-                client_id, resource, scopes
+                agent_id, agent_external_id, client_id, resource, scopes
             ) VALUES (
-                $1, $2, $3, $4, $5, 'https://api.example/mcp/control',
+                $1, $2, $3, $4, $5, $6, $7, 'https://api.example/mcp/agent',
                 ARRAY['agent:manage', 'policy:manage', 'credential:manage']
             )"#,
         )
@@ -5627,6 +5473,8 @@ mod tests {
         .bind(base.organization_id)
         .bind(base.principal_id)
         .bind(passkey_id)
+        .bind(root_agent.id)
+        .bind(&root_agent.external_id)
         .bind(client_id)
         .execute(pool)
         .await
@@ -5635,8 +5483,6 @@ mod tests {
             context: AuthContext {
                 credential_id: oauth_connection_id,
                 credential_kind: CredentialKind::OAuthSession,
-                agent_id: None,
-                agent_external_id: None,
                 instance_id: None,
                 dpop_jkt: None,
                 scopes: [
@@ -5837,7 +5683,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(connection_status, "revoked");
+        assert_eq!(connection_status, "active");
         let audit_count: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM auth_audit_events
                WHERE organization_id = $1
@@ -5911,11 +5757,11 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let target_control_connection = Uuid::new_v4();
+        let target_owner_connection = Uuid::new_v4();
         let target_agent_connection = Uuid::new_v4();
         let survivor_agent_connection = Uuid::new_v4();
         for (id, passkey_id, agent_bound) in [
-            (target_control_connection, first_recovery_id, false),
+            (target_owner_connection, first_recovery_id, true),
             (target_agent_connection, first_recovery_id, true),
             (survivor_agent_connection, fixture.passkey_id, true),
         ] {
@@ -5932,11 +5778,7 @@ mod tests {
             .bind(agent_bound.then_some(fixture.root_agent.id))
             .bind(agent_bound.then_some(fixture.root_agent.external_id.as_str()))
             .bind(&client_id)
-            .bind(if agent_bound {
-                "https://api.example/mcp/agent"
-            } else {
-                "https://api.example/mcp/control"
-            })
+            .bind("https://api.example/mcp/agent")
             .execute(&pool)
             .await
             .unwrap();
@@ -5964,7 +5806,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result["revoked"], true);
-        assert_eq!(result["revoked_connections"], 3);
+        assert_eq!(result["revoked_connections"], 2);
 
         let target_status: (String, Option<Uuid>) = sqlx::query_as(
             "SELECT status, revoked_by_passkey_id FROM owner_passkeys WHERE id = $1",
@@ -5980,7 +5822,7 @@ mod tests {
         )
         .bind(vec![
             fixture.context.credential_id,
-            target_control_connection,
+            target_owner_connection,
             target_agent_connection,
             survivor_agent_connection,
         ])
@@ -5988,7 +5830,8 @@ mod tests {
         .await
         .unwrap();
         for (id, status) in connection_states {
-            let expected = if id == survivor_agent_connection {
+            let expected = if id == survivor_agent_connection || id == fixture.context.credential_id
+            {
                 "active"
             } else {
                 "revoked"
@@ -6108,10 +5951,7 @@ mod tests {
     async fn approved_agent_lifecycle_is_one_time_contained_and_secret_safe() {
         let pool = setup_pool().await;
         let fixture = create_owner_control_fixture(&pool).await;
-        let runtime_scopes = vec![
-            "wallet:read".to_string(),
-            "transaction:simulate".to_string(),
-        ];
+        let runtime_scopes = vec!["wallet:read".to_string(), "workflow:read".to_string()];
         let child_external_id = format!("child-{}", Uuid::new_v4().simple());
         let child_enrollment_token = format!("jso_enroll_{}", random_secret());
         let create_child = OwnerApprovalAction::CreateAgent {
@@ -6284,7 +6124,6 @@ mod tests {
                 allowed_protocols: Some(vec![]),
                 allowed_actions: Some(vec!["wallet:read".into()]),
                 allowed_targets: Some(vec!["0x0000000000000000000000000000000000000001".into()]),
-                allow_raw_execution: false,
                 max_value_wei: Some("0".into()),
                 max_execution_fee_usd: Some(0.5),
                 token_spend_limits: serde_json::json!([]),
@@ -6636,8 +6475,8 @@ mod tests {
 
         let request = sample_request("idempotent");
         let atomic = idempotency_fingerprint(&request, "execute:atomic-token").unwrap();
-        let x402 = idempotency_fingerprint(&request, "execute:x402").unwrap();
-        assert_ne!(atomic, x402);
+        let different_operation = idempotency_fingerprint(&request, "execute:other").unwrap();
+        assert_ne!(atomic, different_operation);
 
         let mut callback_changed = request;
         callback_changed.callback_url = Some("https://example.com/callback".into());
@@ -6702,48 +6541,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_db_payment_replay_protection() {
-        let pool = setup_pool().await;
-        let req = sample_request(&format!("replay-{}", Uuid::new_v4().simple()));
-        let context = create_test_auth_context(&pool, &req.agent_id).await;
-        let row = insert_execution_request(
-            &pool,
-            &context,
-            &req,
-            &ExecutionStatus::PaymentRequired,
-            None,
-            None,
-        )
-        .await
-        .expect("insert request");
-
-        let tx_hash = format!(
-            "0x{}",
-            hex::encode(uuid::Uuid::new_v4().as_bytes().repeat(2))
-        );
-        let payment = SettledExecutionPayment {
-            payment_id: uuid::Uuid::new_v4(),
-            quote_request_id: None,
-            payer: "0x0000000000000000000000000000000000000001".into(),
-            amount_usd: 0.05,
-            token: "USDC".into(),
-            chain: "ethereum".into(),
-            tx_hash: tx_hash.clone(),
-            confirmed_amount_raw: Some("50000".into()),
-            token_contract: Some("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238".into()),
-        };
-
-        assert!(insert_payment(&pool, row.id, &payment)
-            .await
-            .expect("insert payment")
-            .is_some());
-        assert!(insert_payment(&pool, row.id, &payment)
-            .await
-            .expect("insert replay")
-            .is_none());
-    }
-
-    #[tokio::test]
     async fn self_service_registration_is_relational_and_restrictive() {
         let pool = setup_pool().await;
         let external_id = format!("owner-agent-{}", Uuid::new_v4().simple());
@@ -6787,7 +6584,6 @@ mod tests {
             registration.policy.allowed_protocols,
             Some(policy_protocols)
         );
-        assert!(!registration.policy.allow_raw_execution);
         assert_eq!(registration.policy.max_value_wei.as_deref(), Some("0"));
         assert_eq!(
             registration.policy.max_execution_fee_usd,
@@ -7070,16 +6866,16 @@ mod tests {
         .await
         .unwrap();
         let hash = format!("0x{}", hex::encode(Uuid::new_v4().as_bytes().repeat(2)));
-        let payment = SettledExecutionPayment {
-            payment_id: Uuid::new_v4(),
-            quote_request_id: Some(row.id),
+        let payment = SettledExecutionFee {
+            fee_id: Uuid::new_v4(),
+            request_id: row.id,
             payer: "0x1234567890abcdef1234567890abcdef12345678".into(),
             amount_usd: 0.01,
             token: "USDC".into(),
             chain: "arc-testnet".into(),
             tx_hash: hash.clone(),
-            confirmed_amount_raw: Some("10000".into()),
-            token_contract: Some("0x3600000000000000000000000000000000000000".into()),
+            amount_raw: "10000".into(),
+            token_contract: "0x3600000000000000000000000000000000000000".into(),
         };
 
         assert!(update_execution_status(
@@ -7144,28 +6940,42 @@ mod tests {
             &pool,
             &first_context,
             &first_req,
-            &ExecutionStatus::PaymentRequired,
+            &ExecutionStatus::Pending,
             None,
             None,
         )
         .await
         .unwrap();
         let hash = format!("0x{}", hex::encode(Uuid::new_v4().as_bytes().repeat(2)));
-        let existing_payment = SettledExecutionPayment {
-            payment_id: Uuid::new_v4(),
-            quote_request_id: Some(first_row.id),
+        let existing_payment = SettledExecutionFee {
+            fee_id: Uuid::new_v4(),
+            request_id: first_row.id,
             payer: "0x0000000000000000000000000000000000000001".into(),
             amount_usd: 0.01,
             token: "USDC".into(),
             chain: "arc-testnet".into(),
             tx_hash: hash.clone(),
-            confirmed_amount_raw: Some("10000".into()),
-            token_contract: Some("0x3600000000000000000000000000000000000000".into()),
+            amount_raw: "10000".into(),
+            token_contract: "0x3600000000000000000000000000000000000000".into(),
         };
-        insert_payment(&pool, first_row.id, &existing_payment)
-            .await
-            .unwrap()
-            .expect("seed conflicting payment");
+        finalize_arc_execution(
+            &pool,
+            ArcExecutionFinalization {
+                request_id: first_row.id,
+                chain: "arc-testnet",
+                tx_hash: &hash,
+                from_address: "0x0000000000000000000000000000000000000001",
+                to_address: &first_req.target_contract,
+                status: &ExecutionStatus::Confirmed,
+                error_message: None,
+                gas_used: Some(125_000),
+                payment: Some(&existing_payment),
+            },
+        )
+        .await
+        .unwrap()
+        .then_some(())
+        .expect("seed conflicting payment");
 
         let req = sample_request(&format!("rollback-{}", Uuid::new_v4().simple()));
         let context = create_test_auth_context(&pool, &req.agent_id).await;
@@ -7179,9 +6989,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let conflicting_payment = SettledExecutionPayment {
-            payment_id: Uuid::new_v4(),
-            quote_request_id: Some(row.id),
+        let conflicting_payment = SettledExecutionFee {
+            fee_id: Uuid::new_v4(),
+            request_id: row.id,
             ..existing_payment
         };
         let result = finalize_arc_execution(

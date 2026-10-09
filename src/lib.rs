@@ -13,7 +13,6 @@ pub mod db;
 pub mod execution_engine;
 pub mod funding;
 pub mod mcp;
-pub mod payments;
 pub mod policy;
 pub mod queue;
 pub mod rate_limit;

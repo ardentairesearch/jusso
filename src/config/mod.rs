@@ -52,9 +52,7 @@ pub struct AppConfig {
     pub gas_markup_basis_points: u32,
     pub platform_fee_usdc_raw: U256,
     pub receipt_timeout_seconds: u64,
-    pub x402_facilitator_url: Option<String>,
     pub public_api_base_url: String,
-    pub x402_max_timeout_seconds: u64,
     pub turnkey_organization_id: String,
     pub turnkey_api_public_key: String,
     pub turnkey_api_private_key: String,
@@ -178,9 +176,8 @@ impl AppConfig {
         let public_api_base_url = env_or("PUBLIC_API_BASE_URL", "http://localhost:8080")
             .trim_end_matches('/')
             .to_string();
-        let x402_facilitator_url = optional_env("X402_FACILITATOR_URL");
-        if x402_facilitator_url.is_some() && !is_https_or_localhost(&public_api_base_url) {
-            bail!("PUBLIC_API_BASE_URL must use HTTPS when x402 is enabled");
+        if !is_https_or_localhost(&public_api_base_url) {
+            bail!("PUBLIC_API_BASE_URL must use HTTPS outside local development");
         }
         let arc_network: ArcNetwork = env_or("ARC_NETWORK", "arc-testnet").parse()?;
         if arc_network == ArcNetwork::Mainnet && !parse_bool_env("ARC_ENABLE_MAINNET", false)? {
@@ -382,9 +379,7 @@ impl AppConfig {
             gas_markup_basis_points,
             platform_fee_usdc_raw,
             receipt_timeout_seconds: parse_positive_u64_env("ARC_RECEIPT_TIMEOUT_SECONDS", "180")?,
-            x402_facilitator_url,
             public_api_base_url: public_api_base_url.clone(),
-            x402_max_timeout_seconds: parse_positive_u64_env("X402_MAX_TIMEOUT_SECONDS", "60")?,
             turnkey_organization_id: required_env("TURNKEY_ORGANIZATION_ID")?,
             turnkey_api_public_key: required_env("TURNKEY_API_PUBLIC_KEY")?,
             turnkey_api_private_key: required_env("TURNKEY_API_PRIVATE_KEY")?,

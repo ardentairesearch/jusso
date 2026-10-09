@@ -84,18 +84,15 @@ pub async fn handle_execute_idempotent(
     req: &ExecutionRequest,
     idempotency_key: &str,
 ) -> Result<ExecutionResponse> {
-    let result = handle_execution(
-        ExecutionContext {
-            engine,
-            pool,
-            redis_conn,
-            wallet_registry,
-            auth_context,
-            req,
-            idempotency_key,
-        },
-        ExecutionPayment::AtomicExecutionToken,
-    )
+    let result = handle_execution(ExecutionContext {
+        engine,
+        pool,
+        redis_conn,
+        wallet_registry,
+        auth_context,
+        req,
+        idempotency_key,
+    })
     .await;
     record_unfinished_failure(
         pool,
@@ -103,92 +100,6 @@ pub async fn handle_execute_idempotent(
         req,
         "execute:atomic-token",
         idempotency_key,
-        &result,
-    )
-    .await;
-    result
-}
-
-/// Create the locked quote used by the x402 challenge response.
-pub async fn handle_x402_quote(
-    engine: &ExecutionEngine,
-    pool: &PgPool,
-    redis_conn: &mut ConnectionManager,
-    wallet_registry: &AgentWalletRegistry,
-    auth_context: &AuthContext,
-    req: &ExecutionRequest,
-    idempotency_key: &str,
-) -> Result<ExecutionResponse> {
-    let result = handle_execution(
-        ExecutionContext {
-            engine,
-            pool,
-            redis_conn,
-            wallet_registry,
-            auth_context,
-            req,
-            idempotency_key,
-        },
-        ExecutionPayment::X402Quote,
-    )
-    .await;
-    record_unfinished_failure(
-        pool,
-        auth_context,
-        req,
-        "execute:x402",
-        idempotency_key,
-        &result,
-    )
-    .await;
-    result
-}
-
-/// Re-simulate the requested calls immediately before x402 settlement without
-/// adding the normal in-batch fee transfer.
-pub async fn handle_x402_preflight(
-    engine: &ExecutionEngine,
-    wallet_registry: &AgentWalletRegistry,
-    auth_context: &AuthContext,
-    req: &ExecutionRequest,
-) -> Result<SimulationResult> {
-    let chain = engine.validate(req)?;
-    let wallet = wallet_registry
-        .get_or_create(auth_context.organization_id, &req.agent_id)
-        .await?;
-    let smart_wallet = resolve_chain_smart_wallet_address(engine, &chain, &wallet).await?;
-    simulate_arc_request(engine, req, &chain, smart_wallet, None, Uuid::new_v4()).await
-}
-
-/// Queue an execution after an x402 facilitator has settled its token payment.
-pub async fn handle_x402_execute(
-    engine: &ExecutionEngine,
-    pool: &PgPool,
-    redis_conn: &mut ConnectionManager,
-    wallet_registry: &AgentWalletRegistry,
-    auth_context: &AuthContext,
-    req: &ExecutionRequest,
-    settlement: X402Settlement<'_>,
-) -> Result<ExecutionResponse> {
-    let result = handle_execution(
-        ExecutionContext {
-            engine,
-            pool,
-            redis_conn,
-            wallet_registry,
-            auth_context,
-            req,
-            idempotency_key: settlement.idempotency_key,
-        },
-        ExecutionPayment::X402Settled(settlement.payment),
-    )
-    .await;
-    record_unfinished_failure(
-        pool,
-        auth_context,
-        req,
-        "execute:x402",
-        settlement.idempotency_key,
         &result,
     )
     .await;
@@ -252,17 +163,6 @@ async fn record_policy_denial(
     .ok();
 }
 
-enum ExecutionPayment<'a> {
-    AtomicExecutionToken,
-    X402Quote,
-    X402Settled(&'a SettledExecutionPayment),
-}
-
-pub struct X402Settlement<'a> {
-    pub payment: &'a SettledExecutionPayment,
-    pub idempotency_key: &'a str,
-}
-
 struct ExecutionContext<'a> {
     engine: &'a ExecutionEngine,
     pool: &'a PgPool,
@@ -273,10 +173,7 @@ struct ExecutionContext<'a> {
     idempotency_key: &'a str,
 }
 
-async fn handle_execution(
-    context: ExecutionContext<'_>,
-    payment: ExecutionPayment<'_>,
-) -> Result<ExecutionResponse> {
+async fn handle_execution(context: ExecutionContext<'_>) -> Result<ExecutionResponse> {
     let ExecutionContext {
         engine,
         pool,
@@ -315,104 +212,21 @@ async fn handle_execution(
     let smart_wallet_str = format!("{smart_wallet_address:?}");
     // Reserve the logical execution before any simulation, settlement, or
     // queue side effect. The database unique index is the concurrency lock.
-    let operation = match payment {
-        ExecutionPayment::AtomicExecutionToken => "execute:atomic-token",
-        ExecutionPayment::X402Quote | ExecutionPayment::X402Settled(_) => "execute:x402",
-    };
-    let request_id = match payment {
-        ExecutionPayment::X402Settled(settled) => {
-            let quote_request_id = settled.quote_request_id.ok_or_else(|| {
-                anyhow::anyhow!("x402 settlement is missing its quote_request_id")
-            })?;
-            let existing = db::get_idempotent_execution_request(
-                pool,
-                auth_context,
-                req,
-                operation,
-                idempotency_key,
-            )
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("x402 quote Idempotency-Key was not found"))?;
-            if existing.id != quote_request_id {
-                anyhow::bail!("x402 quote does not match Idempotency-Key");
-            }
-            quote_request_id
-        }
-        _ => {
-            let (row, inserted) = db::reserve_execution_request(
-                pool,
-                auth_context,
-                req,
-                operation,
-                idempotency_key,
-                &smart_wallet_str,
-                callback_url.as_deref(),
-            )
-            .await?;
-            if !inserted {
-                return existing_execution_response(row, &execution_token);
-            }
-            row.id
-        }
-    };
-    if matches!(payment, ExecutionPayment::X402Settled(_)) {
-        let existing = db::get_execution_request_for_organization(
-            pool,
-            request_id,
-            auth_context.organization_id,
-        )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("x402 quote request no longer exists"))?;
-        let existing_status = match existing.status.as_str() {
-            "queued" => Some(ExecutionStatus::Queued),
-            "broadcasting" => Some(ExecutionStatus::Broadcasting),
-            "confirmed" => Some(ExecutionStatus::Confirmed),
-            "reverted" => Some(ExecutionStatus::Reverted),
-            _ => None,
-        };
-        if let Some(status) = existing_status {
-            return Ok(ExecutionResponse {
-                request_id,
-                status,
-                smart_wallet_address: existing.smart_wallet_address,
-                estimated_gas: existing.gas_estimate.map(|value| value as u64),
-                estimated_cost_usd: existing.cost_usd,
-                execution_fee_token: Some(execution_token.symbol.clone()),
-                execution_fee_raw: existing
-                    .cost_usd
-                    .map(|cost| usd_to_token_raw_amount(cost, execution_token.decimals))
-                    .transpose()?
-                    .map(|amount| amount.to_string()),
-                tx_hash: existing.tx_hash,
-                message: "x402 execution already accepted".into(),
-            });
-        }
+    let operation = "execute:atomic-token";
+    let (row, inserted) = db::reserve_execution_request(
+        pool,
+        auth_context,
+        req,
+        operation,
+        idempotency_key,
+        &smart_wallet_str,
+        callback_url.as_deref(),
+    )
+    .await?;
+    if !inserted {
+        return existing_execution_response(row, &execution_token);
     }
-    let settled_x402_cost = if let ExecutionPayment::X402Settled(settled) = payment {
-        let locked = db::get_locked_quote_cost(
-            pool,
-            auth_context.organization_id,
-            request_id,
-            req,
-            &smart_wallet_str,
-        )
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("invalid, expired, or mismatched x402 quote"))?;
-        validate_and_record_x402_payment(engine, pool, request_id, &chain, locked, settled).await?;
-        db::update_execution_status(
-            pool,
-            request_id,
-            &ExecutionStatus::PaymentVerified,
-            None,
-            Some(&format!("x402 {} payment settled", execution_token.symbol)),
-            None,
-            Some(locked),
-        )
-        .await?;
-        Some(locked)
-    } else {
-        None
-    };
+    let request_id = row.id;
 
     // 4. Simulate (using smart wallet as `from`)
     let sim =
@@ -445,126 +259,90 @@ async fn handle_execution(
     let quoted_cost = engine
         .estimate_arc_cost(&chain, sim.gas_estimate, simulation_fee_cap(&sim)?, true)
         .await?;
-    let mut queued_req = req.clone();
-    let mut final_sim = sim.clone();
-    let mut atomic_execution_fee = None;
-    let payable_cost = match payment {
-        ExecutionPayment::X402Quote => {
-            db::update_execution_status(
-                pool,
-                request_id,
-                &ExecutionStatus::PaymentRequired,
-                None,
-                Some("x402 payment required"),
-                Some(sim.gas_estimate as i64),
-                Some(quoted_cost),
-            )
-            .await?;
-            return Ok(ExecutionResponse {
-                request_id,
-                status: ExecutionStatus::PaymentRequired,
-                smart_wallet_address: Some(smart_wallet_str),
-                estimated_gas: Some(sim.gas_estimate),
-                estimated_cost_usd: Some(quoted_cost),
-                execution_fee_token: Some(execution_token.symbol.clone()),
-                execution_fee_raw: Some(
-                    usd_to_token_raw_amount(quoted_cost, execution_token.decimals)?.to_string(),
-                ),
-                tx_hash: None,
-                message: "x402 payment required".into(),
-            });
-        }
-        ExecutionPayment::X402Settled(settled) => {
-            let _ = settled;
-            settled_x402_cost.expect("x402 settlement was validated before simulation")
-        }
-        ExecutionPayment::AtomicExecutionToken => {
-            let prepared = match prepare_atomic_fee_execution(
-                engine,
-                &chain,
-                req,
-                smart_wallet_address,
-                request_id,
-                quoted_cost,
-            )
-            .await
-            {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    let message = error.to_string();
-                    db::update_execution_status(
-                        pool,
-                        request_id,
-                        &ExecutionStatus::Failed,
-                        None,
-                        Some(&message),
-                        Some(sim.gas_estimate as i64),
-                        Some(quoted_cost),
-                    )
-                    .await?;
-                    return Ok(ExecutionResponse {
-                        request_id,
-                        status: ExecutionStatus::Failed,
-                        smart_wallet_address: Some(smart_wallet_str.clone()),
-                        estimated_gas: Some(sim.gas_estimate),
-                        estimated_cost_usd: Some(quoted_cost),
-                        execution_fee_token: None,
-                        execution_fee_raw: None,
-                        tx_hash: None,
-                        message,
-                    });
-                }
-            };
-
-            if !prepared.simulation.success {
-                let reason = prepared
-                    .simulation
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "atomic execution-fee simulation failed".to_string());
+    let (queued_req, final_sim, atomic_execution_fee) = {
+        let prepared = match prepare_atomic_fee_execution(
+            engine,
+            &chain,
+            req,
+            smart_wallet_address,
+            request_id,
+            quoted_cost,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let message = error.to_string();
                 db::update_execution_status(
                     pool,
                     request_id,
                     &ExecutionStatus::Failed,
                     None,
-                    Some(&reason),
-                    None,
-                    None,
+                    Some(&message),
+                    Some(sim.gas_estimate as i64),
+                    Some(quoted_cost),
                 )
                 .await?;
                 return Ok(ExecutionResponse {
                     request_id,
                     status: ExecutionStatus::Failed,
                     smart_wallet_address: Some(smart_wallet_str.clone()),
-                    estimated_gas: None,
-                    estimated_cost_usd: Some(prepared.fee.amount_usd),
-                    execution_fee_token: Some(prepared.fee.token_symbol),
-                    execution_fee_raw: Some(prepared.fee.amount_raw),
+                    estimated_gas: Some(sim.gas_estimate),
+                    estimated_cost_usd: Some(quoted_cost),
+                    execution_fee_token: None,
+                    execution_fee_raw: None,
                     tx_hash: None,
-                    message: reason,
+                    message,
                 });
             }
+        };
 
-            final_sim = prepared.simulation;
-            queued_req = prepared.request;
-            let payable_cost = prepared.fee.amount_usd;
-            atomic_execution_fee = Some(prepared.fee);
+        if !prepared.simulation.success {
+            let reason = prepared
+                .simulation
+                .error
+                .clone()
+                .unwrap_or_else(|| "atomic execution-fee simulation failed".to_string());
             db::update_execution_status(
                 pool,
                 request_id,
-                &ExecutionStatus::PaymentVerified,
+                &ExecutionStatus::Failed,
                 None,
-                Some(&format!(
-                    "{} execution fee included in the sponsored atomic UserOperation",
-                    execution_token.symbol
-                )),
-                Some(final_sim.gas_estimate as i64),
-                Some(payable_cost),
+                Some(&reason),
+                None,
+                None,
             )
             .await?;
-            payable_cost
+            return Ok(ExecutionResponse {
+                request_id,
+                status: ExecutionStatus::Failed,
+                smart_wallet_address: Some(smart_wallet_str.clone()),
+                estimated_gas: None,
+                estimated_cost_usd: Some(prepared.fee.amount_usd),
+                execution_fee_token: Some(prepared.fee.token_symbol),
+                execution_fee_raw: Some(prepared.fee.amount_raw),
+                tx_hash: None,
+                message: reason,
+            });
         }
+
+        let payable_cost = prepared.fee.amount_usd;
+        db::update_execution_status(
+            pool,
+            request_id,
+            &ExecutionStatus::PaymentVerified,
+            None,
+            Some(&format!(
+                "{} execution fee included in the sponsored atomic UserOperation",
+                execution_token.symbol
+            )),
+            Some(prepared.simulation.gas_estimate as i64),
+            Some(payable_cost),
+        )
+        .await?;
+        (prepared.request, prepared.simulation, prepared.fee)
     };
+    let payable_cost = atomic_execution_fee.amount_usd;
 
     db::enforce_execution_fee_policy(pool, request_id, payable_cost).await?;
     if let Err(error) =
@@ -581,14 +359,13 @@ async fn handle_execution(
         .await;
         return Err(error);
     }
-    let permit_fee_raw = atomic_execution_fee
-        .as_ref()
-        .map(|fee| fee.amount_raw.as_str())
-        .or(match payment {
-            ExecutionPayment::X402Settled(settled) => settled.confirmed_amount_raw.as_deref(),
-            _ => None,
-        });
-    let permit = db::issue_execution_permit(pool, request_id, permit_fee_raw, 300).await?;
+    let permit = db::issue_execution_permit(
+        pool,
+        request_id,
+        Some(atomic_execution_fee.amount_raw.as_str()),
+        300,
+    )
+    .await?;
 
     // Enqueue the immutable action and fee terms for ERC-4337 signing.
     let job = ExecutionJob {
@@ -605,7 +382,7 @@ async fn handle_execution(
         attempt_count: 0,
         batch_calls: queued_req.batch_calls.clone(),
         callback_url,
-        execution_fee: atomic_execution_fee.clone(),
+        execution_fee: Some(atomic_execution_fee.clone()),
     };
     queue::enqueue_job(redis_conn, &job).await?;
 
@@ -639,12 +416,8 @@ async fn handle_execution(
         smart_wallet_address: Some(smart_wallet_str),
         estimated_gas: Some(final_sim.gas_estimate),
         estimated_cost_usd: Some(payable_cost),
-        execution_fee_token: atomic_execution_fee
-            .as_ref()
-            .map(|fee| fee.token_symbol.clone()),
-        execution_fee_raw: atomic_execution_fee
-            .as_ref()
-            .map(|fee| fee.amount_raw.clone()),
+        execution_fee_token: Some(atomic_execution_fee.token_symbol),
+        execution_fee_raw: Some(atomic_execution_fee.amount_raw),
         tx_hash: None,
         message,
     })
@@ -678,7 +451,6 @@ fn existing_execution_response(
 fn parse_execution_status(status: &str) -> Result<ExecutionStatus> {
     Ok(match status {
         "pending" => ExecutionStatus::Pending,
-        "payment_required" => ExecutionStatus::PaymentRequired,
         "payment_verified" => ExecutionStatus::PaymentVerified,
         "queued" => ExecutionStatus::Queued,
         "broadcasting" => ExecutionStatus::Broadcasting,
@@ -952,75 +724,6 @@ pub async fn arc_fee_recipient_status(engine: &ExecutionEngine) -> Result<serde_
     }))
 }
 
-async fn validate_and_record_x402_payment(
-    engine: &ExecutionEngine,
-    pool: &PgPool,
-    request_id: Uuid,
-    chain: &Chain,
-    cost: f64,
-    payment: &SettledExecutionPayment,
-) -> Result<()> {
-    let chain_cfg = engine.config.chain_config(chain)?;
-    let token = &chain_cfg.execution_token;
-    if payment.token != token.symbol {
-        anyhow::bail!("x402 execution fees must be paid in {}", token.symbol);
-    }
-    if payment.chain != chain.to_string() {
-        anyhow::bail!("x402 settlement chain does not match execution chain");
-    }
-    if payment
-        .token_contract
-        .as_deref()
-        .and_then(|address| address.parse::<Address>().ok())
-        != Some(token.address)
-    {
-        anyhow::bail!("x402 settlement asset does not match configured execution token");
-    }
-    let confirmed = payment
-        .confirmed_amount_raw
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("x402 settlement omitted confirmed_amount_raw"))
-        .and_then(|raw| {
-            U256::from_dec_str(raw)
-                .map_err(|error| anyhow::anyhow!("invalid x402 settlement amount: {error}"))
-        })?;
-    let required = usd_to_token_raw_amount(cost, token.decimals)?;
-    if confirmed < required {
-        anyhow::bail!(
-            "x402 underpayment: paid {} raw {}, required {}",
-            confirmed,
-            token.symbol,
-            required
-        );
-    }
-    let inserted = db::insert_payment(pool, request_id, payment).await?;
-    if inserted.is_none() {
-        let existing = db::get_verified_payment_for_request(pool, request_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("x402 payment tx {} has already been used", payment.tx_hash)
-            })?;
-        if !existing
-            .payment_tx_hash
-            .eq_ignore_ascii_case(&payment.tx_hash)
-            || !existing.payer.eq_ignore_ascii_case(&payment.payer)
-            || existing.token != payment.token
-            || payment
-                .confirmed_amount_raw
-                .as_deref()
-                .is_none_or(|amount| amount != existing.amount_raw)
-            || payment
-                .token_contract
-                .as_deref()
-                .is_none_or(|token| !token.eq_ignore_ascii_case(&existing.token_contract))
-            || existing.payment_chain != payment.chain
-        {
-            anyhow::bail!("x402 payment transaction is bound to another execution");
-        }
-    }
-    Ok(())
-}
-
 /// Resolve the agent's smart wallet and return Arc USDC once.
 pub async fn handle_get_wallet_balance(
     engine: &ExecutionEngine,
@@ -1071,109 +774,6 @@ pub async fn handle_get_wallet_balance(
         smart_wallet_address: smart_wallet_str,
         chain: chain.to_string(),
         tokens,
-    })
-}
-
-/// Handle a simulation-only request (no payment, no queue).
-pub async fn handle_simulate_authenticated(
-    engine: &ExecutionEngine,
-    pool: &PgPool,
-    wallet_registry: &AgentWalletRegistry,
-    auth_context: &AuthContext,
-    req: &ExecutionRequest,
-) -> Result<ExecutionResponse> {
-    let chain = engine.validate(req)?;
-    let (agent, policy) = db::authorize_execution_agent(pool, auth_context, &req.agent_id).await?;
-    if let Err(error) = crate::auth::enforce_compiled_execution_limits(&policy, req) {
-        record_policy_denial(
-            pool,
-            auth_context,
-            Some(agent.id),
-            None,
-            "simulation",
-            &error,
-        )
-        .await;
-        return Err(error);
-    }
-    let agent_wallet = wallet_registry
-        .get_or_create(auth_context.organization_id, &req.agent_id)
-        .await?;
-    let smart_wallet_address =
-        resolve_chain_smart_wallet_address(engine, &chain, &agent_wallet).await?;
-    let smart_wallet_str = format!("{smart_wallet_address:?}");
-    let db_row = db::insert_execution_request(
-        pool,
-        auth_context,
-        req,
-        &ExecutionStatus::Pending,
-        Some(&smart_wallet_str),
-        None,
-    )
-    .await?;
-    let request_id = db_row.id;
-    let initial_sim =
-        simulate_arc_request(engine, req, &chain, smart_wallet_address, None, request_id).await?;
-    let (sim, cost, execution_fee) = if initial_sim.success {
-        let initial_cost = engine
-            .estimate_arc_cost(
-                &chain,
-                initial_sim.gas_estimate,
-                simulation_fee_cap(&initial_sim)?,
-                true,
-            )
-            .await?;
-        let prepared = prepare_atomic_fee_execution(
-            engine,
-            &chain,
-            req,
-            smart_wallet_address,
-            request_id,
-            initial_cost,
-        )
-        .await?;
-        let cost = prepared
-            .simulation
-            .success
-            .then_some(prepared.fee.amount_usd);
-        (prepared.simulation, cost, Some(prepared.fee))
-    } else {
-        (initial_sim, None, None)
-    };
-
-    db::update_execution_status(
-        pool,
-        request_id,
-        if sim.success {
-            &ExecutionStatus::Pending
-        } else {
-            &ExecutionStatus::Failed
-        },
-        None,
-        sim.error.as_deref(),
-        Some(sim.gas_estimate as i64),
-        cost,
-    )
-    .await?;
-
-    Ok(ExecutionResponse {
-        request_id,
-        status: if sim.success {
-            ExecutionStatus::Pending
-        } else {
-            ExecutionStatus::Failed
-        },
-        smart_wallet_address: Some(smart_wallet_str),
-        estimated_gas: Some(sim.gas_estimate),
-        estimated_cost_usd: cost,
-        execution_fee_token: execution_fee.as_ref().map(|fee| fee.token_symbol.clone()),
-        execution_fee_raw: execution_fee.as_ref().map(|fee| fee.amount_raw.clone()),
-        tx_hash: None,
-        message: if sim.success {
-            "simulation succeeded".into()
-        } else {
-            format!("simulation failed: {}", sim.error.unwrap_or_default())
-        },
     })
 }
 

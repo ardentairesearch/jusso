@@ -61,13 +61,6 @@ impl ConnectService {
             self.config.oauth_issuer.trim_end_matches('/')
         )
     }
-
-    pub fn control_resource(&self) -> String {
-        format!(
-            "{}/mcp/control",
-            self.config.oauth_issuer.trim_end_matches('/')
-        )
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,17 +281,7 @@ pub async fn authorize_handler(
 pub async fn agent_resource_metadata_handler(
     State(service): State<ConnectService>,
 ) -> Json<serde_json::Value> {
-    protected_resource_metadata(&service, service.agent_resource(), auth::RUNTIME_SCOPES)
-}
-
-pub async fn control_resource_metadata_handler(
-    State(service): State<ConnectService>,
-) -> Json<serde_json::Value> {
-    protected_resource_metadata(
-        &service,
-        service.control_resource(),
-        auth::MANAGEMENT_SCOPES,
-    )
+    protected_resource_metadata(&service, service.agent_resource(), auth::DEFAULT_SCOPES)
 }
 
 fn protected_resource_metadata(
@@ -367,14 +350,10 @@ async fn begin_authorization(
     {
         anyhow::bail!("redirect_uri is not registered for this client");
     }
-    let allowed = if query.resource == service.agent_resource() {
-        auth::RUNTIME_SCOPES
-    } else if query.resource == service.control_resource() {
-        auth::MANAGEMENT_SCOPES
-    } else {
-        anyhow::bail!("resource must be the Jusso agent or control MCP endpoint");
-    };
-    let scopes = requested_scopes(query.scope.as_deref(), allowed)?;
+    if query.resource != service.agent_resource() {
+        anyhow::bail!("resource must be the Jusso MCP endpoint");
+    }
+    let scopes = requested_scopes(query.scope.as_deref(), auth::DEFAULT_SCOPES)?;
     let raw_token = random_token();
     let token_hash = token_hash(&raw_token);
     sqlx::query(
@@ -633,7 +612,6 @@ pub async fn connect_page_handler(
     let mut response = Html(connect_page_html(
         &token,
         service.config.registration_turnstile_site_key.as_deref(),
-        session.resource == service.agent_resource(),
         service.config.public_registration_enabled,
         &session.client_name,
         &session.scopes,
@@ -883,7 +861,7 @@ async fn finish_registration(
             resource: &session.resource,
             oauth_scopes: &session.scopes,
             authorization_code_expires_at: Utc::now() + Duration::seconds(CODE_TTL_SECONDS),
-            bind_agent_to_token: session.resource == service.agent_resource(),
+            bind_agent_to_token: true,
         },
     )
     .await
@@ -986,27 +964,24 @@ async fn start_authentication(
         .first()
         .map(|row| row.principal_id)
         .ok_or_else(|| anyhow!("owner account was not found"))?;
-    let (agent_id, agent_external_id) = if session.resource == service.agent_resource() {
-        let external_id = body
-            .agent_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("agent_id is required for an agent MCP connection"))?;
-        let agent_id = sqlx::query_scalar::<_, Uuid>(
-            r#"SELECT a.id FROM agents a
-               JOIN principal_agent_grants pag ON pag.agent_id = a.id
-               WHERE pag.principal_id = $1 AND a.external_id = $2 AND a.status = 'active'"#,
-        )
-        .bind(principal_id)
-        .bind(external_id)
-        .fetch_optional(&service.pool)
-        .await?
-        .ok_or_else(|| anyhow!("active agent is not available to this owner"))?;
-        (Some(agent_id), Some(external_id.to_string()))
-    } else {
-        (None, None)
-    };
+    let external_id = body
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("agent_id is required for the Jusso MCP connection"))?;
+    let agent_id = sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT a.id FROM agents a
+           JOIN principal_agent_grants pag ON pag.agent_id = a.id
+           WHERE pag.principal_id = $1 AND a.external_id = $2 AND a.status = 'active'"#,
+    )
+    .bind(principal_id)
+    .bind(external_id)
+    .fetch_optional(&service.pool)
+    .await?
+    .ok_or_else(|| anyhow!("active agent is not available to this owner"))?;
+    let agent_id = Some(agent_id);
+    let agent_external_id = Some(external_id.to_string());
     let passkeys = rows
         .iter()
         .map(|row| serde_json::from_value::<Passkey>(row.passkey.clone()))
@@ -1210,7 +1185,7 @@ async fn pending_passkey_enrollment(
            JOIN principals p ON p.id = r.principal_id AND p.status = 'active'
            JOIN organizations o ON o.id = r.organization_id AND o.status = 'active'
            WHERE r.token_hash = $1 AND r.status = 'pending' AND r.expires_at > now()
-             AND c.status = 'active' AND c.agent_id IS NULL
+             AND c.status = 'active'
              AND oa.webauthn_user_id IS NOT NULL"#,
     )
     .bind(hash)
@@ -1626,7 +1601,7 @@ async fn pending_owner_approval(pool: &PgPool, raw_token: &str) -> Result<Pendin
            WHERE ar.token_hash = $1 AND ar.status = 'pending'
              AND ar.expires_at > now() AND c.status = 'active'
              AND c.organization_id = ar.organization_id
-             AND c.principal_id = ar.principal_id AND c.agent_id IS NULL"#,
+             AND c.principal_id = ar.principal_id"#,
     )
     .bind(token_hash(raw_token))
     .fetch_optional(pool)
@@ -1956,7 +1931,6 @@ fn registration_client_ip(
 fn connect_page_html(
     token: &str,
     turnstile_site_key: Option<&str>,
-    agent_connection: bool,
     registration_enabled: bool,
     client_name: &str,
     scopes: &[String],
@@ -1970,16 +1944,9 @@ fn connect_page_html(
             html_escape(key)
         )
     });
-    let sign_in_agent = if agent_connection {
-        r#"<label>Agent ID</label><input name="agent_id" required value="primary-agent">"#
-    } else {
-        ""
-    };
-    let connection_kind = if agent_connection {
-        "Agent runtime"
-    } else {
-        "Organization control"
-    };
+    let sign_in_agent =
+        r#"<label>Agent ID</label><input name="agent_id" required value="primary-agent">"#;
+    let connection_kind = "Agent workflows and organization management";
     let scope_list = scopes
         .iter()
         .map(|scope| format!("<li><code>{}</code></li>", html_escape(scope)))
@@ -2138,12 +2105,11 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_scopes_are_selected_without_crossing_roles() {
-        let scopes = requested_scopes(Some("wallet:read workflow:read"), auth::RUNTIME_SCOPES)
-            .expect("runtime scopes");
-        assert_eq!(scopes, ["wallet:read", "workflow:read"]);
-        assert!(requested_scopes(Some("policy:manage"), auth::RUNTIME_SCOPES).is_err());
-        assert!(requested_scopes(Some("transaction:execute"), auth::MANAGEMENT_SCOPES).is_err());
+    fn unified_endpoint_selects_only_supported_scopes() {
+        let scopes = requested_scopes(Some("wallet:read workflow:manage"), auth::DEFAULT_SCOPES)
+            .expect("unified scopes");
+        assert_eq!(scopes, ["wallet:read", "workflow:manage"]);
+        assert!(requested_scopes(Some("transaction:execute"), auth::DEFAULT_SCOPES).is_err());
     }
 
     #[test]
@@ -2189,7 +2155,6 @@ mod tests {
         let html = connect_page_html(
             "safe-token",
             None,
-            true,
             false,
             "<script>alert('xss')</script>",
             &["wallet:read".to_string()],
