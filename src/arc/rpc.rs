@@ -106,6 +106,19 @@ impl ArcRpcClient {
         .await
     }
 
+    pub async fn transaction_receipt(&self, hash: H256) -> Result<Option<Value>> {
+        let value = self
+            .request("eth_getTransactionReceipt", json!([format!("{hash:?}")]))
+            .await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        if !value.is_object() {
+            bail!("Arc RPC eth_getTransactionReceipt returned a non-object receipt");
+        }
+        Ok(Some(value))
+    }
+
     pub async fn supported_entry_points(&self) -> Result<Vec<Address>> {
         let value = self.request("eth_supportedEntryPoints", json!([])).await?;
         let entries = value

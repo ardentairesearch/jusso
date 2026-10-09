@@ -51,7 +51,7 @@ Only unfinished release work belongs here.
 
 - [ ] Run end-to-end remote MCP OAuth tests with supported production clients
   and an official SDK client, covering discovery, PKCE, callback/issuer binding,
-  refresh, revocation, and agent/control separation.
+  refresh, revocation, and the unified agent-bound tool surface.
 
 ## Owner And Agent Lifecycle
 
@@ -64,8 +64,11 @@ Only unfinished release work belongs here.
 
 ## Bring Your Own Wallet
 
-- [ ] Keep BYOW disabled until the managed-account payment path is production
-  proven and an external-wallet authorization model is specified and tested.
-- [ ] Require a signed ownership challenge and bind delegated authority to
-  organization, agent, chain, actions, targets, limits, expiry, and revocation.
-- [ ] Never import or retain an external wallet private key.
+- [ ] Certify Circle Agent Wallet on Arc testnet end to end: deployed-wallet
+  ownership proof, owner approval, scheduled intent creation, Circle CLI
+  transfer, receipt verification, expiry, revocation, and reconnect.
+- [ ] Add notifications for pending Circle payment intents so an always-on
+  agent runtime can pick them up promptly without aggressive polling.
+- [ ] Revisit a delegated Circle server API only if Circle publishes a stable,
+  documented authorization flow that does not transfer the owner's CLI session
+  or MPC secret material to Jusso.

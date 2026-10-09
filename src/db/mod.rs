@@ -1722,6 +1722,16 @@ pub enum OwnerApprovalAction {
         passkey_id: Uuid,
         expected_credential_id: String,
     },
+    ConnectCircleAgentWallet {
+        challenge_id: Uuid,
+        agent_id: Uuid,
+        chain: String,
+        wallet_address: String,
+        ownership_signature: String,
+    },
+    RevokeExternalWallet {
+        connection_id: Uuid,
+    },
     CreatePaymentPlan {
         plan: crate::workflows::NormalizedPaymentPlan,
     },
@@ -1750,6 +1760,8 @@ impl OwnerApprovalAction {
             Self::RotateAgentCredential { .. } => "rotate_agent_credential",
             Self::RotateAgentOnchainSigner { .. } => "rotate_agent_onchain_signer",
             Self::RevokeOwnerPasskey { .. } => "revoke_owner_passkey",
+            Self::ConnectCircleAgentWallet { .. } => "connect_circle_agent_wallet",
+            Self::RevokeExternalWallet { .. } => "revoke_external_wallet",
             Self::CreatePaymentPlan { .. } => "create_payment_plan",
             Self::UpdatePaymentPlan { .. } => "update_payment_plan",
             Self::ChangePaymentPlanStatus { .. } => "change_payment_plan_status",
@@ -1994,6 +2006,31 @@ impl OwnerApprovalAction {
                     anyhow::bail!("expected passkey credential ID is invalid");
                 }
             }
+            Self::ConnectCircleAgentWallet {
+                chain,
+                wallet_address,
+                ownership_signature,
+                ..
+            } => {
+                if chain != expected_chain {
+                    anyhow::bail!("Circle wallet connection targets the wrong Arc network");
+                }
+                let address = wallet_address
+                    .parse::<ethers_core::types::Address>()
+                    .map_err(|_| anyhow::anyhow!("Circle wallet address is invalid"))?;
+                if address == ethers_core::types::Address::zero()
+                    || !ownership_signature.starts_with("0x")
+                    || ownership_signature.len() < 4
+                    || ownership_signature.len() > 8194
+                    || ownership_signature.len() % 2 != 0
+                    || !ownership_signature[2..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                {
+                    anyhow::bail!("Circle wallet connection proof is invalid");
+                }
+            }
+            Self::RevokeExternalWallet { .. } => {}
             Self::CreatePaymentPlan { plan } | Self::UpdatePaymentPlan { plan, .. } => {
                 plan.validate()?;
             }
@@ -2930,6 +2967,99 @@ pub async fn create_owner_approval_request(
                 ]
             })
         }
+        OwnerApprovalAction::ConnectCircleAgentWallet {
+            challenge_id,
+            agent_id,
+            chain,
+            wallet_address,
+            ..
+        } => {
+            let connection: (String, DateTime<Utc>) = sqlx::query_as(
+                r#"SELECT c.challenge, c.expires_at
+                   FROM external_wallet_connection_challenges c
+                   JOIN principal_agent_grants pag ON pag.agent_id=c.agent_id
+                   JOIN agents a ON a.id=c.agent_id AND a.organization_id=c.organization_id
+                   WHERE c.id=$1 AND c.organization_id=$2 AND c.agent_id=$3
+                     AND c.created_by_principal_id=$4 AND pag.principal_id=$4
+                     AND c.chain=$5 AND c.wallet_address=$6
+                     AND c.consumed_at IS NULL AND c.expires_at > now()
+                     AND a.status='active'"#,
+            )
+            .bind(challenge_id)
+            .bind(context.organization_id)
+            .bind(agent_id)
+            .bind(context.principal_id)
+            .bind(chain)
+            .bind(wallet_address)
+            .fetch_optional(pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Circle wallet proof is invalid or expired"))?;
+            let incompatible_plan: bool = sqlx::query_scalar(
+                r#"SELECT EXISTS(
+                       SELECT 1 FROM payment_plans p
+                       WHERE p.organization_id=$1 AND p.agent_id=$2
+                         AND p.status <> 'cancelled'
+                         AND (p.surplus_destination IS NOT NULL OR
+                              (SELECT COUNT(*) FROM payment_plan_recipients r
+                               WHERE r.plan_id=p.id) <> 1)
+                   )"#,
+            )
+            .bind(context.organization_id)
+            .bind(agent_id)
+            .fetch_one(pool)
+            .await?;
+            if incompatible_plan {
+                anyhow::bail!(
+                    "Circle Agent Wallet currently requires one-recipient plans without surplus sweeps"
+                );
+            }
+            serde_json::json!({
+                "title": "Connect Circle Agent Wallet",
+                "summary": "Use this Circle wallet for this agent's scheduled USDC payments.",
+                "wallet": {
+                    "provider": "Circle Agent Wallet",
+                    "address": wallet_address,
+                    "network": chain,
+                    "ownership_verified": true
+                },
+                "challenge_expires_at": connection.1,
+                "effects": [
+                    "Circle keeps the wallet's MPC keys and signing session",
+                    "Jusso will prepare exact one-recipient payment instructions for the agent",
+                    "The agent submits payments with Circle and Jusso verifies every receipt",
+                    "Jusso and Circle spending policies both remain in force"
+                ],
+                "current_limit": "One recipient per payment plan; surplus sweeps remain on managed wallets until an atomic Circle batch path is available"
+            })
+        }
+        OwnerApprovalAction::RevokeExternalWallet { connection_id } => {
+            let connection: (String, String, String) = sqlx::query_as(
+                r#"SELECT a.external_id, c.wallet_address, c.chain
+                   FROM external_wallet_connections c
+                   JOIN agents a ON a.id=c.agent_id AND a.organization_id=c.organization_id
+                   JOIN principal_agent_grants pag ON pag.agent_id=a.id
+                   WHERE c.id=$1 AND c.organization_id=$2 AND pag.principal_id=$3
+                     AND c.status='active'"#,
+            )
+            .bind(connection_id)
+            .bind(context.organization_id)
+            .bind(context.principal_id)
+            .fetch_optional(pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("active external wallet connection was not found"))?;
+            serde_json::json!({
+                "title": "Disconnect Circle Agent Wallet",
+                "summary": "Stop creating new payment instructions for this Circle wallet.",
+                "agent": connection.0,
+                "wallet_address": connection.1,
+                "network": connection.2,
+                "effects": [
+                    "Pending payment instructions expire without moving funds",
+                    "The Circle wallet and its funds remain under the owner's control",
+                    "The agent returns to its Jusso-managed wallet for future scheduled runs"
+                ]
+            })
+        }
         OwnerApprovalAction::CreatePaymentPlan { plan } => {
             validate_payment_plan_for_owner(pool, context, plan).await?;
             serde_json::json!({
@@ -3035,6 +3165,15 @@ async fn validate_payment_plan_for_owner(
     let (agent, policy) = authorize_execution_agent(pool, context, &plan.agent_id).await?;
     if context.is_bound_to_other_agent(agent.id) {
         anyhow::bail!("owner session is bound to another agent");
+    }
+    if crate::byow::active_connection_for_agent(pool, context.organization_id, agent.id)
+        .await?
+        .is_some()
+        && (plan.recipients.len() != 1 || plan.surplus.is_some())
+    {
+        anyhow::bail!(
+            "Circle Agent Wallet plans currently support one recipient and no surplus sweep"
+        );
     }
     validate_payment_plan_against_policy(&policy, plan)
 }
@@ -3782,6 +3921,136 @@ pub async fn complete_owner_approval(
                 "revoked_connections": revoked_connections,
                 "expired_approvals": expired_approvals,
                 "expired_passkey_enrollments": expired_enrollments
+            })
+        }
+        OwnerApprovalAction::ConnectCircleAgentWallet {
+            challenge_id,
+            agent_id,
+            chain,
+            wallet_address,
+            ownership_signature,
+        } => {
+            let consumed = sqlx::query(
+                r#"UPDATE external_wallet_connection_challenges
+                   SET consumed_at=now()
+                   WHERE id=$1 AND organization_id=$2 AND agent_id=$3
+                     AND created_by_principal_id=$4 AND chain=$5 AND wallet_address=$6
+                     AND consumed_at IS NULL AND expires_at > now()"#,
+            )
+            .bind(challenge_id)
+            .bind(row.organization_id)
+            .bind(agent_id)
+            .bind(row.principal_id)
+            .bind(&chain)
+            .bind(&wallet_address)
+            .execute(&mut *transaction)
+            .await?;
+            if consumed.rows_affected() != 1 {
+                anyhow::bail!("Circle wallet proof expired or was already consumed");
+            }
+            let agent: (String,) = sqlx::query_as(
+                r#"SELECT a.external_id FROM agents a
+                   JOIN principal_agent_grants pag ON pag.agent_id=a.id
+                   WHERE a.id=$1 AND a.organization_id=$2 AND pag.principal_id=$3
+                     AND a.status='active' FOR UPDATE OF a"#,
+            )
+            .bind(agent_id)
+            .bind(row.organization_id)
+            .bind(row.principal_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("active agent is no longer available"))?;
+            let incompatible_plan: bool = sqlx::query_scalar(
+                r#"SELECT EXISTS(
+                       SELECT 1 FROM payment_plans p
+                       WHERE p.organization_id=$1 AND p.agent_id=$2
+                         AND p.status <> 'cancelled'
+                         AND (p.surplus_destination IS NOT NULL OR
+                              (SELECT COUNT(*) FROM payment_plan_recipients r
+                               WHERE r.plan_id=p.id) <> 1)
+                   )"#,
+            )
+            .bind(row.organization_id)
+            .bind(agent_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if incompatible_plan {
+                anyhow::bail!(
+                    "Circle Agent Wallet currently requires one-recipient plans without surplus sweeps"
+                );
+            }
+            sqlx::query(
+                r#"UPDATE external_wallet_connections
+                   SET status='revoked', revoked_at=now(), updated_at=now()
+                   WHERE organization_id=$1 AND agent_id=$2 AND status='active'"#,
+            )
+            .bind(row.organization_id)
+            .bind(agent_id)
+            .execute(&mut *transaction)
+            .await?;
+            let connection_id = Uuid::new_v4();
+            let challenge: String = sqlx::query_scalar(
+                "SELECT challenge FROM external_wallet_connection_challenges WHERE id=$1",
+            )
+            .bind(challenge_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            sqlx::query(
+                r#"INSERT INTO external_wallet_connections (
+                       id, organization_id, agent_id, provider, chain, wallet_address,
+                       ownership_challenge, ownership_signature,
+                       connected_by_principal_id, verified_at
+                   ) VALUES ($1,$2,$3,'circle_agent_wallet',$4,$5,$6,$7,$8,now())"#,
+            )
+            .bind(connection_id)
+            .bind(row.organization_id)
+            .bind(agent_id)
+            .bind(&chain)
+            .bind(&wallet_address)
+            .bind(challenge)
+            .bind(&ownership_signature)
+            .bind(row.principal_id)
+            .execute(&mut *transaction)
+            .await?;
+            serde_json::json!({
+                "connection_id": connection_id,
+                "provider": "circle_agent_wallet",
+                "agent_id": agent.0,
+                "chain": chain,
+                "wallet_address": wallet_address,
+                "status": "active"
+            })
+        }
+        OwnerApprovalAction::RevokeExternalWallet { connection_id } => {
+            let revoked = sqlx::query(
+                r#"UPDATE external_wallet_connections c
+                   SET status='revoked', revoked_at=now(), updated_at=now()
+                   FROM principal_agent_grants pag
+                   WHERE c.id=$1 AND c.organization_id=$2 AND c.status='active'
+                     AND pag.agent_id=c.agent_id AND pag.principal_id=$3"#,
+            )
+            .bind(connection_id)
+            .bind(row.organization_id)
+            .bind(row.principal_id)
+            .execute(&mut *transaction)
+            .await?;
+            if revoked.rows_affected() != 1 {
+                anyhow::bail!("external wallet connection changed while approval was pending");
+            }
+            // Let the scheduler expire these intents so their associated runs
+            // follow the normal terminal-state and callback path.
+            sqlx::query(
+                r#"UPDATE external_wallet_payment_intents
+                   SET expires_at=LEAST(expires_at, now())
+                   WHERE connection_id=$1 AND status='pending'"#,
+            )
+            .bind(connection_id)
+            .execute(&mut *transaction)
+            .await?;
+            serde_json::json!({
+                "connection_id": connection_id,
+                "status": "revoked",
+                "wallet_funds_moved": false
             })
         }
         OwnerApprovalAction::CreatePaymentPlan { mut plan } => {
@@ -5205,8 +5474,8 @@ mod tests {
         let mut larger_token_budget = child.clone();
         larger_token_budget.token_spend_limits = serde_json::json!([{
             "token": crate::policy::ARC_USDC_ADDRESS,
-            "max_per_execution_raw": "25000001",
-            "max_rolling_raw": "100000001"
+            "max_per_execution_raw": "500000001",
+            "max_rolling_raw": "2500000001"
         }]);
         assert!(validate_delegated_policy(&parent, &larger_token_budget).is_err());
 

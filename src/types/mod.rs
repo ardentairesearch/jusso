@@ -153,14 +153,16 @@ pub struct ExecutionResponse {
     pub message: String,
 }
 
-/// Response for `GET /wallet` — returns the agent's smart wallet address.
+/// Response for `GET /wallet` — returns the active Arc payment wallet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletResponse {
     /// The agent-supplied identifier.
     pub agent_id: String,
-    /// The dedicated Arc ERC-4337 smart-account address.
+    /// The active Arc smart-account address.
     pub smart_wallet_address: String,
-    /// Whether the smart-account contract has deployed onchain.
+    /// Active payment wallet backend (`turnkey_erc4337` or `circle_agent_wallet`).
+    pub wallet_provider: String,
+    /// Whether the active smart-account contract has deployed onchain.
     pub deployed: bool,
     /// Human-readable note explaining wallet funding.
     pub message: String,
@@ -198,6 +200,7 @@ pub struct TokenBalance {
 pub struct WalletBalanceResponse {
     pub agent_id: String,
     pub smart_wallet_address: String,
+    pub wallet_provider: String,
     pub chain: String,
     /// Arc USDC is shown once, through its six-decimal ERC-20 interface.
     pub tokens: Vec<TokenBalance>,

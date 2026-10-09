@@ -7,6 +7,7 @@ pub mod agent_wallet;
 pub mod api;
 pub mod arc;
 pub mod auth;
+pub mod byow;
 pub mod config;
 pub mod connect;
 pub mod db;

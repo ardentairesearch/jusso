@@ -724,9 +724,10 @@ pub async fn arc_fee_recipient_status(engine: &ExecutionEngine) -> Result<serde_
     }))
 }
 
-/// Resolve the agent's smart wallet and return Arc USDC once.
+/// Resolve the agent's active payment wallet and return its Arc USDC balance.
 pub async fn handle_get_wallet_balance(
     engine: &ExecutionEngine,
+    pool: &PgPool,
     wallet_registry: &AgentWalletRegistry,
     organization_id: Uuid,
     agent_id: &str,
@@ -744,12 +745,23 @@ pub async fn handle_get_wallet_balance(
 
     let provider = engine.provider_for_chain(&chain)?;
 
-    // Resolve (or provision) the agent's smart wallet
-    let agent_wallet = wallet_registry
-        .get_or_create(organization_id, agent_id)
-        .await?;
-    let smart_wallet_address =
-        resolve_chain_smart_wallet_address(engine, &chain, &agent_wallet).await?;
+    let external = crate::byow::active_connection_for_external_id(pool, organization_id, agent_id)
+        .await?
+        .filter(|connection| connection.chain == chain.to_string());
+    let (smart_wallet_address, wallet_provider) = if let Some(connection) = external {
+        (
+            connection.wallet_address.parse::<Address>()?,
+            connection.provider,
+        )
+    } else {
+        let agent_wallet = wallet_registry
+            .get_or_create(organization_id, agent_id)
+            .await?;
+        (
+            resolve_chain_smart_wallet_address(engine, &chain, &agent_wallet).await?,
+            "turnkey_erc4337".into(),
+        )
+    };
     let smart_wallet_str = format!("{smart_wallet_address:?}");
 
     // Arc native and ERC-20 USDC are one balance. Use the six-decimal interface
@@ -772,6 +784,7 @@ pub async fn handle_get_wallet_balance(
     Ok(WalletBalanceResponse {
         agent_id: agent_id.to_string(),
         smart_wallet_address: smart_wallet_str,
+        wallet_provider,
         chain: chain.to_string(),
         tokens,
     })
@@ -785,12 +798,13 @@ fn simulation_fee_cap(simulation: &SimulationResult) -> Result<U256> {
     U256::from_dec_str(raw).context("Arc simulation returned invalid max fee per gas")
 }
 
-/// Handle a wallet lookup — return the agent's smart wallet address.
+/// Handle a wallet lookup and return the agent's active payment-wallet address.
 ///
-/// This is a lightweight endpoint that lets agents discover their wallet
-/// address so they can fund it with tokens before submitting execute requests.
+/// Circle BYOW takes precedence when connected; otherwise this resolves the
+/// Jusso-managed ERC-4337 account.
 pub async fn handle_get_wallet(
     engine: &ExecutionEngine,
+    pool: &PgPool,
     wallet_registry: &AgentWalletRegistry,
     organization_id: Uuid,
     agent_id: &str,
@@ -810,12 +824,23 @@ pub async fn handle_get_wallet(
         return Err(anyhow::anyhow!("agent_id too long (max 256 characters)"));
     }
 
-    // Resolve or create the smart wallet
-    let agent_wallet = wallet_registry
-        .get_or_create(organization_id, agent_id)
-        .await?;
-    let smart_wallet_addr =
-        resolve_chain_smart_wallet_address(engine, &resolved_chain, &agent_wallet).await?;
+    let external = crate::byow::active_connection_for_external_id(pool, organization_id, agent_id)
+        .await?
+        .filter(|connection| connection.chain == resolved_chain.to_string());
+    let (smart_wallet_addr, wallet_provider) = if let Some(connection) = external {
+        (
+            connection.wallet_address.parse::<Address>()?,
+            connection.provider,
+        )
+    } else {
+        let agent_wallet = wallet_registry
+            .get_or_create(organization_id, agent_id)
+            .await?;
+        (
+            resolve_chain_smart_wallet_address(engine, &resolved_chain, &agent_wallet).await?,
+            "turnkey_erc4337".into(),
+        )
+    };
 
     // A counterfactual ERC-4337 account is fundable before deployment.
     let provider = engine.provider_for_chain(&resolved_chain)?;
@@ -824,7 +849,11 @@ pub async fn handle_get_wallet(
 
     let smart_wallet_str = format!("{smart_wallet_addr:?}");
 
-    let message = if deployed {
+    let message = if wallet_provider == crate::byow::CIRCLE_PROVIDER {
+        format!(
+            "Circle Agent Wallet is connected for payments at {smart_wallet_str}. Circle retains signing control; Jusso verifies completed payment receipts."
+        )
+    } else if deployed {
         format!(
             "Arc smart account is deployed. Fund {smart_wallet_str} with USDC or assets required by your action.",
         )
@@ -837,6 +866,7 @@ pub async fn handle_get_wallet(
     Ok(WalletResponse {
         agent_id: agent_id.to_string(),
         smart_wallet_address: smart_wallet_str,
+        wallet_provider,
         deployed,
         message,
     })

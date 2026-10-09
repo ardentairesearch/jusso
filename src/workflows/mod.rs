@@ -6,7 +6,7 @@ use chrono_tz::Tz;
 use ethers_core::{
     abi::{encode, Token},
     types::{Address, U256},
-    utils::id,
+    utils::{format_units, id},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -848,21 +848,43 @@ async fn process_run(state: &AppState, run: PaymentPlanRunRow) -> Result<()> {
         )
         .await;
     }
-    let balance_response = services::handle_get_wallet_balance(
-        &state.engine,
-        &state.wallet_registry,
+    let external_wallet = crate::byow::active_connection_for_agent(
+        &state.db_pool,
         snapshot.organization_id,
-        &snapshot.agent_external_id,
-        state.config.arc_network.name(),
+        snapshot.agent_id,
     )
     .await?;
-    let balance = U256::from_dec_str(
-        &balance_response
-            .tokens
-            .first()
-            .context("Arc USDC balance was unavailable")?
-            .raw,
-    )?;
+    let balance = if let Some(connection) = external_wallet.as_ref() {
+        if connection.chain != state.config.arc_network.name() {
+            bail!("active Circle wallet connection targets a different Arc network");
+        }
+        let chain = crate::types::Chain::from_str_loose(&connection.chain)
+            .context("Circle wallet connection has an invalid Arc network")?;
+        let provider = state.engine.provider_for_chain(&chain)?;
+        services::fetch_erc20_balance_of(
+            provider.as_ref(),
+            ARC_USDC_ADDRESS.parse::<Address>()?,
+            connection.wallet_address.parse::<Address>()?,
+        )
+        .await?
+    } else {
+        let balance_response = services::handle_get_wallet_balance(
+            &state.engine,
+            &state.db_pool,
+            &state.wallet_registry,
+            snapshot.organization_id,
+            &snapshot.agent_external_id,
+            state.config.arc_network.name(),
+        )
+        .await?;
+        U256::from_dec_str(
+            &balance_response
+                .tokens
+                .first()
+                .context("Arc USDC balance was unavailable")?
+                .raw,
+        )?
+    };
     let payout_total = snapshot
         .recipients
         .iter()
@@ -872,24 +894,31 @@ async fn process_run(state: &AppState, run: PaymentPlanRunRow) -> Result<()> {
                 .context("payout total overflow")
         })?;
     let reserve = U256::from_dec_str(&snapshot.reserve_raw)?;
-    let fee_buffer = crate::execution_engine::pricing::usd_to_token_raw_amount(
-        policy
-            .max_execution_fee_usd
-            .unwrap_or(crate::auth::DEFAULT_MAX_EXECUTION_FEE_USD),
-        USDC_DECIMALS as u8,
-    )?;
+    let fee_buffer = if external_wallet.is_some() {
+        U256::zero()
+    } else {
+        crate::execution_engine::pricing::usd_to_token_raw_amount(
+            policy
+                .max_execution_fee_usd
+                .unwrap_or(crate::auth::DEFAULT_MAX_EXECUTION_FEE_USD),
+            USDC_DECIMALS as u8,
+        )?
+    };
     let required = payout_total
         .checked_add(reserve)
         .and_then(|v| v.checked_add(fee_buffer))
         .context("required balance overflow")?;
     if balance < required {
+        let reason = if external_wallet.is_some() {
+            "insufficient USDC to pay every recipient while preserving the reserve"
+        } else {
+            "insufficient USDC to pay every recipient while preserving the reserve and execution fee buffer"
+        };
         return finish_run(
             &state.db_pool,
             run.id,
             "skipped",
-            Some(
-                "insufficient USDC to pay every recipient while preserving the reserve and fee buffer",
-            ),
+            Some(reason),
             RunAmounts {
                 balance: Some(balance),
                 payout_total,
@@ -942,6 +971,80 @@ async fn process_run(state: &AppState, run: PaymentPlanRunRow) -> Result<()> {
     let total_spend = payout_total
         .checked_add(surplus)
         .context("payment total overflow")?;
+    if let Some(connection) = external_wallet.as_ref() {
+        if snapshot.recipients.len() != 1 || snapshot.surplus_destination.is_some() {
+            return finish_run(
+                &state.db_pool,
+                run.id,
+                "failed",
+                Some(
+                    "Circle Agent Wallet currently supports one recipient per plan and no surplus sweep",
+                ),
+                RunAmounts {
+                    balance: Some(balance),
+                    payout_total,
+                    surplus,
+                },
+                None,
+            )
+            .await;
+        }
+        let rolling_limit = token_limits
+            .iter()
+            .find(|limit| limit.token.eq_ignore_ascii_case(ARC_USDC_ADDRESS))
+            .or_else(|| token_limits.iter().find(|limit| limit.token == "*"))
+            .context("agent policy has no Arc USDC rolling limit")?;
+        let mut transfers = snapshot
+            .recipients
+            .iter()
+            .map(|recipient| {
+                let amount = U256::from_dec_str(&recipient.amount_raw)?;
+                Ok(crate::byow::ExternalPaymentTransfer {
+                    recipient: recipient.address.clone(),
+                    amount_raw: recipient.amount_raw.clone(),
+                    amount_usdc: format_units(amount, USDC_DECIMALS as usize)?,
+                    label: recipient.label.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !surplus.is_zero() {
+            transfers.push(crate::byow::ExternalPaymentTransfer {
+                recipient: snapshot
+                    .surplus_destination
+                    .clone()
+                    .expect("surplus destination"),
+                amount_raw: surplus.to_string(),
+                amount_usdc: format_units(surplus, USDC_DECIMALS as usize)?,
+                label: Some("Surplus sweep".into()),
+            });
+        }
+        let intent = crate::byow::create_payment_intent(
+            &state.db_pool,
+            run.id,
+            connection,
+            &transfers,
+            total_spend,
+            U256::from_dec_str(&rolling_limit.max_rolling_raw)?,
+            policy.rolling_window_seconds,
+        )
+        .await?;
+        return finish_run(
+            &state.db_pool,
+            run.id,
+            "awaiting_wallet",
+            Some(&format!(
+                "Circle Agent Wallet payment intent {} is ready for the connected agent",
+                intent.id
+            )),
+            RunAmounts {
+                balance: Some(balance),
+                payout_total,
+                surplus,
+            },
+            None,
+        )
+        .await;
+    }
     let mut calls = snapshot
         .recipients
         .iter()
@@ -1063,6 +1166,23 @@ pub async fn run_scheduler(state: AppState) {
         if let Err(error) = reconcile_queued_runs(&state.db_pool).await {
             tracing::error!(%error, "payment-plan reconciliation failed");
         }
+        match crate::byow::expire_pending_payment_intents(&state.db_pool).await {
+            Ok(run_ids) => {
+                for run_id in run_ids {
+                    fire_payment_plan_webhook(
+                        &state,
+                        run_id,
+                        ExecutionStatus::Failed,
+                        None,
+                        Some("Circle wallet payment window expired".into()),
+                    )
+                    .await;
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "external-wallet payment expiry failed");
+            }
+        }
         if let Err(error) = expire_exhausted_runs(&state.db_pool).await {
             tracing::error!(%error, "payment-plan retry cleanup failed");
         }
@@ -1111,6 +1231,63 @@ pub async fn run_scheduler(state: AppState) {
             }
         }
     }
+}
+
+pub async fn fire_payment_plan_webhook(
+    state: &AppState,
+    run_id: Uuid,
+    status: ExecutionStatus,
+    tx_hash: Option<String>,
+    error: Option<String>,
+) {
+    let context = match sqlx::query_as::<_, (Uuid, Option<String>, DateTime<Utc>)>(
+        r#"SELECT organization_id, plan_snapshot->>'callback_url', created_at
+           FROM payment_plan_runs WHERE id=$1"#,
+    )
+    .bind(run_id)
+    .fetch_optional(&state.db_pool)
+    .await
+    {
+        Ok(Some(context)) => context,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%run_id, %error, "payment-plan callback context unavailable");
+            return;
+        }
+    };
+    let (organization_id, callback_url, created_at) = context;
+    let Some(callback_url) = callback_url.filter(|url| !url.is_empty()) else {
+        return;
+    };
+    let signing_secret = match crate::db::get_webhook_secret_by_organization(
+        &state.db_pool,
+        organization_id,
+        &state.config.auth_secret_encryption_key,
+    )
+    .await
+    {
+        Ok(Some(secret)) => secret,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%organization_id, %error, "payment-plan webhook secret unavailable");
+            return;
+        }
+    };
+    let payload = crate::webhook::WebhookPayload {
+        event_id: Uuid::new_v4(),
+        event_type: "payment_plan.completed".into(),
+        request_id: run_id,
+        status,
+        chain: state.config.arc_network.name().to_string(),
+        tx_hash,
+        cost_usd: None,
+        error,
+        created_at,
+        completed_at: Utc::now(),
+    };
+    tokio::spawn(async move {
+        crate::webhook::deliver(&callback_url, &payload, &signing_secret).await;
+    });
 }
 
 #[cfg(test)]

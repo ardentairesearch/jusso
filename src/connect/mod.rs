@@ -1550,11 +1550,8 @@ fn passkey_enrollment_page_html(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{verb} owner passkey</title><style>
-:root{{color-scheme:light dark;--ink:#111713;--paper:#f5f7f5;--line:#ccd5ce;--green:#008f50;--muted:#5f6d64}}
-*{{box-sizing:border-box}}body{{margin:0;font:15px/1.5 system-ui,sans-serif;background:var(--paper);color:var(--ink)}}
-main{{width:min(560px,calc(100% - 32px));margin:8vh auto}}h1{{font-size:30px;margin:8px 0}}p{{color:var(--muted)}}
-.mark{{font-weight:800;letter-spacing:.08em}}.panel{{border:1px solid var(--line);padding:24px}}dl{{display:grid;grid-template-columns:auto 1fr;gap:8px 18px;margin:0 0 22px}}dt{{color:var(--muted)}}dd{{margin:0;font-weight:650}}button{{width:100%;padding:12px;border:0;background:var(--green);color:white;font:inherit;font-weight:700;cursor:pointer}}button:disabled{{opacity:.55}}#message{{min-height:24px;margin-top:16px}}
-</style></head><body><main><div class="mark">JUSSO</div><h1>{verb} owner passkey</h1><p>Confirm with an active owner passkey, then create the new credential.</p><section class="panel"><dl><dt>Label</dt><dd>{label}</dd><dt>Purpose</dt><dd>{purpose}</dd></dl><button id="continue">Continue with passkeys</button><div id="message" role="alert"></div></section></main>
+:root{{color-scheme:light;--paper:#f7f8f7;--surface:#fff;--ink:#19231e;--muted:#5c675f;--line:#dce2dc;--soft:#eef2ee;--accent:#007d36;--danger:#a52d2d}}*{{box-sizing:border-box;letter-spacing:0}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}body:before{{content:"ARDENT AI RESEARCH     /     JUSSO SECURITY";display:flex;align-items:center;min-height:64px;padding:0 max(24px,calc((100vw - 720px)/2));border-bottom:1px solid var(--line);white-space:pre;font:600 10px/1.4 ui-monospace,SFMono-Regular,monospace}}main{{width:min(720px,calc(100% - 40px));margin:64px auto}}h1{{margin:8px 0 12px;font:500 clamp(40px,7vw,60px)/1.02 Georgia,serif}}p{{margin:0 0 30px;color:var(--muted)}}.mark{{color:var(--accent);font:600 10px/1.5 ui-monospace,SFMono-Regular,monospace}}.panel{{border:1px solid var(--line);padding:28px;background:var(--surface)}}dl{{display:grid;grid-template-columns:130px 1fr;gap:12px 22px;margin:0 0 26px}}dt{{color:var(--muted);font-size:12px}}dd{{margin:0;font-weight:650}}button{{width:100%;min-height:50px;padding:13px 18px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);font:inherit;font-weight:700;cursor:pointer}}button:hover{{background:var(--accent);border-color:var(--accent)}}button:disabled{{opacity:.55;cursor:wait}}#message{{min-height:24px;margin-top:16px;color:var(--danger)}}@media(prefers-color-scheme:dark){{:root{{color-scheme:dark;--paper:#111612;--surface:#182019;--ink:#f0f4f0;--muted:#a6b1a8;--line:#323d34;--soft:#1b251d;--accent:#93dfae;--danger:#ff9595}}}}@media(max-width:560px){{body:before{{padding:0 20px}}main{{margin-top:40px}}.panel{{padding:20px}}dl{{grid-template-columns:1fr;gap:3px}}dd{{margin-bottom:10px}}}}
+</style></head><body><main><div class="mark">OWNER SECURITY</div><h1>{verb} owner passkey.</h1><p>First confirm that it is you, then securely create the new passkey on this device.</p><section class="panel"><dl><dt>Passkey name</dt><dd>{label}</dd><dt>Used for</dt><dd>{purpose}</dd></dl><button id="continue">Continue securely</button><div id="message" role="alert" aria-live="polite"></div></section></main>
 <script>
 const token={token};const message=document.querySelector('#message');const button=document.querySelector('#continue');
 const b64u=b=>{{let s='';new Uint8Array(b).forEach(v=>s+=String.fromCharCode(v));return btoa(s).replaceAll('+','-').replaceAll('/','_').replaceAll('=','')}};
@@ -1814,19 +1811,19 @@ fn owner_approval_page_html(
 ) -> String {
     let token = serde_json::to_string(token).expect("token is serializable");
     let client_name = html_escape(client_name);
-    let review = html_escape(
-        &serde_json::to_string_pretty(presentation).expect("approval presentation is serializable"),
-    );
+    let title = presentation
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Review requested change");
+    let summary = presentation
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Review what will change, then approve with your passkey.");
+    let review = render_approval_review(presentation);
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Approve Jusso change</title><style>
-:root{{color-scheme:light dark;--ink:#111713;--paper:#f5f7f5;--line:#ccd5ce;--green:#008f50;--muted:#5f6d64}}
-*{{box-sizing:border-box}}body{{margin:0;font:15px/1.5 system-ui,sans-serif;background:var(--paper);color:var(--ink)}}
-main{{width:min(720px,calc(100% - 32px));margin:7vh auto}}h1{{font-size:30px;margin:8px 0}}p{{color:var(--muted)}}
-.mark{{font-weight:800;letter-spacing:.08em}}.panel{{border:1px solid var(--line);padding:24px}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid var(--line);padding:16px;font-size:12px;line-height:1.6}}
-button{{width:100%;padding:12px;border:0;background:var(--green);color:white;font:inherit;font-weight:700;cursor:pointer}}#message{{min-height:24px;margin-top:16px}}
-</style></head><body><main><div class="mark">JUSSO</div><h1>Review authority change</h1><p>Requested by <strong>{client_name}</strong>. The change below is applied only after this passkey approval.</p><section class="panel"><pre>{review}</pre><button id="approve">Approve with passkey</button><div id="message" role="alert"></div></section></main>
+<title>{title} | Jusso</title><style>{approval_css}</style></head><body><div class="topbar"><span>ARDENT AI RESEARCH</span><span>JUSSO / OWNER APPROVAL</span></div><main><header><span class="eyebrow">Protected change</span><h1>{title}</h1><p class="lede">{summary}</p><p class="requester">Requested through <strong>{client_name}</strong></p></header><section class="review" aria-label="Change review">{review}</section><section class="approve"><div><strong>Ready to approve?</strong><span>Your passkey confirms this exact change. Nothing else is authorized.</span></div><button id="approve">Approve with passkey <span aria-hidden="true">&nearr;</span></button><div id="message" role="alert" aria-live="polite"></div></section><footer><span>Passkey protected</span><span>Link expires automatically</span></footer></main>
 <script>
 const token={token};const message=document.querySelector('#message');
 const b64u=b=>{{let s='';new Uint8Array(b).forEach(v=>s+=String.fromCharCode(v));return btoa(s).replaceAll('+','-').replaceAll('/','_').replaceAll('=','')}};
@@ -1835,8 +1832,80 @@ function request(o){{o.challenge=bytes(o.challenge);(o.allowCredentials||[]).for
 function authJSON(c){{return {{id:c.id,type:c.type,rawId:b64u(c.rawId),authenticatorAttachment:c.authenticatorAttachment,response:{{authenticatorData:b64u(c.response.authenticatorData),clientDataJSON:b64u(c.response.clientDataJSON),signature:b64u(c.response.signature),userHandle:c.response.userHandle?b64u(c.response.userHandle):null}},clientExtensionResults:c.getClientExtensionResults()}}}}
 async function post(path,body){{const r=await fetch(`/approve/${{token}}/${{path}}`,{{method:'POST',headers:{{'content-type':'application/json'}},body:body?JSON.stringify(body):null}});const j=await r.json();if(!r.ok)throw new Error(j.error||'Request failed');return j}}
 document.querySelector('#approve').onclick=async()=>{{message.textContent='';try{{const start=await post('start');const c=await navigator.credentials.get({{publicKey:request(start.options.publicKey)}});await post('finish',{{ceremony_id:start.ceremony_id,credential:authJSON(c)}});document.querySelector('#approve').disabled=true;message.textContent='Approved. You may return to your assistant.'}}catch(err){{message.textContent=err.message}}}};
-</script></body></html>"#
+</script></body></html>"#,
+        title = html_escape(title),
+        summary = html_escape(summary),
+        approval_css = approval_page_css(),
     )
+}
+
+fn approval_page_css() -> &'static str {
+    r#":root{color-scheme:light;--paper:#f7f8f7;--surface:#fff;--ink:#19231e;--muted:#5c675f;--line:#dce2dc;--soft:#eef2ee;--accent:#007d36;--danger:#a52d2d}*{box-sizing:border-box;letter-spacing:0}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}.topbar{min-height:64px;padding:0 max(24px,calc((100vw - 960px)/2));display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);font:600 10px/1.4 ui-monospace,SFMono-Regular,monospace}.topbar span:last-child{color:var(--muted)}main{width:min(960px,calc(100% - 40px));margin:72px auto 40px}header{display:grid;grid-template-columns:1fr auto;gap:8px 40px;padding-bottom:42px;border-bottom:1px solid var(--line)}.eyebrow{grid-column:1/-1;color:var(--accent);font:600 10px/1.5 ui-monospace,SFMono-Regular,monospace;text-transform:uppercase}h1{margin:4px 0 0;max-width:760px;font:500 clamp(38px,6vw,64px)/1.02 Georgia,serif}.lede{grid-column:1;max-width:640px;margin:16px 0 0;color:var(--muted);font-size:17px}.requester{grid-column:2;grid-row:2;align-self:end;margin:0;color:var(--muted);font-size:12px}.review{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-left:1px solid var(--line);margin-top:32px}.review-block{min-width:0;padding:24px;border:1px solid var(--line);border-left:0;background:var(--surface)}.review-block.wide{grid-column:1/-1}.review-block h2{margin:0 0 18px;font-size:11px;text-transform:uppercase;color:var(--muted)}dl{display:grid;grid-template-columns:minmax(120px,.7fr) minmax(0,1.3fr);gap:12px 20px;margin:0}dt{color:var(--muted);font-size:12px}dd{margin:0;font-weight:600;overflow-wrap:anywhere}ul{margin:0;padding:0;list-style:none;display:grid;gap:10px}li{position:relative;padding-left:20px}li:before{content:"";position:absolute;left:0;top:.62em;width:7px;height:7px;background:var(--accent)}code{font:12px/1.55 ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}.approve{margin-top:32px;padding:24px;display:grid;grid-template-columns:1fr auto;align-items:center;gap:22px;border:1px solid var(--ink);background:var(--ink);color:var(--paper)}.approve div:first-child{display:grid;gap:3px}.approve span{font-size:12px;color:#cbd2cd}.approve button{min-height:50px;padding:13px 20px;border:1px solid var(--paper);background:var(--paper);color:var(--ink);font:inherit;font-weight:700;cursor:pointer}.approve button:hover{background:#9de1b4;border-color:#9de1b4}.approve button:disabled{opacity:.55;cursor:wait}#message{grid-column:1/-1;min-height:0;color:#b8efca;font-size:13px}#message:empty{display:none}footer{display:flex;justify-content:space-between;padding-top:18px;color:var(--muted);font:10px/1.5 ui-monospace,SFMono-Regular,monospace;text-transform:uppercase}@media(prefers-color-scheme:dark){:root{color-scheme:dark;--paper:#111612;--surface:#182019;--ink:#f0f4f0;--muted:#a6b1a8;--line:#323d34;--soft:#1b251d;--accent:#93dfae}.approve{background:#f0f4f0;color:#111612}.approve span{color:#536057}.approve button{background:#111612;color:#f0f4f0;border-color:#111612}}@media(max-width:700px){.topbar{padding:0 20px}.topbar span:last-child{display:none}main{margin-top:42px}header{display:block}.requester{margin-top:18px}.review{grid-template-columns:1fr}.review-block.wide{grid-column:auto}.approve{grid-template-columns:1fr}.approve button{width:100%}dl{grid-template-columns:1fr;gap:3px}dd{margin-bottom:12px}}"#
+}
+
+fn render_approval_review(presentation: &serde_json::Value) -> String {
+    let Some(object) = presentation.as_object() else {
+        return String::new();
+    };
+    object
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "title" | "summary"))
+        .map(|(key, value)| {
+            let wide = matches!(
+                key.as_str(),
+                "effects" | "warnings" | "recipients" | "plan" | "proposed_plan" | "current_plan"
+            );
+            format!(
+                "<article class=\"review-block{}\"><h2>{}</h2>{}</article>",
+                if wide { " wide" } else { "" },
+                html_escape(&humanize_key(key)),
+                render_review_value(value)
+            )
+        })
+        .collect()
+}
+
+fn render_review_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "<span>Not set</span>".into(),
+        serde_json::Value::Bool(value) => if *value {
+            "<span>Yes</span>"
+        } else {
+            "<span>No</span>"
+        }
+        .into(),
+        serde_json::Value::Number(value) => {
+            format!("<span>{}</span>", html_escape(&value.to_string()))
+        }
+        serde_json::Value::String(value) => format!("<span>{}</span>", html_escape(value)),
+        serde_json::Value::Array(values) => format!(
+            "<ul>{}</ul>",
+            values
+                .iter()
+                .map(|value| format!("<li>{}</li>", render_review_value(value)))
+                .collect::<String>()
+        ),
+        serde_json::Value::Object(values) => format!(
+            "<dl>{}</dl>",
+            values
+                .iter()
+                .map(|(key, value)| format!(
+                    "<dt>{}</dt><dd>{}</dd>",
+                    html_escape(&humanize_key(key)),
+                    render_review_value(value)
+                ))
+                .collect::<String>()
+        ),
+    }
+}
+
+fn humanize_key(key: &str) -> String {
+    let words = key.replace('_', " ");
+    let mut chars = words.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
 }
 
 fn authorization_redirect(
@@ -1978,13 +2047,8 @@ fn connect_page_html(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Connect to Jusso</title><style>
-:root{{color-scheme:light dark;--ink:#111713;--paper:#f5f7f5;--line:#ccd5ce;--green:#00a85a;--muted:#5f6d64}}
-*{{box-sizing:border-box}}body{{margin:0;font:15px/1.5 system-ui,sans-serif;background:var(--paper);color:var(--ink)}}
-main{{width:min(560px,calc(100% - 32px));margin:8vh auto}}header{{margin-bottom:28px}}h1{{font-size:30px;margin:8px 0}}p{{color:var(--muted)}}
-.mark{{font-weight:800;letter-spacing:.08em}}.panel{{border:1px solid var(--line);padding:24px;background:color-mix(in srgb,var(--paper) 92%,white)}}
-.tabs{{display:flex;border-bottom:1px solid var(--line);margin-bottom:20px}}button{{font:inherit;cursor:pointer}}.tab{{border:0;background:none;padding:10px 14px;border-bottom:2px solid transparent}}.tab.active{{border-color:var(--green)}}
-label{{display:block;margin:13px 0 5px;font-weight:600}}input{{width:100%;padding:11px;border:1px solid var(--line);background:transparent;color:inherit}}.primary{{width:100%;margin-top:20px;padding:12px;border:0;background:var(--green);color:white;font-weight:700}}.hidden{{display:none}}#message{{min-height:24px;margin-top:16px;color:#a32828}}.consent{{border:1px solid var(--line);padding:12px 14px;margin:18px 0}}.consent strong{{display:block}}.consent ul{{margin:8px 0 0;padding-left:20px}}code{{font-size:12px}}
-</style></head><body><main><header><div class="mark">JUSSO</div><h1>Connect your agent</h1><p>One owner approval creates a protected organization and lets your assistant use only the permissions shown by Jusso.</p></header>
+:root{{color-scheme:light;--paper:#f7f8f7;--surface:#fff;--ink:#19231e;--muted:#5c675f;--line:#dce2dc;--soft:#eef2ee;--accent:#007d36;--danger:#a52d2d}}*{{box-sizing:border-box;letter-spacing:0}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}}body:before{{content:"ARDENT AI RESEARCH     /     JUSSO CONNECT";display:flex;align-items:center;min-height:64px;padding:0 max(24px,calc((100vw - 760px)/2));border-bottom:1px solid var(--line);white-space:pre;font:600 10px/1.4 ui-monospace,SFMono-Regular,monospace}}main{{width:min(760px,calc(100% - 40px));margin:64px auto}}header{{display:grid;gap:10px;margin-bottom:34px}}h1{{margin:0;font:500 clamp(40px,7vw,62px)/1.02 Georgia,serif}}p{{margin:0;max-width:620px;color:var(--muted)}}.mark{{color:var(--accent);font:600 10px/1.5 ui-monospace,SFMono-Regular,monospace}}.panel{{border:1px solid var(--line);padding:28px;background:var(--surface)}}.tabs{{display:flex;border-bottom:1px solid var(--line);margin:28px 0 22px}}button{{font:inherit;cursor:pointer}}.tab{{border:0;background:none;color:var(--muted);padding:10px 16px;border-bottom:2px solid transparent}}.tab.active{{color:var(--ink);border-color:var(--accent)}}label{{display:block;margin:16px 0 6px;font-size:12px;font-weight:650}}input{{width:100%;min-height:48px;padding:11px 13px;border:1px solid var(--line);border-radius:0;background:var(--paper);color:inherit;outline:none}}input:focus{{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}}.primary{{width:100%;min-height:50px;margin-top:22px;padding:13px 18px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);font-weight:700}}.primary:hover{{background:var(--accent);border-color:var(--accent)}}.primary:disabled{{opacity:.55;cursor:wait}}.hidden{{display:none}}#message{{min-height:24px;margin-top:16px;color:var(--danger)}}.consent{{padding:20px;border:1px solid var(--line);background:var(--soft)}}.consent strong{{display:block;font-size:16px}}.consent span{{color:var(--muted);font-size:12px}}.consent ul{{display:flex;flex-wrap:wrap;gap:7px;margin:14px 0 0;padding:0;list-style:none}}.consent li{{padding:5px 8px;border:1px solid var(--line);background:var(--surface)}}code{{font:11px/1.4 ui-monospace,SFMono-Regular,monospace}}@media(prefers-color-scheme:dark){{:root{{color-scheme:dark;--paper:#111612;--surface:#182019;--ink:#f0f4f0;--muted:#a6b1a8;--line:#323d34;--soft:#1b251d;--accent:#93dfae;--danger:#ff9595}}}}@media(max-width:560px){{body:before{{padding:0 20px}}main{{margin-top:40px}}.panel{{padding:20px}}}}
+</style></head><body><main><header><div class="mark">SECURE AGENT ONBOARDING</div><h1>Connect your agent.</h1><p>Create or enter your organization, choose the agent this assistant may use, and confirm the connection with a passkey.</p></header>
 <section class="panel"><div class="consent"><strong>{client_name}</strong><span>{connection_kind}</span><ul>{scope_list}</ul></div><div class="tabs">{registration_tab}<button class="{sign_in_tab_class}" data-mode="signin">Sign in</button></div>
 {registration_form}
 <form id="signin" class="{sign_in_form_class}"><label>Owner handle</label><input name="owner_handle" required autocomplete="username">{sign_in_agent}<button class="primary">Approve with passkey</button></form><div id="message" role="alert"></div></section></main>
@@ -2179,6 +2243,8 @@ mod tests {
         assert!(!html.contains("</pre><script>alert(1)</script>"));
         assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
         assert!(html.contains("&lt;/pre&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!html.contains("<pre"));
+        assert!(html.contains("Approve with passkey"));
     }
 
     #[test]

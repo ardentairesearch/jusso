@@ -113,6 +113,33 @@ struct PaymentPlanRunsParams {
     limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BeginCircleWalletConnectionParams {
+    /// Organization agent that will use the Circle wallet.
+    agent_id: String,
+    /// Deployed Circle Agent Wallet address on the configured Arc network.
+    wallet_address: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ConfirmCircleWalletConnectionParams {
+    challenge_id: String,
+    /// Signature returned by `circle wallet sign message ... --output json`.
+    ownership_signature: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ExternalWalletConnectionIdParams {
+    connection_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ConfirmExternalPaymentParams {
+    payment_intent_id: String,
+    /// Confirmed transaction hashes in the same order as the intent transfers.
+    tx_hashes: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct AgentMcp {
     state: AppState,
@@ -155,7 +182,7 @@ impl AgentMcp {
 #[tool_router(router = runtime_tool_router)]
 impl AgentMcp {
     #[tool(
-        description = "Get or provision the connected agent's dedicated Arc smart-account address."
+        description = "Get the connected agent's active Arc payment wallet. Returns the Circle Agent Wallet when BYOW is active; otherwise provisions the dedicated Jusso-managed smart account."
     )]
     async fn get_wallet(
         &self,
@@ -171,6 +198,7 @@ impl AgentMcp {
             .await?;
         let response = services::handle_get_wallet(
             &self.state.engine,
+            &self.state.db_pool,
             &self.state.wallet_registry,
             auth.organization_id,
             &agent_id,
@@ -181,7 +209,9 @@ impl AgentMcp {
         json_output(response)
     }
 
-    #[tool(description = "Read the Arc USDC balance held by the connected agent's smart account.")]
+    #[tool(
+        description = "Read the Arc USDC balance held by the connected agent's active payment wallet."
+    )]
     async fn get_wallet_balance(
         &self,
         Parameters(params): Parameters<WalletParams>,
@@ -196,6 +226,7 @@ impl AgentMcp {
             .await?;
         let response = services::handle_get_wallet_balance(
             &self.state.engine,
+            &self.state.db_pool,
             &self.state.wallet_registry,
             auth.organization_id,
             &agent_id,
@@ -225,6 +256,7 @@ impl AgentMcp {
         })?;
         let wallet = services::handle_get_wallet(
             &self.state.engine,
+            &self.state.db_pool,
             &self.state.wallet_registry,
             auth.organization_id,
             &agent_id,
@@ -290,6 +322,76 @@ impl AgentMcp {
             .await
             .map_err(tool_error)?,
         )
+    }
+
+    #[tool(
+        description = "List scheduled USDC payments awaiting execution by the connected Circle Agent Wallet. Each intent includes exact transfers and Circle CLI commands; never alter the returned recipient or amount."
+    )]
+    async fn list_pending_circle_payments(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let (auth, _) = self
+            .authorize(
+                &context,
+                Some(self.state.config.arc_network.name()),
+                "workflow:read",
+                "/payment-intents",
+            )
+            .await?;
+        json_output(
+            crate::byow::list_pending_payment_intents(&self.state.db_pool, &auth)
+                .await
+                .map_err(tool_error)?,
+        )
+    }
+
+    #[tool(
+        description = "Submit the confirmed Arc transaction hashes for a Circle wallet payment intent. Jusso independently verifies each USDC transfer before marking the scheduled run complete."
+    )]
+    async fn confirm_circle_payment(
+        &self,
+        Parameters(params): Parameters<ConfirmExternalPaymentParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let (auth, _) = self
+            .authorize(
+                &context,
+                Some(self.state.config.arc_network.name()),
+                "workflow:read",
+                "/payment-intents/confirm",
+            )
+            .await?;
+        let intent_id = Uuid::parse_str(params.payment_intent_id.trim()).map_err(tool_error)?;
+        let chain = self
+            .state
+            .config
+            .chain_config(
+                &crate::types::Chain::from_str_loose(self.state.config.arc_network.name())
+                    .expect("configured Arc network"),
+            )
+            .map_err(tool_error)?;
+        let rpc = crate::arc::rpc::ArcRpcClient::new(&chain.rpc_url).map_err(tool_error)?;
+        let confirmation = crate::byow::confirm_payment_intent(
+            &self.state.db_pool,
+            &rpc,
+            &auth,
+            intent_id,
+            &params.tx_hashes,
+        )
+        .await
+        .map_err(tool_error)?;
+        if confirmation.newly_confirmed {
+            crate::workflows::fire_payment_plan_webhook(
+                &self.state,
+                confirmation.intent.payment_plan_run_id,
+                crate::types::ExecutionStatus::Confirmed,
+                params.tx_hashes.first().cloned(),
+                None,
+            )
+            .await;
+        }
+        json_output(confirmation.intent)
     }
 }
 
@@ -527,6 +629,119 @@ impl AgentMcp {
 
 #[tool_router(router = management_tool_router)]
 impl AgentMcp {
+    #[tool(
+        description = "Begin connecting a deployed Circle Agent Wallet to an organization agent. Returns a one-time ownership message and an exact Circle CLI signing command; Jusso never receives Circle login credentials or key material."
+    )]
+    async fn begin_circle_wallet_connection(
+        &self,
+        Parameters(params): Parameters<BeginCircleWalletConnectionParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:manage")?;
+        let challenge = crate::byow::create_connection_challenge(
+            &self.state.db_pool,
+            &auth,
+            params.agent_id.trim(),
+            self.state.config.arc_network.name(),
+            params.wallet_address.trim(),
+        )
+        .await
+        .map_err(tool_error)?;
+        let command = crate::byow::circle_sign_command(&challenge).map_err(tool_error)?;
+        json_output(serde_json::json!({
+            "challenge_id": challenge.id,
+            "provider": "circle_agent_wallet",
+            "agent_id": challenge.agent_external_id,
+            "wallet_address": challenge.wallet_address,
+            "network": challenge.chain,
+            "ownership_message": challenge.challenge,
+            "expires_at": challenge.expires_at,
+            "sign_command": command,
+            "next_step": "Run the signing command with the owner's Circle CLI, then call request_connect_circle_wallet_approval with the returned signature."
+        }))
+    }
+
+    #[tool(
+        description = "Verify a Circle Agent Wallet ownership signature and create a friendly owner-passkey approval to connect it. Pass only the signature returned by Circle CLI, never Circle session files, OTPs, or secrets."
+    )]
+    async fn request_connect_circle_wallet_approval(
+        &self,
+        Parameters(params): Parameters<ConfirmCircleWalletConnectionParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:manage")?;
+        let challenge_id = Uuid::parse_str(params.challenge_id.trim()).map_err(tool_error)?;
+        let challenge =
+            crate::byow::get_connection_challenge(&self.state.db_pool, &auth, challenge_id)
+                .await
+                .map_err(tool_error)?;
+        let configured_chain = crate::types::Chain::from_str_loose(&challenge.chain)
+            .ok_or_else(|| tool_error("Circle wallet challenge has an invalid network"))?;
+        let rpc_url = &self
+            .state
+            .config
+            .chain_config(&configured_chain)
+            .map_err(tool_error)?
+            .rpc_url;
+        let rpc = crate::arc::rpc::ArcRpcClient::new(rpc_url).map_err(tool_error)?;
+        let signature = crate::byow::verify_circle_ownership(
+            &rpc,
+            &challenge.wallet_address,
+            &challenge.challenge,
+            &params.ownership_signature,
+        )
+        .await
+        .map_err(tool_error)?;
+        self.request_owner_approval(
+            &auth,
+            db::OwnerApprovalAction::ConnectCircleAgentWallet {
+                challenge_id,
+                agent_id: challenge.agent_id,
+                chain: challenge.chain,
+                wallet_address: challenge.wallet_address,
+                ownership_signature: signature,
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List Circle Agent Wallet connections visible to this organization owner."
+    )]
+    async fn list_external_wallet_connections(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:manage")?;
+        json_output(
+            crate::byow::list_connections(&self.state.db_pool, &auth)
+                .await
+                .map_err(tool_error)?,
+        )
+    }
+
+    #[tool(
+        description = "Create owner passkey approval to disconnect a Circle Agent Wallet. This never moves or withdraws funds from the Circle wallet."
+    )]
+    async fn request_revoke_external_wallet_approval(
+        &self,
+        Parameters(params): Parameters<ExternalWalletConnectionIdParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:manage")?;
+        self.request_owner_approval(
+            &auth,
+            db::OwnerApprovalAction::RevokeExternalWallet {
+                connection_id: Uuid::parse_str(params.connection_id.trim()).map_err(tool_error)?,
+            },
+        )
+        .await
+    }
+
     #[tool(description = "List the organization's recurring USDC payment plans.")]
     async fn list_organization_payment_plans(
         &self,
@@ -1346,6 +1561,16 @@ mod tests {
             .iter()
             .any(|name| name == "request_create_payment_plan_approval"));
         assert!(names.iter().any(|name| name == "list_agents"));
+        assert!(names
+            .iter()
+            .any(|name| name == "begin_circle_wallet_connection"));
+        assert!(names
+            .iter()
+            .any(|name| name == "request_connect_circle_wallet_approval"));
+        assert!(names
+            .iter()
+            .any(|name| name == "list_pending_circle_payments"));
+        assert!(names.iter().any(|name| name == "confirm_circle_payment"));
         assert!(names
             .iter()
             .any(|name| name == "request_revoke_owner_passkey_approval"));

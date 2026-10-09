@@ -17,6 +17,8 @@ pub const SUPPORTED_RISK_PERMISSIONS: &[&str] = &[
 ];
 
 pub const ARC_USDC_ADDRESS: &str = "0x3600000000000000000000000000000000000000";
+pub const DEFAULT_USDC_PER_PAYMENT_RAW: &str = "500000000";
+pub const DEFAULT_USDC_ROLLING_RAW: &str = "2500000000";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct TokenSpendLimit {
@@ -134,8 +136,10 @@ pub fn validate_token_spend_limits(value: &serde_json::Value) -> Result<Vec<Toke
 pub fn default_token_spend_limits() -> serde_json::Value {
     serde_json::to_value([TokenSpendLimit {
         token: ARC_USDC_ADDRESS.into(),
-        max_per_execution_raw: "25000000".into(),
-        max_rolling_raw: "100000000".into(),
+        // Useful for real payment operations while still bounding a newly
+        // onboarded agent to $500 per run and $2,500 per rolling day.
+        max_per_execution_raw: DEFAULT_USDC_PER_PAYMENT_RAW.into(),
+        max_rolling_raw: DEFAULT_USDC_ROLLING_RAW.into(),
     }])
     .expect("default token spend policy is serializable")
 }
@@ -171,7 +175,13 @@ mod tests {
     #[test]
     fn token_limits_are_structured_unique_and_bounded() {
         let defaults = default_token_spend_limits();
-        assert_eq!(validate_token_spend_limits(&defaults).unwrap().len(), 1);
+        let parsed = validate_token_spend_limits(&defaults).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].max_per_execution_raw,
+            DEFAULT_USDC_PER_PAYMENT_RAW
+        );
+        assert_eq!(parsed[0].max_rolling_raw, DEFAULT_USDC_ROLLING_RAW);
         let duplicate = serde_json::json!([
             {"token": ARC_USDC_ADDRESS, "max_per_execution_raw": "1", "max_rolling_raw": "2"},
             {"token": ARC_USDC_ADDRESS.to_ascii_uppercase(), "max_per_execution_raw": "1", "max_rolling_raw": "2"}

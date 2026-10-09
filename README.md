@@ -4,10 +4,17 @@ Jusso is autonomous stablecoin operations infrastructure for AI agents and
 businesses. It turns owner-approved payment rules into durable USDC workflows
 on Arc: recurring payouts, balance reserves, and optional surplus sweeps.
 
-Each agent receives a dedicated ERC-4337 smart account owned by a
+By default, each agent receives a dedicated ERC-4337 smart account owned by a
 tenant-isolated Turnkey signer. Alchemy prepares and sponsors UserOperations;
 Jusso validates policy, simulates the complete batch, queues it idempotently,
 and verifies the onchain result. Agent private keys never enter Jusso.
+
+Organizations can alternatively connect a deployed Circle Agent Wallet. The
+owner proves control with Circle CLI and approves the binding with a Jusso
+passkey. Circle keeps its MPC keys and login session; Jusso stores only the
+verified address. Scheduled runs become exact, expiring payment intents that
+the connected agent executes with Circle CLI. Jusso independently verifies
+every Arc USDC transfer receipt before marking the run complete.
 
 ## Payment Workflows
 
@@ -46,6 +53,19 @@ Scheduler
   -> run history + optional webhook
 ```
 
+For Circle BYOW, the scheduler performs the same plan, policy, balance, reserve,
+recipient, per-payment, and rolling-window checks, then emits an exact Circle
+CLI transfer instruction. The agent retrieves it with
+`list_pending_circle_payments`, executes it without changing any field, and
+submits the transaction hash with `confirm_circle_payment`. Pending intents
+expire after 24 hours. This first adapter is designed for an always-on agent
+runtime with Circle CLI; Jusso never uploads or stores the owner's Circle
+session, OTP, user token, or MPC secret.
+
+The initial Circle adapter permits one recipient per plan and no surplus sweep.
+That keeps each scheduled payment atomic; multi-recipient Circle plans remain
+disabled until Circle provides a stable atomic batch execution surface.
+
 ## Funding
 
 The agent MCP can return the smart-account address at any time, including
@@ -81,7 +101,10 @@ splitting assets across two wallet models or advertising a nonfunctional route.
 - Stable idempotency keys and persisted signed operations make retries safe.
 - Arbitrary target/calldata submission is not exposed through MCP or HTTP.
 - Only Jusso-defined workflows can compile transactions for the execution engine.
-- Bring-your-own-wallet is disabled.
+- Circle Agent Wallet is the first BYOW adapter and uses signed ownership,
+  owner-passkey approval, expiring intents, and independent receipt checks.
+- External-wallet keys, Circle sessions, OTPs, and refresh tokens never enter
+  Jusso.
 
 ## MCP
 
@@ -101,6 +124,13 @@ Owners may also onboard locally:
 ```bash
 cargo run --bin jusso -- onboard --organization "Acme" --agent-id treasury --accept-terms
 ```
+
+To connect Circle Agent Wallet, the owner asks the assistant to begin a Circle
+wallet connection. Jusso returns an exact `circle wallet sign message` command.
+After Circle returns the signature, Jusso verifies it through EIP-1271 and opens
+a normal owner-passkey review. The wallet must already be deployed on the same
+Arc network; one transaction through Circle is enough to deploy a newly created
+wallet.
 
 Child agents enroll with a one-time token created by an owner-approved
 operation:
@@ -192,6 +222,10 @@ resource and revokes existing OAuth connections; remove and reconnect Jusso in
 each MCP client once after deploying this revision. Keep one application
 replica until the scheduler, queue workers, and recovery paths have completed
 multi-replica certification.
+
+Migration `003` adds Circle Agent Wallet connections and externally verified
+payment intents. It expires pending owner approvals so any in-progress change
+is reviewed again against the new approval model.
 
 ## Railway Testnet Deployment
 

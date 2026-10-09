@@ -133,7 +133,8 @@ pub(crate) fn is_public_ip(ip: IpAddr) -> bool {
 pub struct WebhookPayload {
     /// Unique event identifier for idempotency on the receiver side.
     pub event_id: Uuid,
-    /// Always `"execution.completed"` for now — room for more event types later.
+    /// Terminal event type, such as `"execution.completed"` or
+    /// `"payment_plan.completed"`.
     pub event_type: String,
     /// The execution request ID.
     pub request_id: Uuid,

@@ -362,6 +362,7 @@ pub async fn wallet_handler(
 
     match services::handle_get_wallet(
         &state.engine,
+        &state.db_pool,
         &state.wallet_registry,
         api_ctx.organization_id,
         &params.agent_id,
@@ -400,6 +401,7 @@ pub async fn wallet_balance_handler(
 
     match services::handle_get_wallet_balance(
         &state.engine,
+        &state.db_pool,
         &state.wallet_registry,
         api_ctx.organization_id,
         &params.agent_id,
