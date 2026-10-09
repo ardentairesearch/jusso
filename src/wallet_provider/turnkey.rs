@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
-use ethers::{
+use ethers_core::{
     types::{Address, Signature, H256, U256},
     utils::to_checksum,
 };
@@ -1134,11 +1134,18 @@ fn find_optional_api_user<'a>(
 fn validate_base_url(value: &str) -> Result<String> {
     let value = value.trim_end_matches('/');
     let parsed = reqwest::Url::parse(value).context("invalid TURNKEY_BASE_URL")?;
-    if parsed.scheme() != "https"
-        && parsed.host_str() != Some("localhost")
-        && parsed.host_str() != Some("127.0.0.1")
+    let local_http = parsed.scheme() == "http"
+        && matches!(
+            parsed.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        );
+    if (parsed.scheme() != "https" && !local_http)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
     {
-        bail!("TURNKEY_BASE_URL must use HTTPS outside local development");
+        bail!("TURNKEY_BASE_URL must be an HTTPS URL without credentials, query, or fragment outside local development");
     }
     Ok(value.to_string())
 }

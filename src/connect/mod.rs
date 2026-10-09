@@ -2139,9 +2139,9 @@ mod tests {
 
     #[test]
     fn endpoint_scopes_are_selected_without_crossing_roles() {
-        let scopes = requested_scopes(Some("wallet:read protocol:read"), auth::RUNTIME_SCOPES)
+        let scopes = requested_scopes(Some("wallet:read workflow:read"), auth::RUNTIME_SCOPES)
             .expect("runtime scopes");
-        assert_eq!(scopes, ["wallet:read", "protocol:read"]);
+        assert_eq!(scopes, ["wallet:read", "workflow:read"]);
         assert!(requested_scopes(Some("policy:manage"), auth::RUNTIME_SCOPES).is_err());
         assert!(requested_scopes(Some("transaction:execute"), auth::MANAGEMENT_SCOPES).is_err());
     }

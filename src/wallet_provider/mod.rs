@@ -8,7 +8,7 @@ mod turnkey;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use ethers::types::{Address, Signature, H256};
+use ethers_core::types::{Address, Signature, H256};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use std::{fmt, str::FromStr, sync::Arc};
@@ -375,7 +375,7 @@ impl TryFrom<ManagedWalletRow> for ManagedWallet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethers::signers::LocalWallet;
+    use ethers_signers::LocalWallet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]

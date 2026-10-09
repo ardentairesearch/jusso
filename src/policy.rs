@@ -1,7 +1,7 @@
 //! Typed policy-impact metadata and Policy Enforcement V2 primitives.
 
 use anyhow::{anyhow, Context, Result};
-use ethers::types::{Address, U256};
+use ethers_core::types::{Address, U256};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -103,11 +103,11 @@ impl ExecutionPolicyImpact {
         Ok(())
     }
 
-    pub fn uniswap_swap(token: Address, max_input: U256) -> Self {
+    pub fn token_spend(token: Address, amount: U256) -> Self {
         Self {
             token_spends: vec![TokenSpend {
                 token: format!("{token:?}").to_ascii_lowercase(),
-                amount_raw: max_input.to_string(),
+                amount_raw: amount.to_string(),
             }],
             ..Self::default()
         }

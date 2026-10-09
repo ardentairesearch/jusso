@@ -3,13 +3,11 @@
 //! Arc transaction submission uses dedicated ERC-4337 smart accounts.
 
 pub mod execution;
+pub mod rpc;
 pub mod smart_account;
 
 use anyhow::{bail, Context, Result};
-use ethers::{
-    providers::{Http, Middleware, Provider},
-    types::{Address, Bytes, TransactionRequest, H160, U256},
-};
+use ethers_core::types::{Address, H160, U256};
 
 pub const ARC_MAINNET_CHAIN_ID: u64 = 5042;
 pub const ARC_TESTNET_CHAIN_ID: u64 = 5_042_002;
@@ -83,15 +81,9 @@ pub async fn probe_rpc(
     rpc_url: &str,
     balance_address: Option<Address>,
 ) -> Result<ArcRpcStatus> {
-    if !rpc_url.starts_with("https://")
-        && !rpc_url.starts_with("http://localhost")
-        && !rpc_url.starts_with("http://127.0.0.1")
-    {
-        bail!("Arc RPC URL must use HTTPS outside local development");
-    }
-    let provider = Provider::<Http>::try_from(rpc_url).context("invalid Arc RPC URL")?;
+    let provider = rpc::ArcRpcClient::new(rpc_url)?;
     let actual_chain_id = provider
-        .get_chainid()
+        .chain_id()
         .await
         .context("Arc RPC chain ID failed")?;
     if actual_chain_id != U256::from(network.chain_id()) {
@@ -102,13 +94,7 @@ pub async fn probe_rpc(
     }
 
     let decimals = provider
-        .call(
-            &TransactionRequest::new()
-                .to(ARC_USDC_ADDRESS)
-                .data(Bytes::from_static(&[0x31, 0x3c, 0xe5, 0x67]))
-                .into(),
-            None,
-        )
+        .call(ARC_USDC_ADDRESS, &[0x31, 0x3c, 0xe5, 0x67])
         .await
         .context("Arc USDC decimals() call failed")?;
     if decimals.len() != 32
@@ -121,7 +107,7 @@ pub async fn probe_rpc(
         .parse()
         .expect("fixed ERC-4337 EntryPoint address");
     if provider
-        .get_code(entry_point, None)
+        .get_code(entry_point)
         .await
         .context("Arc ERC-4337 EntryPoint code lookup failed")?
         .is_empty()
@@ -130,7 +116,7 @@ pub async fn probe_rpc(
     }
 
     let gas_price_wei = provider
-        .get_gas_price()
+        .gas_price()
         .await
         .context("Arc gas price lookup failed")?;
     if gas_price_wei < U256::from(ARC_MIN_GAS_PRICE_WEI) {
@@ -139,7 +125,7 @@ pub async fn probe_rpc(
     let native_usdc_balance_wei = match balance_address {
         Some(address) => Some(
             provider
-                .get_balance(address, None)
+                .get_balance(address)
                 .await
                 .context("Arc native USDC balance lookup failed")?,
         ),
@@ -155,46 +141,13 @@ pub async fn probe_rpc(
 /// Check that a configured bundler actually supports the EntryPoint deployed
 /// on Arc. This is a discovery check only and does not submit a UserOperation.
 pub async fn probe_bundler(bundler_url: &str) -> Result<ArcBundlerStatus> {
-    if !bundler_url.starts_with("https://")
-        && !bundler_url.starts_with("http://localhost")
-        && !bundler_url.starts_with("http://127.0.0.1")
-    {
-        bail!("Arc bundler URL must use HTTPS outside local development");
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .context("failed to build Arc bundler client")?;
-    let response = client
-        .post(bundler_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_supportedEntryPoints",
-            "params": []
-        }))
-        .send()
-        .await
-        .context("Arc bundler discovery request failed")?
-        .error_for_status()
-        .context("Arc bundler discovery returned a non-success HTTP status")?;
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .context("Arc bundler discovery returned invalid JSON")?;
-    let supported = body
-        .get("result")
-        .and_then(serde_json::Value::as_array)
-        .context("Arc bundler did not return an EntryPoint array")?;
+    let supported = rpc::ArcRpcClient::new(bundler_url)?
+        .supported_entry_points()
+        .await?;
     let entry_point: Address = ARC_ENTRY_POINT_V07
         .parse()
         .expect("fixed ERC-4337 EntryPoint address");
-    let found = supported.iter().any(|value| {
-        value
-            .as_str()
-            .and_then(|address| address.parse::<Address>().ok())
-            == Some(entry_point)
-    });
+    let found = supported.contains(&entry_point);
     if !found {
         bail!("Arc bundler does not support ERC-4337 EntryPoint v0.7");
     }

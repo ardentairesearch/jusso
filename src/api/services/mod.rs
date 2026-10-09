@@ -7,10 +7,9 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use ethers::abi::{decode, ParamType};
-use ethers::prelude::Middleware;
-use ethers::types::{Address, Bytes, TransactionRequest, U256};
-use ethers::utils::format_units;
+use ethers_core::abi::{decode, ParamType};
+use ethers_core::types::{Address, U256};
+use ethers_core::utils::format_units;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tracing::info;
@@ -75,7 +74,7 @@ pub async fn resolve_chain_smart_wallet_address(
 }
 
 /// Execute through the normal Jusso flow. The configured execution-token fee
-/// is always embedded in the same native transaction as the protocol action.
+/// is always embedded in the same native transaction as the requested calls.
 pub async fn handle_execute_idempotent(
     engine: &ExecutionEngine,
     pool: &PgPool,
@@ -108,31 +107,6 @@ pub async fn handle_execute_idempotent(
     )
     .await;
     result
-}
-
-/// Return a previously accepted typed execution before recomputing a mutable
-/// pool selection, quote, deadline, balance, or position-derived amount.
-pub async fn handle_existing_protocol_execution(
-    engine: &ExecutionEngine,
-    pool: &PgPool,
-    auth_context: &AuthContext,
-    agent_id: &str,
-    idempotency_key: &str,
-) -> Result<Option<ExecutionResponse>> {
-    let Some(row) = db::get_execution_request_by_idempotency_key_for_agent(
-        pool,
-        auth_context,
-        agent_id,
-        idempotency_key,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let chain = Chain::from_str_loose(&row.chain)
-        .ok_or_else(|| anyhow::anyhow!("stored execution has unsupported chain {}", row.chain))?;
-    let execution_token = &engine.config.chain_config(&chain)?.execution_token;
-    existing_execution_response(row, execution_token).map(Some)
 }
 
 /// Create the locked quote used by the x402 challenge response.
@@ -170,7 +144,7 @@ pub async fn handle_x402_quote(
     result
 }
 
-/// Re-simulate the protocol action immediately before x402 settlement without
+/// Re-simulate the requested calls immediately before x402 settlement without
 /// adding the normal in-batch fee transfer.
 pub async fn handle_x402_preflight(
     engine: &ExecutionEngine,
@@ -854,7 +828,7 @@ async fn prepare_atomic_fee_execution(
 }
 
 pub(crate) async fn fetch_erc20_balance_of(
-    provider: &ethers::providers::Provider<ethers::providers::Http>,
+    provider: &crate::arc::rpc::ArcRpcClient,
     token_contract: Address,
     wallet: Address,
 ) -> Result<U256> {
@@ -864,11 +838,7 @@ pub(crate) async fn fetch_erc20_balance_of(
     addr_slot[12..32].copy_from_slice(wallet.as_bytes());
     data.extend_from_slice(&addr_slot);
 
-    let call = TransactionRequest::new()
-        .to(token_contract)
-        .data(Bytes::from(data));
-
-    let raw = provider.call(&call.into(), None).await?;
+    let raw = provider.call(token_contract, &data).await?;
     if raw.0.len() < 32 {
         anyhow::bail!("short balanceOf return data length {}", raw.0.len());
     }
@@ -887,7 +857,7 @@ pub async fn validate_execution_token(engine: &ExecutionEngine) -> Result<()> {
     let chain_config = engine.config.chain_config(&chain)?;
     let provider = engine.provider_for_chain(&chain)?;
     let configured = &chain_config.execution_token;
-    let code = provider.get_code(configured.address, None).await?;
+    let code = provider.get_code(configured.address).await?;
     if code.is_empty() {
         anyhow::bail!(
             "configured {} execution token has no bytecode at {:?}",
@@ -918,17 +888,11 @@ pub async fn validate_execution_token(engine: &ExecutionEngine) -> Result<()> {
 }
 
 async fn read_erc20_symbol(
-    provider: &ethers::providers::Provider<ethers::providers::Http>,
+    provider: &crate::arc::rpc::ArcRpcClient,
     token: Address,
 ) -> Result<String> {
     let raw = provider
-        .call(
-            &TransactionRequest::new()
-                .to(token)
-                .data(Bytes::from_static(&[0x95, 0xd8, 0x9b, 0x41]))
-                .into(),
-            None,
-        )
+        .call(token, &[0x95, 0xd8, 0x9b, 0x41])
         .await
         .context("execution token symbol() call failed")?;
     decode(&[ParamType::String], &raw)
@@ -941,17 +905,11 @@ async fn read_erc20_symbol(
 }
 
 async fn read_erc20_decimals(
-    provider: &ethers::providers::Provider<ethers::providers::Http>,
+    provider: &crate::arc::rpc::ArcRpcClient,
     token: Address,
 ) -> Result<u8> {
     let raw = provider
-        .call(
-            &TransactionRequest::new()
-                .to(token)
-                .data(Bytes::from_static(&[0x31, 0x3c, 0xe5, 0x67]))
-                .into(),
-            None,
-        )
+        .call(token, &[0x31, 0x3c, 0xe5, 0x67])
         .await
         .context("execution token decimals() call failed")?;
     if raw.len() != 32 {
@@ -1261,7 +1219,7 @@ pub async fn handle_get_wallet(
 
     // A counterfactual ERC-4337 account is fundable before deployment.
     let provider = engine.provider_for_chain(&resolved_chain)?;
-    let code: ethers::types::Bytes = provider.get_code(smart_wallet_addr, None).await?;
+    let code = provider.get_code(smart_wallet_addr).await?;
     let deployed = !code.is_empty();
 
     let smart_wallet_str = format!("{smart_wallet_addr:?}");

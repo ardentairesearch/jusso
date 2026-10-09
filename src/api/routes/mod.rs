@@ -6,10 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use ethers::{
-    providers::Middleware,
-    types::{Address, U256},
-};
+use ethers_core::types::{Address, U256};
 use hmac::{Hmac, Mac};
 use redis::aio::ConnectionManager;
 use sha2::Sha256;
@@ -27,10 +24,6 @@ use crate::db;
 use crate::execution_engine::ExecutionEngine;
 use crate::payments::x402::{
     self, FacilitatorClient, PaymentRequired, PaymentRequirements, ResourceInfo,
-};
-use crate::protocols::uniswap_v4::{
-    service as uniswap_v4_service, UniswapBalancesQuery, UniswapPoolQuery, UniswapPoolsQuery,
-    UniswapSwapRequest,
 };
 use crate::types::*;
 
@@ -158,17 +151,6 @@ fn required_idempotency_key(headers: &HeaderMap) -> Result<&str, RequestValidati
     Ok(value)
 }
 
-pub async fn protocol_not_enabled_handler() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({
-            "error": "protocol_not_enabled",
-            "message": "Only the Uniswap V4 protocol routes are enabled on Arc testnet."
-        })),
-    )
-        .into_response()
-}
-
 #[derive(Clone)]
 pub struct AdminAuthState {
     token: Arc<Zeroizing<String>>,
@@ -177,41 +159,6 @@ pub struct AdminAuthState {
 pub async fn validate_beta_runtime_startup(engine: &ExecutionEngine) -> anyhow::Result<()> {
     services::validate_execution_token(engine).await?;
     services::arc_fee_recipient_status(engine).await?;
-    validate_protocol_deployments(engine).await?;
-    Ok(())
-}
-
-async fn validate_protocol_deployments(engine: &ExecutionEngine) -> anyhow::Result<()> {
-    if engine.config.arc_network != crate::arc::ArcNetwork::Testnet {
-        return Ok(());
-    }
-    let provider = engine.provider_for_chain(&Chain::ArcTestnet)?;
-    for (name, address) in [
-        (
-            "Uniswap V4 PoolManager",
-            crate::protocols::uniswap_v4::adapter::pool_manager_address(),
-        ),
-        (
-            "Uniswap V4 Universal Router",
-            crate::protocols::uniswap_v4::adapter::universal_router_address(),
-        ),
-        (
-            "Uniswap V4 StateView",
-            crate::protocols::uniswap_v4::adapter::state_view_address(),
-        ),
-        (
-            "Uniswap V4 Quoter",
-            crate::protocols::uniswap_v4::adapter::quoter_address(),
-        ),
-        (
-            "Permit2",
-            crate::protocols::uniswap_v4::adapter::permit2_address(),
-        ),
-    ] {
-        if provider.get_code(address, None).await?.is_empty() {
-            anyhow::bail!("{name} has no code at the pinned Arc testnet address {address:?}");
-        }
-    }
     Ok(())
 }
 
@@ -309,7 +256,7 @@ pub async fn x402_execute_handler(
                     Ok(required) => {
                         let encoded = match x402::encode_header(&required) {
                             Ok(value) => value,
-                            Err(error) => return protocol_error_to_http(error),
+                            Err(error) => return execution_error_to_http(error),
                         };
                         let mut response = (
                             StatusCode::PAYMENT_REQUIRED,
@@ -323,11 +270,11 @@ pub async fn x402_execute_handler(
                         );
                         response
                     }
-                    Err(error) => protocol_error_to_http(error),
+                    Err(error) => execution_error_to_http(error),
                 }
             }
             Ok(resp) => execution_response_to_http(resp),
-            Err(error) => protocol_error_to_http(error),
+            Err(error) => execution_error_to_http(error),
         };
     }
 
@@ -556,7 +503,7 @@ pub async fn x402_execute_handler(
         Ok((execution, settled)) => {
             let encoded = match x402::encode_header(&settled) {
                 Ok(value) => value,
-                Err(error) => return protocol_error_to_http(error),
+                Err(error) => return execution_error_to_http(error),
             };
             let mut response = execution_response_to_http(execution);
             response.headers_mut().insert(
@@ -684,7 +631,7 @@ fn execution_response_to_http(response: ExecutionResponse) -> Response {
     (status, Json(serde_json::to_value(response).unwrap())).into_response()
 }
 
-fn protocol_error_to_http(error: anyhow::Error) -> Response {
+fn execution_error_to_http(error: anyhow::Error) -> Response {
     error!(%error, "execution request failed");
     let message = error.to_string();
     let status = if message.contains("idempotency key") {
@@ -710,153 +657,6 @@ fn protocol_error_to_http(error: anyhow::Error) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR
     };
     (status, Json(serde_json::json!({"error": message}))).into_response()
-}
-
-async fn existing_protocol_execution_response(
-    state: &AppState,
-    auth_context: &AuthContext,
-    agent_id: &str,
-    idempotency_key: &str,
-) -> anyhow::Result<Option<Response>> {
-    Ok(services::handle_existing_protocol_execution(
-        &state.engine,
-        &state.db_pool,
-        auth_context,
-        agent_id,
-        idempotency_key,
-    )
-    .await?
-    .map(execution_response_to_http))
-}
-
-pub async fn uniswap_v4_swap_handler(
-    State(state): State<AppState>,
-    Extension(auth_context): Extension<AuthContext>,
-    headers: HeaderMap,
-    Json(request): Json<UniswapSwapRequest>,
-) -> Response {
-    let idempotency_key = match required_idempotency_key(&headers) {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
-    match existing_protocol_execution_response(
-        &state,
-        &auth_context,
-        &request.agent_id,
-        idempotency_key,
-    )
-    .await
-    {
-        Ok(Some(response)) => return response,
-        Ok(None) => {}
-        Err(error) => return protocol_error_to_http(error),
-    }
-    let mut redis = state.redis_conn.clone();
-    match uniswap_v4_service::handle_swap(
-        &state.engine,
-        &state.db_pool,
-        &mut redis,
-        &state.wallet_registry,
-        &auth_context,
-        &request,
-        idempotency_key,
-    )
-    .await
-    {
-        Ok(response) => execution_response_to_http(response),
-        Err(error) if error.to_string().contains("idempotency key") => {
-            match existing_protocol_execution_response(
-                &state,
-                &auth_context,
-                &request.agent_id,
-                idempotency_key,
-            )
-            .await
-            {
-                Ok(Some(response)) => response,
-                Ok(None) => protocol_error_to_http(error),
-                Err(recovery_error) => protocol_error_to_http(recovery_error),
-            }
-        }
-        Err(error) => protocol_error_to_http(error),
-    }
-}
-
-pub async fn uniswap_v4_swap_simulate_handler(
-    State(state): State<AppState>,
-    Extension(auth_context): Extension<AuthContext>,
-    Json(request): Json<UniswapSwapRequest>,
-) -> Response {
-    match uniswap_v4_service::handle_swap_simulate(
-        &state.engine,
-        &state.db_pool,
-        &state.wallet_registry,
-        &auth_context,
-        &request,
-    )
-    .await
-    {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(error) => protocol_error_to_http(error),
-    }
-}
-
-pub async fn uniswap_v4_quote_handler(
-    State(state): State<AppState>,
-    Extension(auth_context): Extension<AuthContext>,
-    Json(request): Json<UniswapSwapRequest>,
-) -> Response {
-    match uniswap_v4_service::handle_quote(
-        &state.engine,
-        &state.wallet_registry,
-        auth_context.organization_id,
-        &request,
-    )
-    .await
-    {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(error) => protocol_error_to_http(error),
-    }
-}
-
-pub async fn uniswap_v4_pool_handler(
-    State(state): State<AppState>,
-    Extension(_auth_context): Extension<AuthContext>,
-    Query(query): Query<UniswapPoolQuery>,
-) -> Response {
-    match uniswap_v4_service::handle_pool(&state.engine, &query).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(error) => protocol_error_to_http(error),
-    }
-}
-
-pub async fn uniswap_v4_pools_handler(
-    State(state): State<AppState>,
-    Extension(_auth_context): Extension<AuthContext>,
-    Query(query): Query<UniswapPoolsQuery>,
-) -> Response {
-    match uniswap_v4_service::handle_pools(&state.engine, &query).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(error) => protocol_error_to_http(error),
-    }
-}
-
-pub async fn uniswap_v4_balances_handler(
-    State(state): State<AppState>,
-    Extension(auth_context): Extension<AuthContext>,
-    Query(query): Query<UniswapBalancesQuery>,
-) -> Response {
-    match uniswap_v4_service::handle_balances(
-        &state.engine,
-        &state.wallet_registry,
-        auth_context.organization_id,
-        &query,
-    )
-    .await
-    {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(error) => protocol_error_to_http(error),
-    }
 }
 
 // ────────────────────── GET /status/:id ──────────────────────────────

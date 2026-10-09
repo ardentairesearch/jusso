@@ -5,7 +5,7 @@
 //! the agent's fundable Arc smart account is resolved separately.
 
 use anyhow::{anyhow, Context, Result};
-use ethers::types::Address;
+use ethers_core::types::Address;
 use sqlx::PgPool;
 use tracing::info;
 use uuid::Uuid;
@@ -278,7 +278,7 @@ fn validate_agent_id(agent_id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ethers::types::{Signature, H256};
+    use ethers_core::types::{Signature, H256};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -376,7 +376,7 @@ mod tests {
         .unwrap();
 
         let address =
-            Address::from_slice(&ethers::utils::keccak256(organization_id.as_bytes())[..20]);
+            Address::from_slice(&ethers_core::utils::keccak256(organization_id.as_bytes())[..20]);
         let manager = WalletManager::new(pool.clone(), Arc::new(ProvisioningProvider { address }));
         let registry = AgentWalletRegistry::new(pool.clone(), manager);
 

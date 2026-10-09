@@ -12,7 +12,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{Duration, Utc};
-use ethers::types::U256;
+use ethers_core::types::U256;
 use jsonwebtoken::{
     decode, decode_header, encode,
     jwk::{Jwk, JwkSet},
@@ -32,23 +32,23 @@ use crate::{
 
 pub const RUNTIME_SCOPES: &[&str] = &[
     "wallet:read",
-    "protocol:read",
+    "workflow:read",
     "execution:read",
     "transaction:simulate",
     "transaction:execute",
 ];
 
-pub const SUPPORTED_PROTOCOLS: &[&str] = &["uniswap-v4"];
+pub const SUPPORTED_PROTOCOLS: &[&str] = &[];
 
-pub const SUPPORTED_PROTOCOL_ACTIONS: &[&str] = &["protocol:uniswap-v4:swap"];
+pub const SUPPORTED_WORKFLOW_ACTIONS: &[&str] = &["payment_plan:execute"];
 
 pub const DEFAULT_POLICY_ACTIONS: &[&str] = &[
     "wallet:read",
-    "protocol:read",
+    "workflow:read",
     "execution:read",
     "transaction:simulate",
     "transaction:execute",
-    "protocol:uniswap-v4:swap",
+    "payment_plan:execute",
 ];
 
 pub const DEFAULT_MAX_EXECUTION_FEE_USD: f64 = 1.0;
@@ -63,11 +63,12 @@ pub const MANAGEMENT_SCOPES: &[&str] = &[
     "credential:manage",
     "trust:manage",
     "policy:manage",
+    "workflow:manage",
 ];
 
 pub const DEFAULT_SCOPES: &[&str] = &[
     "wallet:read",
-    "protocol:read",
+    "workflow:read",
     "execution:read",
     "transaction:simulate",
     "transaction:execute",
@@ -75,6 +76,7 @@ pub const DEFAULT_SCOPES: &[&str] = &[
     "credential:manage",
     "trust:manage",
     "policy:manage",
+    "workflow:manage",
 ];
 
 pub fn validate_scopes(scopes: &[String]) -> Result<()> {
@@ -113,15 +115,14 @@ pub fn validate_policy_actions(actions: &[String]) -> Result<()> {
     if let Some(action) = actions.iter().find(|action| {
         action.as_str() != "*"
             && !RUNTIME_SCOPES.contains(&action.as_str())
-            && !SUPPORTED_PROTOCOL_ACTIONS.contains(&action.as_str())
+            && !SUPPORTED_WORKFLOW_ACTIONS.contains(&action.as_str())
     }) {
         anyhow::bail!("unknown runtime policy action: {action}");
     }
     Ok(())
 }
 
-/// Enforce limits that can only be evaluated after a typed protocol request
-/// has been compiled into its exact onchain calls.
+/// Enforce limits after a typed action has been compiled into exact onchain calls.
 pub fn enforce_compiled_execution_limits(
     policy: &db::models::AuthorizationPolicyRow,
     request: &ExecutionRequest,
@@ -389,6 +390,8 @@ pub async fn verify_registration_challenge(
         .ok_or_else(|| anyhow!("registration challenge is required"))?;
     let response = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .build()?
         .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
         .form(&[
@@ -490,7 +493,6 @@ impl AuthService {
         chain: Option<&str>,
         required_scope: &'static str,
         resource: &'static str,
-        protocol: Option<&'static str>,
     ) -> Result<AuthContext> {
         if !context.allows_scope(required_scope) {
             anyhow::bail!("access token does not grant {required_scope}");
@@ -506,15 +508,8 @@ impl AuthService {
             chain: chain.map(str::to_string),
             ..AuthorizationInput::default()
         };
-        self.enforce_policy(
-            &authorized,
-            &policy,
-            required_scope,
-            resource,
-            &input,
-            protocol,
-        )
-        .await?;
+        self.enforce_policy(&authorized, &policy, required_scope, resource, &input)
+            .await?;
         Ok(authorized)
     }
 
@@ -1324,9 +1319,8 @@ impl AuthService {
         action: &str,
         resource: &str,
         input: &AuthorizationInput,
-        protocol: Option<&str>,
     ) -> Result<()> {
-        if action.starts_with("transaction:") && protocol.is_none() && !policy.allow_raw_execution {
+        if action.starts_with("transaction:") && !policy.allow_raw_execution {
             anyhow::bail!("raw transaction routes require an explicit policy opt-in");
         }
         if let Some(allowed) = &policy.allowed_chains {
@@ -1339,25 +1333,12 @@ impl AuthService {
                 }
             }
         }
-        enforce_protocol_permission(policy.allowed_protocols.as_deref(), protocol)?;
         if let Some(allowed) = &policy.allowed_actions {
             if !allowed
                 .iter()
                 .any(|candidate| candidate == "*" || candidate == action)
             {
                 anyhow::bail!("action is denied by authorization policy");
-            }
-            if action == "transaction:execute" {
-                if let Some(protocol_action) = protocol_action_from_path(resource) {
-                    if !allowed
-                        .iter()
-                        .any(|candidate| candidate == "*" || candidate == protocol_action)
-                    {
-                        anyhow::bail!(
-                            "protocol action requires explicit authorization: {protocol_action}"
-                        );
-                    }
-                }
             }
         }
         if let Some(allowed) = &policy.allowed_targets {
@@ -1384,7 +1365,6 @@ impl AuthService {
             "allow",
             serde_json::json!({
                 "chain": input.chain,
-                "protocol": protocol,
                 "policy_id": policy.id,
                 "policy_version": policy.version
             }),
@@ -1392,23 +1372,6 @@ impl AuthService {
         .await
         .ok();
         Ok(())
-    }
-}
-
-fn enforce_protocol_permission(
-    allowed_protocols: Option<&[String]>,
-    protocol: Option<&str>,
-) -> Result<()> {
-    let (Some(allowed), Some(protocol)) = (allowed_protocols, protocol) else {
-        return Ok(());
-    };
-    if allowed
-        .iter()
-        .any(|candidate| candidate == "*" || candidate == protocol)
-    {
-        Ok(())
-    } else {
-        anyhow::bail!("protocol is denied by authorization policy")
     }
 }
 
@@ -1740,9 +1703,10 @@ pub(crate) async fn hardened_public_https_client(value: &str) -> Result<reqwest:
     }
     reqwest::Client::builder()
         .redirect(Policy::none())
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(10))
         .connect_timeout(std::time::Duration::from_secs(5))
-        .resolve(host, addresses[0])
+        .resolve_to_addrs(host, &addresses)
         .build()
         .context("failed to build federation HTTP client")
 }
@@ -1799,7 +1763,7 @@ pub async fn authorization_middleware(
                 .into_response()
         }
     };
-    let required_scope = scope_for(request.method(), request.uri().path());
+    let required_scope = scope_for(request.uri().path());
     if !context.allows_scope(required_scope) {
         db::insert_auth_audit_event(
             &auth.pool,
@@ -1862,16 +1826,8 @@ pub async fn authorization_middleware(
                 Ok((agent, policy)) => {
                     context.agent_id = Some(agent.id);
                     context.agent_external_id = Some(agent.external_id);
-                    let protocol = protocol_from_path(parts.uri.path());
                     if let Err(error) = auth
-                        .enforce_policy(
-                            &context,
-                            &policy,
-                            required_scope,
-                            parts.uri.path(),
-                            &input,
-                            protocol,
-                        )
+                        .enforce_policy(&context, &policy, required_scope, parts.uri.path(), &input)
                         .await
                     {
                         db::insert_auth_audit_event(
@@ -1961,20 +1917,7 @@ impl AuthorizationInput {
     }
 }
 
-fn protocol_from_path(path: &str) -> Option<&str> {
-    path.strip_prefix("/protocols/")
-        .and_then(|suffix| suffix.split('/').next())
-        .filter(|protocol| !protocol.is_empty())
-}
-
-fn protocol_action_from_path(path: &str) -> Option<&'static str> {
-    match path {
-        "/protocols/uniswap-v4/swap" => Some("protocol:uniswap-v4:swap"),
-        _ => None,
-    }
-}
-
-fn scope_for(method: &Method, path: &str) -> &'static str {
+fn scope_for(path: &str) -> &'static str {
     if path.starts_with("/agents") {
         "agent:manage"
     } else if path.starts_with("/credential-bindings") {
@@ -1989,8 +1932,6 @@ fn scope_for(method: &Method, path: &str) -> &'static str {
         "wallet:read"
     } else if path.ends_with("/simulate") || path.ends_with("/quote") || path == "/simulate" {
         "transaction:simulate"
-    } else if method == Method::GET && path.starts_with("/protocols/") {
-        "protocol:read"
     } else {
         "transaction:execute"
     }
@@ -2066,16 +2007,8 @@ mod tests {
 
     #[test]
     fn maps_route_scopes() {
-        assert_eq!(scope_for(&Method::GET, "/wallet"), "wallet:read");
-        assert_eq!(scope_for(&Method::POST, "/agents"), "agent:manage");
-        assert_eq!(
-            scope_for(&Method::POST, "/protocols/uniswap-v4/swap/simulate"),
-            "transaction:simulate"
-        );
-        assert_eq!(
-            scope_for(&Method::POST, "/protocols/uniswap-v4/swap"),
-            "transaction:execute"
-        );
+        assert_eq!(scope_for("/wallet"), "wallet:read");
+        assert_eq!(scope_for("/agents"), "agent:manage");
     }
 
     #[test]
@@ -2101,29 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn uniswap_protocol_action_is_exact() {
-        assert_eq!(
-            protocol_action_from_path("/protocols/uniswap-v4/swap"),
-            Some("protocol:uniswap-v4:swap")
-        );
-        assert_eq!(
-            protocol_action_from_path("/protocols/uniswap-v4/swap/simulate"),
-            None
-        );
-        assert_eq!(protocol_action_from_path("/protocols/morpho/borrow"), None);
-        assert!(DEFAULT_POLICY_ACTIONS.contains(&"protocol:uniswap-v4:swap"));
-    }
-
-    #[test]
-    fn protocol_allow_list_does_not_disable_separately_opted_in_raw_routes() {
-        let allowed = vec!["uniswap-v4".to_string()];
-        assert!(enforce_protocol_permission(Some(&allowed), None).is_ok());
-        assert!(enforce_protocol_permission(Some(&allowed), Some("uniswap-v4")).is_ok());
-        assert!(enforce_protocol_permission(Some(&allowed), Some("other-protocol")).is_err());
-    }
-
-    #[test]
-    fn compiled_protocol_calls_obey_target_and_native_value_limits() {
+    fn compiled_workflow_calls_obey_target_and_native_value_limits() {
         let now = Utc::now();
         let policy = db::models::AuthorizationPolicyRow {
             id: Uuid::new_v4(),
@@ -2131,8 +2042,8 @@ mod tests {
             name: "test".into(),
             version: 1,
             allowed_chains: Some(vec!["arc-testnet".into()]),
-            allowed_protocols: Some(vec!["uniswap-v4".into()]),
-            allowed_actions: Some(vec!["protocol:uniswap-v4:swap".into()]),
+            allowed_protocols: None,
+            allowed_actions: Some(vec!["payment_plan:execute".into()]),
             allowed_targets: Some(vec!["0x0000000000000000000000000000000000000001".into()]),
             allow_raw_execution: false,
             max_value_wei: Some("0".into()),
@@ -2180,8 +2091,8 @@ mod tests {
             name: "impact-test".into(),
             version: 1,
             allowed_chains: Some(vec!["arc-testnet".into()]),
-            allowed_protocols: Some(vec!["uniswap-v4".into()]),
-            allowed_actions: Some(vec!["protocol:uniswap-v4:swap".into()]),
+            allowed_protocols: None,
+            allowed_actions: Some(vec!["payment_plan:execute".into()]),
             allowed_targets: Some(vec!["*".into()]),
             allow_raw_execution: false,
             max_value_wei: Some("0".into()),
@@ -2202,13 +2113,13 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let allowed = crate::policy::ExecutionPolicyImpact::uniswap_swap(
+        let allowed = crate::policy::ExecutionPolicyImpact::token_spend(
             crate::policy::ARC_USDC_ADDRESS.parse().unwrap(),
             U256::from(5_000_000u64),
         );
         assert!(enforce_policy_impact(&policy, &allowed).is_ok());
 
-        let oversized = crate::policy::ExecutionPolicyImpact::uniswap_swap(
+        let oversized = crate::policy::ExecutionPolicyImpact::token_spend(
             crate::policy::ARC_USDC_ADDRESS.parse().unwrap(),
             U256::from(5_000_001u64),
         );

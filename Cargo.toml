@@ -30,35 +30,41 @@ tower-http = { version = "0.5", features = ["cors", "trace", "request-id", "limi
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-jsonwebtoken = "8.3"
+jsonwebtoken = "9.3"
 serde_urlencoded = "0.7"
 schemars = "1"
 
 # Database
-sqlx = { version = "0.7", features = [
+sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls",
     "postgres",
     "uuid",
     "chrono",
+    "derive",
+    "macros",
     "migrate",
 ] }
 
 # Redis
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 
-# Blockchain — ethers
-ethers = { version = "2", features = ["legacy", "rustls"] }
+# Ethereum ABI, hashing, signatures, and value types. Arc JSON-RPC uses the
+# minimal client in `src/arc/rpc.rs` instead of the legacy provider stack.
+ethers-core = { version = "2", default-features = false }
 
 # Logging / observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# HTTP clients for wallet APIs, auth, and protocol reads
+# HTTP clients for wallet APIs, authentication, and provider integrations
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
+url = "2"
 anyhow = "1"
 dotenvy = "0.15"
 hex = "0.4"
@@ -77,3 +83,6 @@ turnkey_client = "0.13.1"
 # Remote MCP and owner approval ceremonies
 rmcp = { version = "3.5.0", features = ["server", "transport-streamable-http-server"] }
 webauthn-rs = { version = "0.5.2", features = ["danger-allow-state-serialisation"] }
+
+[dev-dependencies]
+ethers-signers = { version = "2", default-features = false }

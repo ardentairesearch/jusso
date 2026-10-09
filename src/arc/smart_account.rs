@@ -6,10 +6,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use ethers::{
+use ethers_core::{
     abi::{decode, encode, ParamType, Token},
-    providers::{Http, Middleware, Provider},
-    types::{Address, Bytes, TransactionRequest, H256, U256},
+    types::{Address, H256, U256},
     utils::keccak256,
 };
 use serde_json::{json, Value};
@@ -74,19 +73,13 @@ pub trait SmartAccountVerifier: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub struct AlchemyMav2Verifier {
-    provider: Provider<Http>,
+    provider: crate::arc::rpc::ArcRpcClient,
 }
 
 impl AlchemyMav2Verifier {
     pub fn new(rpc_url: &str) -> Result<Self> {
-        if !rpc_url.starts_with("https://")
-            && !rpc_url.starts_with("http://localhost")
-            && !rpc_url.starts_with("http://127.0.0.1")
-        {
-            bail!("Arc RPC URL must use HTTPS outside local development");
-        }
         Ok(Self {
-            provider: Provider::<Http>::try_from(rpc_url).context("invalid Arc RPC URL")?,
+            provider: crate::arc::rpc::ArcRpcClient::new(rpc_url)?,
         })
     }
 
@@ -100,13 +93,7 @@ impl AlchemyMav2Verifier {
         data.extend(encode(&arguments));
         let raw = self
             .provider
-            .call(
-                &TransactionRequest::new()
-                    .to(contract)
-                    .data(Bytes::from(data))
-                    .into(),
-                None,
-            )
+            .call(contract, &data)
             .await
             .with_context(|| format!("Arc contract call failed: {signature}"))?;
         let decoded = decode(&[ParamType::Address], &raw)
@@ -118,13 +105,10 @@ impl AlchemyMav2Verifier {
     }
 
     async fn call_fallback_signer(&self, contract: Address) -> Result<(Address, bool)> {
-        let data = Bytes::from(keccak256(b"getFallbackSignerData()")[..4].to_vec());
+        let data = keccak256(b"getFallbackSignerData()")[..4].to_vec();
         let raw = self
             .provider
-            .call(
-                &TransactionRequest::new().to(contract).data(data).into(),
-                None,
-            )
+            .call(contract, &data)
             .await
             .context("Arc fallback-signer lookup failed")?;
         decode_fallback_signer_data(&raw)
@@ -164,7 +148,7 @@ impl SmartAccountVerifier for AlchemyMav2Verifier {
         let factory: Address = MAV2_FACTORY.parse().expect("fixed MAv2 factory address");
         if self
             .provider
-            .get_code(factory, None)
+            .get_code(factory)
             .await
             .context("MAv2 factory code lookup failed")?
             .is_empty()
@@ -204,7 +188,7 @@ impl SmartAccountVerifier for AlchemyMav2Verifier {
 
         let code = self
             .provider
-            .get_code(account, None)
+            .get_code(account)
             .await
             .context("smart-account code lookup failed")?;
         if code.is_empty() {
@@ -218,7 +202,7 @@ impl SmartAccountVerifier for AlchemyMav2Verifier {
             .expect("fixed ERC-1967 implementation slot");
         let stored_implementation = self
             .provider
-            .get_storage_at(account, implementation_slot, None)
+            .get_storage_at(account, implementation_slot)
             .await
             .context("smart-account implementation lookup failed")?;
         validate_deployed_account(&code, stored_implementation, initial_signer, implementation)?;
@@ -235,7 +219,7 @@ impl SmartAccountVerifier for AlchemyMav2Verifier {
         }
         if self
             .provider
-            .get_code(account, None)
+            .get_code(account)
             .await
             .context("smart-account code lookup failed")?
             .is_empty()
@@ -296,6 +280,8 @@ impl AlchemySmartAccountProvider {
             endpoint,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()
                 .context("failed to build Alchemy Wallet API client")?,
         })

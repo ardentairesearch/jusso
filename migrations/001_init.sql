@@ -18,7 +18,8 @@ CREATE TABLE principals (
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended')),
     auth_version BIGINT NOT NULL DEFAULT 1 CHECK (auth_version > 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (id, organization_id)
 );
 CREATE INDEX idx_principals_organization ON principals(organization_id);
 
@@ -179,8 +180,19 @@ CREATE TABLE oauth_clients (
     client_name TEXT NOT NULL,
     redirect_uris TEXT[] NOT NULL CHECK (cardinality(redirect_uris) BETWEEN 1 AND 10),
     token_endpoint_auth_method TEXT NOT NULL DEFAULT 'none'
-        CHECK (token_endpoint_auth_method = 'none'),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        CHECK (token_endpoint_auth_method IN ('none', 'private_key_jwt')),
+    jwks_uri TEXT,
+    token_endpoint_auth_signing_alg TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (
+        (token_endpoint_auth_method = 'none'
+            AND jwks_uri IS NULL
+            AND token_endpoint_auth_signing_alg IS NULL)
+        OR
+        (token_endpoint_auth_method = 'private_key_jwt'
+            AND jwks_uri IS NOT NULL
+            AND token_endpoint_auth_signing_alg IS NOT NULL)
+    )
 );
 
 CREATE TABLE connect_sessions (
@@ -371,7 +383,8 @@ CREATE TABLE owner_approval_requests (
             'create_policy', 'update_policy', 'assign_policy', 'revoke_policy',
             'create_agent', 'suspend_agent', 'reactivate_agent',
             'rotate_agent_credential', 'rotate_agent_onchain_signer',
-            'revoke_owner_passkey'
+            'revoke_owner_passkey', 'create_payment_plan',
+            'update_payment_plan', 'change_payment_plan_status'
         )
     ),
     payload JSONB NOT NULL,
@@ -730,3 +743,103 @@ CREATE TABLE registration_events (
 );
 CREATE INDEX registration_events_fingerprint_created
     ON registration_events(client_fingerprint, created_at DESC);
+
+CREATE TABLE payment_plans (
+    id UUID PRIMARY KEY,
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    agent_id UUID NOT NULL,
+    created_by_principal_id UUID NOT NULL,
+    name TEXT NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 100),
+    version BIGINT NOT NULL DEFAULT 1 CHECK (version > 0),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'paused', 'cancelled')),
+    cadence TEXT NOT NULL CHECK (cadence IN ('daily', 'weekly', 'monthly')),
+    timezone TEXT NOT NULL,
+    local_time TEXT NOT NULL CHECK (local_time ~ '^([01][0-9]|2[0-3]):[0-5][0-9]$'),
+    weekday TEXT CHECK (weekday IN (
+        'monday', 'tuesday', 'wednesday', 'thursday',
+        'friday', 'saturday', 'sunday'
+    )),
+    day_of_month SMALLINT CHECK (day_of_month BETWEEN 1 AND 28),
+    reserve_raw NUMERIC(78, 0) NOT NULL CHECK (reserve_raw >= 0),
+    surplus_destination TEXT,
+    surplus_minimum_raw NUMERIC(78, 0),
+    surplus_maximum_raw NUMERIC(78, 0),
+    callback_url TEXT,
+    next_run_at TIMESTAMPTZ,
+    last_run_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    cancelled_at TIMESTAMPTZ,
+    UNIQUE (id, organization_id),
+    FOREIGN KEY (agent_id, organization_id)
+        REFERENCES agents(id, organization_id),
+    FOREIGN KEY (created_by_principal_id, organization_id)
+        REFERENCES principals(id, organization_id),
+    CHECK (
+        (cadence = 'daily' AND weekday IS NULL AND day_of_month IS NULL)
+        OR (cadence = 'weekly' AND weekday IS NOT NULL AND day_of_month IS NULL)
+        OR (cadence = 'monthly' AND weekday IS NULL AND day_of_month IS NOT NULL)
+    ),
+    CHECK (
+        (surplus_destination IS NULL AND surplus_minimum_raw IS NULL AND surplus_maximum_raw IS NULL)
+        OR (surplus_destination ~ '^0x[0-9a-f]{40}$' AND surplus_minimum_raw > 0
+            AND (surplus_maximum_raw IS NULL OR surplus_maximum_raw >= surplus_minimum_raw))
+    ),
+    CHECK ((status = 'cancelled') = (cancelled_at IS NOT NULL)),
+    CHECK (status <> 'active' OR next_run_at IS NOT NULL)
+);
+CREATE INDEX payment_plans_due
+    ON payment_plans(next_run_at) WHERE status = 'active';
+CREATE INDEX payment_plans_organization
+    ON payment_plans(organization_id, created_at DESC);
+CREATE INDEX payment_plans_agent
+    ON payment_plans(agent_id, created_at DESC);
+
+CREATE TABLE payment_plan_recipients (
+    id UUID PRIMARY KEY,
+    plan_id UUID NOT NULL REFERENCES payment_plans(id) ON DELETE CASCADE,
+    position SMALLINT NOT NULL CHECK (position BETWEEN 0 AND 15),
+    recipient_address TEXT NOT NULL CHECK (recipient_address ~ '^0x[0-9a-f]{40}$'),
+    amount_raw NUMERIC(78, 0) NOT NULL CHECK (amount_raw > 0),
+    label TEXT CHECK (label IS NULL OR length(trim(label)) BETWEEN 1 AND 80),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (plan_id, position),
+    UNIQUE (plan_id, recipient_address)
+);
+
+CREATE TABLE payment_plan_runs (
+    id UUID PRIMARY KEY,
+    plan_id UUID NOT NULL,
+    organization_id UUID NOT NULL REFERENCES organizations(id),
+    agent_id UUID NOT NULL,
+    plan_version BIGINT NOT NULL CHECK (plan_version > 0),
+    scheduled_for TIMESTAMPTZ NOT NULL,
+    status TEXT NOT NULL DEFAULT 'claimed' CHECK (
+        status IN ('claimed', 'processing', 'queued', 'confirmed', 'skipped', 'failed', 'reverted')
+    ),
+    plan_snapshot JSONB NOT NULL CHECK (jsonb_typeof(plan_snapshot) = 'object'),
+    execution_request_id UUID UNIQUE REFERENCES execution_requests(id),
+    payout_total_raw NUMERIC(78, 0) NOT NULL DEFAULT 0 CHECK (payout_total_raw >= 0),
+    surplus_raw NUMERIC(78, 0) NOT NULL DEFAULT 0 CHECK (surplus_raw >= 0),
+    balance_observed_raw NUMERIC(78, 0),
+    reason TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 5),
+    lease_until TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    UNIQUE (plan_id, scheduled_for),
+    FOREIGN KEY (plan_id, organization_id)
+        REFERENCES payment_plans(id, organization_id),
+    FOREIGN KEY (agent_id, organization_id)
+        REFERENCES agents(id, organization_id),
+    CHECK (
+        (status IN ('confirmed', 'skipped', 'failed', 'reverted')) = (completed_at IS NOT NULL)
+    ),
+    CHECK ((status = 'processing') = (lease_until IS NOT NULL))
+);
+CREATE INDEX payment_plan_runs_plan
+    ON payment_plan_runs(plan_id, scheduled_for DESC);
+CREATE INDEX payment_plan_runs_reconcile
+    ON payment_plan_runs(updated_at) WHERE status = 'queued';

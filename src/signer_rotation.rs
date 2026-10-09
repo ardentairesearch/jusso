@@ -1,7 +1,7 @@
 //! Durable Turnkey signer rotation for deployed Arc smart accounts.
 
 use anyhow::{bail, Context, Result};
-use ethers::{
+use ethers_core::{
     abi::{encode, Token},
     types::{Address, U256},
     utils::keccak256,

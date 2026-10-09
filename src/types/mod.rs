@@ -118,7 +118,7 @@ pub struct ExecutionRequest {
     #[serde(default)]
     pub value: String,
     pub strategy_id: Option<String>,
-    /// Optional batch of calls to execute atomically in one protocol phase.
+    /// Optional batch of calls to execute atomically in one transaction.
     /// When present (and non-empty), takes priority over the single-call fields.
     #[serde(default)]
     pub batch_calls: Option<Vec<BatchCall>>,
@@ -128,7 +128,7 @@ pub struct ExecutionRequest {
     /// to poll `/status/{id}` — the result will be pushed automatically.
     #[serde(default)]
     pub callback_url: Option<String>,
-    /// Trusted metadata produced by typed protocol adapters. This field is
+    /// Trusted metadata produced by internal workflow compilers. This field is
     /// never accepted from or serialized to external callers.
     #[serde(skip)]
     pub policy_impact: crate::policy::ExecutionPolicyImpact,
@@ -239,7 +239,7 @@ pub struct ExecutionJob {
     pub execution_fee: Option<ExecutionFeeCharge>,
 }
 
-/// Stablecoin execution fee collected atomically with a protocol action.
+/// Stablecoin execution fee collected atomically with an action.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionFeeCharge {
     pub token_symbol: String,

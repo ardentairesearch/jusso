@@ -1,7 +1,7 @@
 //! Durable Arc ERC-4337 execution worker.
 
 use anyhow::{bail, Context, Result};
-use ethers::{
+use ethers_core::{
     types::{Address, U256},
     utils::keccak256,
 };
@@ -34,7 +34,6 @@ pub struct WorkerContext {
     pub db_pool: PgPool,
     pub wallet_registry: AgentWalletRegistry,
     pub engine: ExecutionEngine,
-    pub webhook_client: reqwest::Client,
     pub webhook_encryption_key: String,
 }
 
@@ -526,10 +525,9 @@ async fn fire_webhook(
         created_at: job.created_at,
         completed_at: chrono::Utc::now(),
     };
-    let client = ctx.webhook_client.clone();
     let callback_url = callback_url.clone();
     tokio::spawn(async move {
-        webhook::deliver(&client, &callback_url, &payload, &signing_secret).await;
+        webhook::deliver(&callback_url, &payload, &signing_secret).await;
     });
 }
 
@@ -538,7 +536,7 @@ mod tests {
     use std::{collections::BTreeSet, sync::Arc};
 
     use anyhow::{bail, Context};
-    use ethers::types::U256;
+    use ethers_core::types::U256;
     use sqlx::PgPool;
 
     use super::*;
@@ -623,7 +621,6 @@ mod tests {
             db_pool: pool,
             wallet_registry,
             engine: ExecutionEngine::new(config.runtime_config(), smart_accounts)?,
-            webhook_client: webhook::build_http_client(),
             webhook_encryption_key: config.auth_secret_encryption_key.clone(),
         })
     }

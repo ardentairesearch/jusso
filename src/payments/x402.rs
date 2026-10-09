@@ -97,12 +97,26 @@ pub struct FacilitatorClient {
 impl FacilitatorClient {
     pub fn new(base_url: &str) -> Result<Self> {
         let base_url = base_url.trim_end_matches('/');
-        if !base_url.starts_with("https://") && !base_url.starts_with("http://localhost") {
+        let parsed = reqwest::Url::parse(base_url)
+            .context("X402_FACILITATOR_URL must be an absolute URL")?;
+        let local_http = parsed.scheme() == "http"
+            && matches!(
+                parsed.host_str(),
+                Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+            );
+        if (parsed.scheme() != "https" && !local_http)
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
             anyhow::bail!("X402_FACILITATOR_URL must use HTTPS (localhost is allowed for testing)");
         }
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(20))
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()?,
             base_url: base_url.to_string(),
         })

@@ -1,7 +1,7 @@
 //! Sponsored ERC-4337 execution through Alchemy Wallet APIs on Arc.
 
 use anyhow::{bail, Context, Result};
-use ethers::{
+use ethers_core::{
     abi::{decode, encode, ParamType, Token},
     types::{Address, Signature, H256, U256},
     utils::{hash_message, keccak256},
@@ -209,6 +209,8 @@ impl ArcExecutionClient {
             endpoint,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()?,
             network,
             policy_id: policy_id.to_owned(),

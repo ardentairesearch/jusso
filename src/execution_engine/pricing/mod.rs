@@ -1,7 +1,7 @@
 //! Decimal conversion for USD-denominated execution policy and x402 amounts.
 
 use anyhow::{bail, Result};
-use ethers::types::U256;
+use ethers_core::types::U256;
 
 pub fn usd_to_token_raw_amount(usd: f64, decimals: u8) -> Result<U256> {
     if !usd.is_finite() || usd < 0.0 || decimals > 18 {

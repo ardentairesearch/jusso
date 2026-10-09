@@ -1,155 +1,160 @@
 # Jusso
 
-Jusso is execution infrastructure for autonomous AI agents. The Beta runtime
-targets Arc testnet. Each agent has a dedicated ERC-4337 smart account; its
-Turnkey-managed key is the owner signer, **not** the address to fund. Alchemy
-Wallet APIs prepare and submit sponsored UserOperations. A configured recipient
-collects the USDC execution fee, while the gas policy pays Arc native USDC gas.
+Jusso is autonomous stablecoin operations infrastructure for AI agents and
+businesses. It turns owner-approved payment rules into durable USDC workflows
+on Arc: recurring payouts, balance reserves, and optional surplus sweeps.
 
-The Arc stack has passed a live Turnkey + Alchemy + Arc testnet execution,
-including first-operation account deployment, sponsorship, atomic fee
-settlement, and receipt verification. It is not production-ready until the
-remaining checks in [TODO.md](TODO.md) are complete. Typed protocol HTTP routes
-are enabled only for Uniswap V4 on Arc testnet, using pinned official
-deployments. Preserved adapters, including Morpho, remain dormant because they
-do not have a verified Arc testnet deployment.
+Each agent receives a dedicated ERC-4337 smart account owned by a
+tenant-isolated Turnkey signer. Alchemy prepares and sponsors UserOperations;
+Jusso validates policy, simulates the complete batch, queues it idempotently,
+and verifies the onchain result. Agent private keys never enter Jusso.
 
-## Execution Flow
+## Payment Workflows
 
-1. An organization registers a principal and agent. Jusso provisions a
-   tenant-scoped Turnkey signer and a separate counterfactual Arc smart account.
-2. `GET /wallet` returns the smart-account address, including before its first
-   deployment. Fund **that** address with USDC and assets the action will use.
-3. `POST /simulate` or `POST /execute` validates the caller's authorization,
-   prepares the full sponsored UserOperation, and estimates a USDC fee from
-   the Arc gas cap. The default execution includes the USDC fee transfer and
-   requested calls in one atomic smart-account batch.
-4. The worker rechecks the permit and immutable request, signs the verified
-   UserOperation digest with the agent's Turnkey signer, persists the signed
-   operation, and submits it to Alchemy. Retries reuse that same signed payload.
-5. The worker confirms the provider call, transaction receipt, and ERC-4337
-   `UserOperationEvent` before marking success or recording the fee.
+A payment plan defines:
 
-An optional x402 route can collect a settled payment before the action, but it
-requires an Arc-capable facilitator configured with `X402_FACILITATOR_URL`.
-It is not part of the default managed-wallet payment path.
+- one agent wallet and 1-16 fixed USDC recipients;
+- a daily, weekly, or monthly schedule in an IANA time zone;
+- a USDC balance that must remain after every run;
+- an optional surplus destination, minimum transfer, and per-run maximum;
+- an optional completion webhook.
 
-## Boundaries
+Creating, updating, resuming, or cancelling a plan requires an organization
+owner's passkey approval. Pausing is immediate so an owner can stop future runs
+without waiting for a browser ceremony.
+
+At run time Jusso rechecks the plan version, agent state, current policy,
+recipient limits, wallet balance, and execution-fee reserve. Fixed recipients
+are all-or-nothing. If the wallet cannot pay every recipient while preserving
+the reserve and fee buffer, the run is skipped. Jusso never borrows, partially
+pays a list, or silently catches up multiple missed periods after downtime.
 
 ```text
-Agent or developer
-  -> OAuth + DPoP authentication and agent policy
-  -> Jusso API: wallet lookup / simulate / execute / status
-  -> Postgres permit + idempotent request; Redis execution queue
-  -> Arc worker: full sponsored UserOperation validation
-       -> tenant Turnkey signer (private key never enters Jusso)
-       -> Alchemy Wallet API / bundler / gas policy
-       -> Arc EntryPoint v0.7 -> dedicated smart account
-            -> atomic USDC execution fee + requested calls
+Owner or control agent
+  -> drafts payment plan
+  -> reviews exact schedule, recipients, limits, and effects
+  -> approves with passkey
+
+Scheduler
+  -> claims one durable run with a database lease
+  -> rechecks active plan + current agent policy
+  -> reads Arc USDC balance
+  -> compiles deterministic ERC-20 transfers
+  -> full ERC-4337 simulation + policy-budget reservation
+  -> Turnkey signature + Alchemy sponsorship/submission
+  -> receipt and UserOperationEvent verification
+  -> run history + optional webhook
 ```
 
-Turnkey custody is provider-neutral at the `WalletProvider` boundary. Jusso
-organizations have separate Turnkey sub-organizations and tenant runtime
-credentials. Smart-account addresses are persisted separately from Turnkey
-signer addresses and bound to the agent, chain, and account provider. Native
-Arc USDC uses 18 decimals for gas; its ERC-20 interface at
-`0x3600000000000000000000000000000000000000` uses 6 decimals for transfers.
+## Funding
 
-Self-service policies are Arc-only, permit only typed protocol routes, reject
-native-value transfers, cap execution fees at one USDC, and deny raw execution
-unless an organization owner creates and assigns an explicitly opted-in policy.
-Every smart-account load independently checks the official factory derivation,
-EntryPoint, implementation, and embedded Turnkey owner. Bring-your-own-wallet
-is disabled.
+The agent MCP can return the smart-account address at any time, including
+before first deployment. USDC can be transferred to that address directly.
 
-## Integration Surfaces
+On Arc mainnet, an optional Onramper integration can create a 15-minute,
+single-use checkout URL signed by Jusso and locked to the agent's smart-account
+address. Onramper remains responsible for payment methods, quotes, fees,
+country availability, KYC/AML, limits, and fiat settlement. Jusso never handles
+card or bank credentials.
 
-Jusso exposes two remote Streamable HTTP MCP endpoints:
+This is a funding convenience, not a recurring fiat mandate. Payment plans
+spend only USDC already present in the agent wallet; generating a checkout link
+does not authorize future fiat debits.
 
-| Endpoint | Audience |
+Token conversion and treasury yield are deliberately not exposed yet. Turnkey
+Swap currently spends from a Turnkey wallet account, while Jusso custody stays
+in the agent's ERC-4337 smart account; the Turnkey address is only the account
+owner signer and must not receive user deposits. Turnkey Earn does not currently
+support Arc. Both capabilities remain release-gated in `TODO.md` rather than
+splitting assets across two wallet models or advertising a nonfunctional route.
+
+## Safety Model
+
+- Organization owners control agents, policies, and payment plans.
+- Every organization has a separate Turnkey sub-organization.
+- Each stable agent has its own Turnkey signer and Arc smart account.
+- OAuth tokens are short-lived; local/workload tokens are DPoP-bound.
+- Remote MCP authorization binds the selected agent into the access token.
+- Payment-plan calls carry exact token-spend, recipient, and risk metadata.
+- Per-execution and rolling token/gas budgets are reserved atomically.
+- Execution is always fully simulated before queueing.
+- Stable idempotency keys and persisted signed operations make retries safe.
+- Raw transaction tools remain disabled unless a policy explicitly opts in.
+- Bring-your-own-wallet is disabled.
+
+## MCP Surfaces
+
+Jusso exposes remote Streamable HTTP MCP over HTTPS:
+
+| Endpoint | Purpose |
 | --- | --- |
-| `/mcp/agent` | Agent runtime tools: wallet, balance, status, Uniswap actions, and policy-gated raw simulation/execution |
-| `/mcp/control` | Owner tools: agents, policies, connections, approvals, and signer lifecycle |
+| `/mcp/agent` | Wallet, USDC balance, funding session, execution status, plan/run reads, and explicitly opted-in raw execution |
+| `/mcp/control` | Organization plan management, owner approvals, agents, policies, connections, passkeys, and signer lifecycle |
 
-Compatible MCP clients connect directly over HTTPS and complete OAuth in a
-browser. The agent selected during authorization is bound to that connection,
-so runtime tools resolve its wallet and executions without asking for an agent
-ID again. Raw single-call and atomic-batch tools remain unusable unless the
-assigned policy explicitly enables raw execution. There is no local stdio MCP
-server or installer to keep synchronized. Direct REST/OAuth access remains
-available for custom runtimes and services. Client-specific certification is
-tracked in [TODO.md](TODO.md).
+The runtime connection is agent-bound, so tools do not repeatedly ask for an
+agent ID. Control tools can select an organization agent when drafting a plan.
+Compatible clients complete OAuth Authorization Code + PKCE in a browser.
 
-## Authentication
-
-Organizations own stable agents. Principals have grants to those agents;
-credentials authenticate principals; hosted runs become short-lived instances.
-Local and workload-federated access tokens are short-lived and DPoP-bound.
-Remote MCP clients use Authorization Code + PKCE and receive a bearer or
-DPoP-bound token according to the client authorization request. Local
-onboarding creates a P-256 key on the developer's machine, registers only its
-public JWK, stores the key with `0600` permissions, and verifies wallet access:
+Owners may also onboard locally:
 
 ```bash
 cargo run --bin jusso -- onboard --organization "Acme" --agent-id treasury --accept-terms
 ```
 
-Owners create another stable agent and one-time enrollment token through the
-control MCP endpoint. The child runtime then enrolls with its own key, without
-receiving the owner key:
+Child agents enroll with a one-time token created by an owner-approved control
+operation:
 
 ```bash
 cargo run --bin jusso -- enroll \
   --enrollment-token jso_enroll_REDACTED \
-  --display-name "Research worker"
+  --display-name "Treasury operator"
 ```
 
-Hosted agents can use an organization-configured OIDC federation trust. Jusso
-checks issuer, HTTPS JWKS, audience, and subject, and consumes proof IDs once
-to prevent replay. Credential rotation does not change the stable agent's
-Turnkey signer or Arc smart account.
-
-## API
+## HTTP API
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /register` | Public, protected self-service organization onboarding |
-| `GET /wallet` | Agent's dedicated Arc smart-account address and deployment state |
-| `GET /wallet/balance` | One USDC balance via Arc's six-decimal interface |
-| `POST /simulate` | Prepare sponsored call bundle without submitting |
-| `POST /execute` | Idempotently queue a sponsored execution |
+| `POST /register` | Public, protected organization onboarding |
+| `GET /wallet` | Agent's Arc smart-account address and deployment state |
+| `GET /wallet/balance` | Agent's Arc USDC balance |
+| `POST /simulate` | Simulate an explicitly permitted raw call or batch |
+| `POST /execute` | Idempotently queue an explicitly permitted raw execution |
 | `POST /x402/execute` | Optional facilitator-paid execution |
 | `GET /status/{id}` | Execution status and transaction hash |
-| `/protocols/uniswap-v4/*` | Arc testnet pool discovery, quotes, balances, simulation, and swaps |
-| `GET /admin/fee-recipient/status` | Fee recipient USDC balance and Arc sponsor configuration |
+| `GET /admin/fee-recipient/status` | Fee-recipient and sponsor status |
 
-`POST /execute` and `POST /x402/execute` require `Idempotency-Key`. Agent
-authorization policies constrain chains, actions, contract targets, value,
-and maximum execution fees. All integrations other than Uniswap V4 remain
-outside the runtime.
+`POST /execute` and `POST /x402/execute` require `Idempotency-Key`. The normal
+payment-plan path is MCP-first and uses the same simulation, policy, queue, and
+receipt-verification engine internally.
 
 ## Local Setup
 
-Requires Rust, PostgreSQL, Redis, a Turnkey parent organization with a P-256
-API key permitted to create tenant sub-organizations, an Alchemy app with Arc
-testnet Wallet API access and a funded gas sponsorship policy, and an Arc USDC
-fee-recipient address. Configure a fresh database; `001_init.sql` contains the
-current schema.
+Required services and accounts:
+
+- Rust, PostgreSQL, and Redis;
+- a Turnkey parent organization with a P-256 API key permitted to create tenant
+  sub-organizations;
+- an Alchemy app with Arc Wallet API access and a funded gas policy;
+- an Arc USDC execution-fee recipient.
+
+Core environment variables:
 
 ```dotenv
 ARC_NETWORK=arc-testnet
 ARC_RPC_URL=https://rpc.testnet.arc.io
 ALCHEMY_API_KEY=<Alchemy app key>
-ALCHEMY_GAS_POLICY_ID=<funded sponsorship policy ID>
+ALCHEMY_GAS_POLICY_ID=<funded policy ID>
 ARC_MAX_SPONSORED_GAS_UNITS=2000000
 ARC_MAX_SPONSORED_GAS_COST_WEI=100000000000000000
-EXECUTION_FEE_RECIPIENT=0x<Arc fee-recipient address>
+EXECUTION_FEE_RECIPIENT=0x<Arc address>
 GAS_MARKUP_BPS=1000
 PLATFORM_FEE_USDC_RAW=10000
+
 TURNKEY_ORGANIZATION_ID=<parent organization ID>
 TURNKEY_API_PUBLIC_KEY=<P-256 public key>
 TURNKEY_API_PRIVATE_KEY=<P-256 private key>
 TURNKEY_CREDENTIAL_ENCRYPTION_KEY=<64 hex characters>
+
 AUTH_SECRET_ENCRYPTION_KEY=<64 hex characters>
 OAUTH_SIGNING_SECRET=<32+ random bytes>
 BOOTSTRAP_ADMIN_TOKEN=<32+ random bytes>
@@ -157,11 +162,25 @@ DATABASE_URL=postgres://...
 REDIS_URL=redis://...
 ```
 
-Public registration outside localhost additionally requires a Turnstile secret
-and allowed hostnames. Review `src/config/mod.rs` for optional auth, rate-limit,
-webhook, and x402 settings. Do not commit `.env` or Turnkey credentials. Arc
-mainnet is disabled unless `ARC_NETWORK=arc` and `ARC_ENABLE_MAINNET=true`; do
-not enable it before the separate mainnet rollout gate.
+Optional Arc-mainnet funding integration:
+
+```dotenv
+ONRAMPER_API_KEY=<Onramper API key>
+ONRAMPER_SIGNING_PRIVATE_KEY_PKCS8_BASE64=<Ed25519 PKCS#8 DER as base64>
+ONRAMPER_USDC_ASSET_ID=<Onramper's verified Arc USDC asset ID>
+ONRAMPER_ARC_NETWORK_ID=<Onramper's verified Arc network ID>
+```
+
+All four Onramper values are required together. The server refuses to enable
+fiat funding on Arc testnet or with a non-Onramper widget origin. Verify current
+Arc/USDC support and identifiers with the provider before production rollout.
+
+Public registration outside localhost also requires Cloudflare Turnstile and
+allowed hostnames. Copy `.env.example` for the complete configuration contract.
+For hosted WebAuthn, `PUBLIC_API_BASE_URL`, `OAUTH_ISSUER`, `OAUTH_AUDIENCE`, and
+`WEBAUTHN_ORIGIN` should be the same canonical HTTPS API origin, while
+`WEBAUTHN_RP_ID` and `REGISTRATION_ALLOWED_HOSTNAMES` contain only its hostname.
+Never commit `.env` or provider credentials.
 
 ```bash
 docker compose up -d
@@ -169,40 +188,39 @@ cargo run --bin jusso-arc-probe
 cargo run --bin jusso-server
 ```
 
-Startup verifies Arc chain ID, USDC decimals, EntryPoint v0.7 bytecode,
-Alchemy bundler EntryPoint support, the fee-recipient token interface, and all
-pinned Uniswap V4 contracts.
-The probe is read-only and accepts `ARC_BALANCE_ADDRESS` or
-`ARC_BUNDLER_RPC_URL` for additional checks.
+Migrations run at startup. `001_init.sql` is the single pre-beta baseline. This
+pivot intentionally requires a newly provisioned empty PostgreSQL database;
+do not edit SQLx checksums or point the build at a database created by an older
+Jusso revision. Resetting the registry does not move or recover assets from old
+onchain accounts, so verify every old test wallet is empty before retiring its
+database. Keep one application replica until the scheduler, queue workers, and
+recovery paths have completed multi-replica certification.
 
-## Railway Deployment
+## Railway Testnet Deployment
 
-Deploy the repository as one Railway service using the included `Dockerfile`
-and `railway.toml`, with separate managed PostgreSQL and Redis services. Give
-only the Jusso service a public domain and pass the databases through Railway's
-private `DATABASE_URL` and `REDIS_URL` references. Set `PUBLIC_API_BASE_URL`,
-`WEBAUTHN_ORIGIN`, and `WEBAUTHN_RP_ID` to the final HTTPS domain before testing
-passkey onboarding; WebAuthn credentials are bound to that origin and relying
-party ID. The server applies migrations at startup and `/health` verifies both
-datastores. Keep one application replica until queue-worker coordination and
-multi-replica operations are separately certified.
+Deploy this Beta as a new Railway project with three services: `jusso-api`, a
+new PostgreSQL service, and a new Redis service. Do not reuse the database from
+an older Jusso deployment because this revision intentionally replaces the
+migration history with a new `001_init.sql` baseline.
+
+Railway detects the root `Dockerfile`; `railway.toml` selects `/health` as the
+deployment health check. Keep the API at one replica because the scheduler and
+queue recovery paths have not yet been certified for multiple replicas. Connect
+`DATABASE_URL` and `REDIS_URL` using Railway reference variables, not copied
+public credentials. Generate the API domain before configuring the canonical
+OAuth/WebAuthn origin and Cloudflare Turnstile hostname.
 
 ## Verification
 
 ```bash
 cargo fmt --check
 cargo check --all-targets
-cargo test arc:: --lib
-cargo test protocols:: --lib
+cargo test --all-targets
 ```
 
-The Arc testnet path has passed registration, tenant Turnkey signer creation,
-counterfactual account derivation, first-operation deployment, sponsored
-execution, and atomic fee settlement. Account loads now independently verify
-Alchemy's official MAv2 factory derivation, embedded owner, implementation, and
-EntryPoint. Crash recovery, sponsorship rejection, and protocol-specific Arc
-deployment tests remain release gates. Other preserved adapters are
-intentionally not compiled or routed until they have a verified Arc deployment.
+The live-spend recovery test is ignored by default because it requires real
+Turnkey, Alchemy, and Arc testnet credentials and spends testnet USDC. Remaining
+production gates are tracked in [TODO.md](TODO.md).
 
 ## License
 

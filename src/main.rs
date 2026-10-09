@@ -17,7 +17,7 @@ use axum::{
     http::{HeaderName, HeaderValue},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{any, get, post},
+    routing::{get, post},
     Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -44,6 +44,7 @@ use jusso::{
     signer_rotation::{self, SignerRotationContext},
     wallet_provider::{TurnkeyWalletProvider, WalletManager},
     worker::{self, WorkerContext},
+    workflows,
 };
 
 async fn no_store_sensitive_response(request: Request, next: Next) -> Response {
@@ -147,6 +148,10 @@ async fn main() -> anyhow::Result<()> {
     let mut config = AppConfig::from_env()?;
     let admin_auth = routes::AdminAuthState::new(std::mem::take(&mut config.bootstrap_admin_token));
     info!(host = %config.host, port = config.port, "config loaded");
+    if let Some(onramp) = config.onramp.as_ref() {
+        let fingerprint = jusso::funding::signing_key_fingerprint(onramp)?;
+        info!(signing_key_fingerprint = %fingerprint, "fiat funding integration enabled");
+    }
 
     // ── Database ────────────────────────────────────────────────────
     let db_pool = db::create_pool(&config.database_url).await?;
@@ -214,7 +219,6 @@ async fn main() -> anyhow::Result<()> {
         db_pool: db_pool.clone(),
         wallet_registry: wallet_registry.clone(),
         engine: engine.clone(),
-        webhook_client: jusso::webhook::build_http_client(),
         webhook_encryption_key: config.auth_secret_encryption_key.clone(),
     };
     info!("worker context assembled");
@@ -268,6 +272,8 @@ async fn main() -> anyhow::Result<()> {
         wallet_registry,
     };
     let connect_service = ConnectService::new(db_pool.clone(), redis_conn.clone(), config.clone())?;
+    tokio::spawn(workflows::run_scheduler(state.clone()));
+    info!("payment-plan scheduler spawned");
 
     // ── Per-principal Rate Limiter ──────────────────────────────────
     let rate_limiter = if config.per_principal_rate_limit_rps > 0.0 {
@@ -416,35 +422,6 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/federation-trusts/:id",
             axum::routing::delete(routes::revoke_federation_trust_handler),
-        )
-        .route(
-            "/protocols/uniswap-v4/swap",
-            post(routes::uniswap_v4_swap_handler),
-        )
-        .route(
-            "/protocols/uniswap-v4/swap/simulate",
-            post(routes::uniswap_v4_swap_simulate_handler),
-        )
-        .route(
-            "/protocols/uniswap-v4/swap/quote",
-            post(routes::uniswap_v4_quote_handler),
-        )
-        .route(
-            "/protocols/uniswap-v4/pool",
-            get(routes::uniswap_v4_pool_handler),
-        )
-        .route(
-            "/protocols/uniswap-v4/pools",
-            get(routes::uniswap_v4_pools_handler),
-        )
-        .route(
-            "/protocols/uniswap-v4/balances",
-            get(routes::uniswap_v4_balances_handler),
-        )
-        .route("/protocols", any(routes::protocol_not_enabled_handler))
-        .route(
-            "/protocols/*path",
-            any(routes::protocol_not_enabled_handler),
         )
         // Distributed per-principal rate limiting (after authorization).
         .layer({

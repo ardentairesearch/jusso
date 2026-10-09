@@ -1,7 +1,7 @@
 //! Read-only Arc network check. No wallet key or transaction is required.
 
 use anyhow::{Context, Result};
-use ethers::types::Address;
+use ethers_core::types::Address;
 use jusso::arc::{probe_bundler, probe_rpc, ArcNetwork};
 
 #[tokio::main]

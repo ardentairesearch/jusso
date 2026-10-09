@@ -24,10 +24,9 @@ use crate::{
     api::{routes::AppState, services},
     auth::AuthService,
     db,
-    protocols::uniswap_v4::{
-        adapter::UniswapSwapKind, service as uniswap_service, UniswapPoolsQuery, UniswapSwapRequest,
-    },
+    funding::FundingSessionRequest,
     types::{AuthContext, BatchCall, ExecutionRequest},
+    workflows::{PaymentPlanInput, PaymentPlanStatusChange},
 };
 
 pub type AgentMcpService = StreamableHttpService<AgentMcp, LocalSessionManager>;
@@ -125,86 +124,17 @@ struct ExecutionStatusParams {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct PoolsParams {
-    /// First token contract address.
-    token_a: String,
-    /// Second token contract address.
-    token_b: String,
-    /// Include pools with hooks. Defaults to false.
-    include_hooked_pools: Option<bool>,
-    /// Arc network name. Defaults to the server's configured Arc network.
-    chain: Option<String>,
+struct PaymentPlanIdParams {
+    /// Payment plan UUID.
+    payment_plan_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct SwapParams {
-    /// Input ERC-20 token address.
-    token_in: String,
-    /// Output token address. The zero address means native Arc USDC.
-    token_out: String,
-    /// Raw token amount in base units.
-    amount_raw: String,
-    /// exact_in or exact_out. Defaults to exact_in.
-    swap_kind: Option<String>,
-    /// Explicit pool fee. Omit with tick_spacing and hooks for discovery.
-    fee: Option<u32>,
-    /// Explicit pool tick spacing. Omit with fee and hooks for discovery.
-    tick_spacing: Option<i32>,
-    /// Explicit hooks contract. Omit for automatic discovery.
-    hooks: Option<String>,
-    /// Permit automatic selection of hooked pools.
-    include_hooked_pools: Option<bool>,
-    /// Hook calldata as a 0x-prefixed byte string.
-    hook_data: Option<String>,
-    /// Minimum output for exact_in or maximum input for exact_out.
-    limit_raw: Option<String>,
-    /// Maximum slippage in basis points. Defaults to 50.
-    slippage_bps: Option<u16>,
-    /// Unix deadline. Defaults to the protocol adapter's safe window.
-    deadline: Option<u64>,
-    /// Arc network name. Defaults to the configured Arc network.
-    chain: Option<String>,
-    /// Optional strategy correlation identifier.
-    strategy_id: Option<String>,
-    /// Optional HTTPS completion webhook.
-    callback_url: Option<String>,
-    /// Stable retry key. Omit to derive it from the MCP request ID and arguments.
-    idempotency_key: Option<String>,
-}
-
-impl SwapParams {
-    fn to_request(
-        &self,
-        default_chain: &str,
-        agent_id: String,
-    ) -> Result<UniswapSwapRequest, ErrorData> {
-        let swap_kind = match self.swap_kind.as_deref().unwrap_or("exact_in") {
-            "exact_in" => UniswapSwapKind::ExactIn,
-            "exact_out" => UniswapSwapKind::ExactOut,
-            _ => return Err(tool_error("swap_kind must be exact_in or exact_out")),
-        };
-        Ok(UniswapSwapRequest {
-            agent_id,
-            chain: self
-                .chain
-                .clone()
-                .unwrap_or_else(|| default_chain.to_string()),
-            token_in: self.token_in.clone(),
-            token_out: self.token_out.clone(),
-            fee: self.fee,
-            tick_spacing: self.tick_spacing,
-            hooks: self.hooks.clone(),
-            include_hooked_pools: self.include_hooked_pools.unwrap_or(false),
-            hook_data: self.hook_data.clone().unwrap_or_else(|| "0x".into()),
-            swap_kind,
-            amount_raw: self.amount_raw.clone(),
-            limit_raw: self.limit_raw.clone(),
-            slippage_bps: self.slippage_bps.unwrap_or(50),
-            deadline: self.deadline,
-            strategy_id: self.strategy_id.clone(),
-            callback_url: self.callback_url.clone(),
-        })
-    }
+struct PaymentPlanRunsParams {
+    /// Payment plan UUID.
+    payment_plan_id: String,
+    /// Maximum runs to return, from 1 to 100. Defaults to 25.
+    limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -298,12 +228,11 @@ impl AgentMcp {
         chain: Option<&str>,
         scope: &'static str,
         resource: &'static str,
-        protocol: Option<&'static str>,
     ) -> Result<(AuthContext, String), ErrorData> {
         let auth = request_auth(context)?;
         let authorized = self
             .auth
-            .authorize_mcp_action(&auth, chain, scope, resource, protocol)
+            .authorize_mcp_action(&auth, chain, scope, resource)
             .await
             .map_err(tool_error)?;
         let agent_id = authorized
@@ -329,7 +258,7 @@ impl AgentMcp {
             .as_deref()
             .unwrap_or(self.state.config.arc_network.name());
         let (auth, agent_id) = self
-            .authorize(&context, Some(chain), "wallet:read", "/wallet", None)
+            .authorize(&context, Some(chain), "wallet:read", "/wallet")
             .await?;
         let response = services::handle_get_wallet(
             &self.state.engine,
@@ -354,13 +283,7 @@ impl AgentMcp {
             .as_deref()
             .unwrap_or(self.state.config.arc_network.name());
         let (auth, agent_id) = self
-            .authorize(
-                &context,
-                Some(chain),
-                "wallet:read",
-                "/wallet/balance",
-                None,
-            )
+            .authorize(&context, Some(chain), "wallet:read", "/wallet/balance")
             .await?;
         let response = services::handle_get_wallet_balance(
             &self.state.engine,
@@ -372,6 +295,38 @@ impl AgentMcp {
         .await
         .map_err(tool_error)?;
         json_output(response)
+    }
+
+    #[tool(
+        description = "Create a short-lived, wallet-bound checkout link for buying USDC for the connected agent. Payment methods, KYC, quotes, fees, and currency availability are handled by the configured ramp provider."
+    )]
+    async fn create_funding_session(
+        &self,
+        Parameters(params): Parameters<FundingSessionRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let chain = self.state.config.arc_network.name();
+        let (auth, agent_id) = self
+            .authorize(&context, Some(chain), "wallet:read", "/wallet")
+            .await?;
+        let config = self.state.config.onramp.as_ref().ok_or_else(|| {
+            tool_error(
+                "fiat funding is not enabled for this deployment; fund the smart account with Arc USDC directly",
+            )
+        })?;
+        let wallet = services::handle_get_wallet(
+            &self.state.engine,
+            &self.state.wallet_registry,
+            auth.organization_id,
+            &agent_id,
+            chain,
+        )
+        .await
+        .map_err(tool_error)?;
+        json_output(
+            crate::funding::create_onramper_session(config, &wallet.smart_wallet_address, &params)
+                .map_err(tool_error)?,
+        )
     }
 
     #[tool(description = "Read the current status and transaction hash of an execution request.")]
@@ -391,143 +346,41 @@ impl AgentMcp {
         json_output(response)
     }
 
-    #[tool(description = "Discover initialized Uniswap V4 pools for a token pair on Arc.")]
-    async fn discover_uniswap_v4_pools(
+    #[tool(description = "List recurring USDC payment plans belonging to the connected agent.")]
+    async fn list_payment_plans(
         &self,
-        Parameters(params): Parameters<PoolsParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<McpJson<serde_json::Value>, ErrorData> {
         let auth = request_auth(&context)?;
-        require_scope(&auth, "protocol:read")?;
-        let query = UniswapPoolsQuery {
-            chain: params
-                .chain
-                .unwrap_or_else(|| self.state.config.arc_network.name().to_string()),
-            token_a: params.token_a,
-            token_b: params.token_b,
-            include_hooked_pools: params.include_hooked_pools.unwrap_or(false),
-        };
+        require_scope(&auth, "workflow:read")?;
         json_output(
-            uniswap_service::handle_pools(&self.state.engine, &query)
+            crate::workflows::list_plans(&self.state.db_pool, &auth)
                 .await
                 .map_err(tool_error)?,
         )
     }
 
-    #[tool(description = "Quote a Uniswap V4 swap without submitting an on-chain operation.")]
-    async fn quote_uniswap_v4_swap(
-        &self,
-        Parameters(params): Parameters<SwapParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
-        let chain = params
-            .chain
-            .as_deref()
-            .unwrap_or(self.state.config.arc_network.name());
-        let (auth, agent_id) = self
-            .authorize(
-                &context,
-                Some(chain),
-                "transaction:simulate",
-                "/protocols/uniswap-v4/swap/quote",
-                Some("uniswap-v4"),
-            )
-            .await?;
-        let request = params.to_request(self.state.config.arc_network.name(), agent_id)?;
-        json_output(
-            uniswap_service::handle_quote(
-                &self.state.engine,
-                &self.state.wallet_registry,
-                auth.organization_id,
-                &request,
-            )
-            .await
-            .map_err(tool_error)?,
-        )
-    }
-
-    #[tool(description = "Fully simulate a Uniswap V4 swap as an Arc UserOperation.")]
-    async fn simulate_uniswap_v4_swap(
-        &self,
-        Parameters(params): Parameters<SwapParams>,
-        context: RequestContext<RoleServer>,
-    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
-        let chain = params
-            .chain
-            .as_deref()
-            .unwrap_or(self.state.config.arc_network.name());
-        let (auth, agent_id) = self
-            .authorize(
-                &context,
-                Some(chain),
-                "transaction:simulate",
-                "/protocols/uniswap-v4/swap/simulate",
-                Some("uniswap-v4"),
-            )
-            .await?;
-        let request = params.to_request(self.state.config.arc_network.name(), agent_id)?;
-        json_output(
-            uniswap_service::handle_swap_simulate(
-                &self.state.engine,
-                &self.state.db_pool,
-                &self.state.wallet_registry,
-                &auth,
-                &request,
-            )
-            .await
-            .map_err(tool_error)?,
-        )
-    }
-
     #[tool(
-        description = "Execute a policy-authorized Uniswap V4 swap through sponsored Arc ERC-4337."
+        description = "Read recent runs for one recurring USDC payment plan belonging to the connected agent."
     )]
-    async fn execute_uniswap_v4_swap(
+    async fn list_payment_plan_runs(
         &self,
-        Parameters(params): Parameters<SwapParams>,
+        Parameters(params): Parameters<PaymentPlanRunsParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<McpJson<serde_json::Value>, ErrorData> {
-        let chain = params
-            .chain
-            .as_deref()
-            .unwrap_or(self.state.config.arc_network.name());
-        let (auth, agent_id) = self
-            .authorize(
-                &context,
-                Some(chain),
-                "transaction:execute",
-                "/protocols/uniswap-v4/swap",
-                Some("uniswap-v4"),
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:read")?;
+        let plan_id = Uuid::parse_str(params.payment_plan_id.trim()).map_err(tool_error)?;
+        json_output(
+            crate::workflows::list_runs(
+                &self.state.db_pool,
+                &auth,
+                plan_id,
+                params.limit.unwrap_or(25),
             )
-            .await?;
-        let request = params.to_request(self.state.config.arc_network.name(), agent_id)?;
-        let idempotency_key =
-            mcp_idempotency_key(params.idempotency_key.as_deref(), &auth, &context, &params)?;
-        if let Some(existing) = services::handle_existing_protocol_execution(
-            &self.state.engine,
-            &self.state.db_pool,
-            &auth,
-            &request.agent_id,
-            &idempotency_key,
+            .await
+            .map_err(tool_error)?,
         )
-        .await
-        .map_err(tool_error)?
-        {
-            return json_output(existing);
-        }
-        let mut redis = self.state.redis_conn.clone();
-        let response = uniswap_service::handle_swap(
-            &self.state.engine,
-            &self.state.db_pool,
-            &mut redis,
-            &self.state.wallet_registry,
-            &auth,
-            &request,
-            &idempotency_key,
-        )
-        .await
-        .map_err(tool_error)?;
-        json_output(response)
     }
 
     #[tool(
@@ -543,13 +396,7 @@ impl AgentMcp {
             .as_deref()
             .unwrap_or(self.state.config.arc_network.name());
         let (auth, agent_id) = self
-            .authorize(
-                &context,
-                Some(chain),
-                "transaction:simulate",
-                "/simulate",
-                None,
-            )
+            .authorize(&context, Some(chain), "transaction:simulate", "/simulate")
             .await?;
         let request = params.to_request(self.state.config.arc_network.name(), agent_id);
         let response = services::handle_simulate_authenticated(
@@ -578,13 +425,7 @@ impl AgentMcp {
             .as_deref()
             .unwrap_or(self.state.config.arc_network.name());
         let (auth, agent_id) = self
-            .authorize(
-                &context,
-                Some(chain),
-                "transaction:execute",
-                "/execute",
-                None,
-            )
+            .authorize(&context, Some(chain), "transaction:execute", "/execute")
             .await?;
         let request = params
             .transaction
@@ -632,14 +473,34 @@ struct RevokeConnectionParams {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct UpdatePaymentPlanApprovalParams {
+    /// Existing payment plan UUID.
+    payment_plan_id: String,
+    /// Current version returned by list_payment_plans.
+    expected_version: i64,
+    /// Complete replacement plan. Existing values are not inherited.
+    plan: PaymentPlanInput,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct ChangePaymentPlanStatusApprovalParams {
+    /// Existing payment plan UUID.
+    payment_plan_id: String,
+    /// Current version returned by list_payment_plans.
+    expected_version: i64,
+    /// pause, resume, or cancel.
+    change: PaymentPlanStatusChange,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 struct CreatePolicyApprovalParams {
     /// Human-readable policy name.
     name: String,
     /// Allowed Arc network names. Use the configured Arc network only.
     allowed_chains: Option<Vec<String>>,
-    /// Allowed protocol identifiers, currently uniswap-v4.
+    /// Reserved protocol allow-list. Leave unset while typed protocol routes are disabled.
     allowed_protocols: Option<Vec<String>>,
-    /// Allowed runtime and typed protocol actions.
+    /// Allowed runtime and workflow actions.
     allowed_actions: Option<Vec<String>>,
     /// Allowed EVM target addresses. A wildcard is an explicit dangerous opt-in.
     allowed_targets: Option<Vec<String>>,
@@ -680,9 +541,9 @@ struct UpdatePolicyApprovalParams {
     name: String,
     /// Allowed Arc network names. Use the configured Arc network only.
     allowed_chains: Option<Vec<String>>,
-    /// Allowed protocol identifiers, currently uniswap-v4.
+    /// Reserved protocol allow-list. Leave unset while typed protocol routes are disabled.
     allowed_protocols: Option<Vec<String>>,
-    /// Allowed runtime and typed protocol actions.
+    /// Allowed runtime and workflow actions.
     allowed_actions: Option<Vec<String>>,
     /// Allowed EVM target addresses. A wildcard is an explicit dangerous opt-in.
     allowed_targets: Option<Vec<String>>,
@@ -852,6 +713,124 @@ impl ControlMcp {
 
 #[tool_router]
 impl ControlMcp {
+    #[tool(description = "List the organization's recurring USDC payment plans.")]
+    async fn list_organization_payment_plans(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:manage")?;
+        json_output(
+            crate::workflows::list_plans(&self.state.db_pool, &auth)
+                .await
+                .map_err(tool_error)?,
+        )
+    }
+
+    #[tool(
+        description = "List recent runs and outcomes for an organization's recurring USDC payment plan."
+    )]
+    async fn list_organization_payment_plan_runs(
+        &self,
+        Parameters(params): Parameters<PaymentPlanRunsParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:manage")?;
+        let plan_id = Uuid::parse_str(params.payment_plan_id.trim()).map_err(tool_error)?;
+        json_output(
+            crate::workflows::list_runs(
+                &self.state.db_pool,
+                &auth,
+                plan_id,
+                params.limit.unwrap_or(25),
+            )
+            .await
+            .map_err(tool_error)?,
+        )
+    }
+
+    #[tool(
+        description = "Draft a recurring USDC payment plan and create a short-lived owner passkey approval. Amounts are human USDC decimal strings, not raw units."
+    )]
+    async fn request_create_payment_plan_approval(
+        &self,
+        Parameters(plan): Parameters<PaymentPlanInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:manage")?;
+        let normalized = plan.normalize(Utc::now()).map_err(tool_error)?;
+        self.request_owner_approval(
+            &auth,
+            db::OwnerApprovalAction::CreatePaymentPlan { plan: normalized },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Create owner passkey approval to replace a recurring USDC payment plan. The expected version prevents overwriting concurrent changes."
+    )]
+    async fn request_update_payment_plan_approval(
+        &self,
+        Parameters(params): Parameters<UpdatePaymentPlanApprovalParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:manage")?;
+        let normalized = params.plan.normalize(Utc::now()).map_err(tool_error)?;
+        self.request_owner_approval(
+            &auth,
+            db::OwnerApprovalAction::UpdatePaymentPlan {
+                plan_id: Uuid::parse_str(params.payment_plan_id.trim()).map_err(tool_error)?,
+                expected_version: params.expected_version,
+                plan: normalized,
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Immediately pause an active recurring payment plan. This safety action never moves funds and does not require another passkey ceremony."
+    )]
+    async fn pause_payment_plan(
+        &self,
+        Parameters(params): Parameters<PaymentPlanIdParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:manage")?;
+        let plan_id = Uuid::parse_str(params.payment_plan_id.trim()).map_err(tool_error)?;
+        let paused = crate::workflows::pause_plan_immediately(&self.state.db_pool, &auth, plan_id)
+            .await
+            .map_err(tool_error)?;
+        if !paused {
+            return Err(tool_error("active payment plan was not found"));
+        }
+        json_output(serde_json::json!({"payment_plan_id": plan_id, "status": "paused"}))
+    }
+
+    #[tool(
+        description = "Create owner passkey approval to resume or permanently cancel a recurring USDC payment plan. Pause is also accepted, though pause_payment_plan is the immediate safety control."
+    )]
+    async fn request_change_payment_plan_status_approval(
+        &self,
+        Parameters(params): Parameters<ChangePaymentPlanStatusApprovalParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:manage")?;
+        self.request_owner_approval(
+            &auth,
+            db::OwnerApprovalAction::ChangePaymentPlanStatus {
+                plan_id: Uuid::parse_str(params.payment_plan_id.trim()).map_err(tool_error)?,
+                expected_version: params.expected_version,
+                change: params.change,
+            },
+        )
+        .await
+    }
+
     #[tool(description = "List agents visible to the authenticated organization owner.")]
     async fn list_agents(
         &self,
@@ -1546,15 +1525,12 @@ mod tests {
         let runtime = [
             AgentMcp::get_wallet_tool_attr().name.to_string(),
             AgentMcp::get_wallet_balance_tool_attr().name.to_string(),
+            AgentMcp::create_funding_session_tool_attr()
+                .name
+                .to_string(),
             AgentMcp::get_execution_status_tool_attr().name.to_string(),
-            AgentMcp::discover_uniswap_v4_pools_tool_attr()
-                .name
-                .to_string(),
-            AgentMcp::quote_uniswap_v4_swap_tool_attr().name.to_string(),
-            AgentMcp::simulate_uniswap_v4_swap_tool_attr()
-                .name
-                .to_string(),
-            AgentMcp::execute_uniswap_v4_swap_tool_attr()
+            AgentMcp::list_payment_plans_tool_attr().name.to_string(),
+            AgentMcp::list_payment_plan_runs_tool_attr()
                 .name
                 .to_string(),
             AgentMcp::simulate_raw_transaction_tool_attr()
@@ -1565,6 +1541,22 @@ mod tests {
                 .to_string(),
         ];
         let control = [
+            ControlMcp::list_organization_payment_plans_tool_attr()
+                .name
+                .to_string(),
+            ControlMcp::list_organization_payment_plan_runs_tool_attr()
+                .name
+                .to_string(),
+            ControlMcp::request_create_payment_plan_approval_tool_attr()
+                .name
+                .to_string(),
+            ControlMcp::request_update_payment_plan_approval_tool_attr()
+                .name
+                .to_string(),
+            ControlMcp::pause_payment_plan_tool_attr().name.to_string(),
+            ControlMcp::request_change_payment_plan_status_approval_tool_attr()
+                .name
+                .to_string(),
             ControlMcp::list_agents_tool_attr().name.to_string(),
             ControlMcp::list_authorization_policies_tool_attr()
                 .name
@@ -1619,12 +1611,12 @@ mod tests {
                 .name
                 .to_string(),
         ];
-        assert!(runtime.iter().any(|name| name == "execute_uniswap_v4_swap"));
+        assert!(runtime.iter().any(|name| name == "list_payment_plans"));
         assert!(runtime
             .iter()
             .any(|name| name == "simulate_raw_transaction"));
         assert!(runtime.iter().any(|name| name == "execute_raw_transaction"));
-        assert!(control.iter().all(|name| !name.contains("execute")));
+        assert!(control.iter().all(|name| !name.contains("raw_transaction")));
         assert!(control
             .iter()
             .filter(|name| {
@@ -1643,10 +1635,11 @@ mod tests {
     #[test]
     fn agent_runtime_tool_inputs_use_the_oauth_bound_agent() {
         let wallet_schema = serde_json::to_value(schemars::schema_for!(WalletParams)).unwrap();
-        let swap_schema = serde_json::to_value(schemars::schema_for!(SwapParams)).unwrap();
+        let funding_schema =
+            serde_json::to_value(schemars::schema_for!(FundingSessionRequest)).unwrap();
         let raw_schema = serde_json::to_value(schemars::schema_for!(RawExecutionParams)).unwrap();
 
-        for schema in [&wallet_schema, &swap_schema, &raw_schema] {
+        for schema in [&wallet_schema, &funding_schema, &raw_schema] {
             let properties = schema
                 .pointer("/properties")
                 .and_then(serde_json::Value::as_object)

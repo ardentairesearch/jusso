@@ -3,7 +3,7 @@
 pub mod pricing;
 
 use anyhow::{anyhow, Result};
-use ethers::prelude::*;
+use ethers_core::types::U256;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
@@ -42,7 +42,7 @@ pub struct ExecutionEngine {
     pub smart_accounts: SmartAccountRegistry,
     pub arc_client: ArcExecutionClient,
     /// Per-chain JSON-RPC providers.
-    providers: HashMap<Chain, Arc<Provider<Http>>>,
+    providers: HashMap<Chain, Arc<crate::arc::rpc::ArcRpcClient>>,
 }
 
 impl ExecutionEngine {
@@ -51,7 +51,7 @@ impl ExecutionEngine {
         let mut providers = HashMap::new();
 
         for (chain, chain_cfg) in &config.chains {
-            let provider = Provider::<Http>::try_from(&chain_cfg.rpc_url)
+            let provider = crate::arc::rpc::ArcRpcClient::new(&chain_cfg.rpc_url)
                 .map_err(|e| anyhow!("failed to create provider for {chain}: {e}"))?;
             let provider = Arc::new(provider);
             providers.insert(chain.clone(), provider.clone());
@@ -75,7 +75,7 @@ impl ExecutionEngine {
     }
 
     /// Resolve the provider for a given chain.
-    pub fn provider_for_chain(&self, chain: &Chain) -> Result<Arc<Provider<Http>>> {
+    pub fn provider_for_chain(&self, chain: &Chain) -> Result<Arc<crate::arc::rpc::ArcRpcClient>> {
         self.providers
             .get(chain)
             .cloned()
@@ -125,7 +125,7 @@ impl ExecutionEngine {
             }
             if batch_calls.len() > 16 {
                 return Err(anyhow!(
-                    "batch_calls has {} entries — max 16 protocol calls per UserOperation",
+                    "batch_calls has {} entries — max 16 calls per UserOperation",
                     batch_calls.len()
                 ));
             }
@@ -205,7 +205,7 @@ impl ExecutionEngine {
         // the account still signs and submits the exact zero-fee operation.
         let pricing_fee_per_gas = if max_fee_per_gas.is_zero() {
             self.provider_for_chain(chain)?
-                .get_gas_price()
+                .gas_price()
                 .await
                 .map_err(|error| anyhow!("failed to fetch Arc gas price: {error}"))?
                 .max(U256::from(ARC_MIN_GAS_PRICE_WEI))

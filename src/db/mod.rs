@@ -328,13 +328,13 @@ pub async fn create_passkey_owner_registration(
         INSERT INTO authorization_policies (
             id, organization_id, name, allowed_chains, allowed_protocols,
             allowed_actions, max_value_wei, max_execution_fee_usd,
-            token_spend_limits, rolling_window_seconds,
+            token_spend_limits, risk_permissions, rolling_window_seconds,
             max_rolling_execution_fee_usd, max_sponsored_gas_units,
             max_rolling_sponsored_gas_units, max_borrowed_value_usd,
             max_rolling_borrowed_value_usd
         ) VALUES (
             $1, $2, 'default-autonomous', $3, $4, $5, '0', $6,
-            $7, $8, $9, $10, $11, 0, 0
+            $7, $8, $9, $10, $11, $12, 0, 0
         )
         RETURNING *
         "#,
@@ -346,6 +346,7 @@ pub async fn create_passkey_owner_registration(
     .bind(options.policy_actions)
     .bind(options.max_execution_fee_usd)
     .bind(crate::policy::default_token_spend_limits())
+    .bind(vec![crate::policy::RISK_EXTERNAL_WITHDRAWAL.to_string()])
     .bind(crate::auth::DEFAULT_ROLLING_WINDOW_SECONDS)
     .bind(crate::auth::DEFAULT_MAX_ROLLING_EXECUTION_FEE_USD)
     .bind(crate::auth::DEFAULT_MAX_SPONSORED_GAS_UNITS)
@@ -482,14 +483,14 @@ pub async fn create_self_service_registration(
         INSERT INTO authorization_policies (
             id, organization_id, name, allowed_chains, allowed_protocols,
             allowed_actions, max_value_wei, max_execution_fee_usd,
-            token_spend_limits, rolling_window_seconds,
+            token_spend_limits, risk_permissions, rolling_window_seconds,
             max_rolling_execution_fee_usd, max_sponsored_gas_units,
             max_rolling_sponsored_gas_units, max_borrowed_value_usd,
             max_rolling_borrowed_value_usd
         )
         VALUES (
             $1, $2, 'default-autonomous', $3, $4, $5, '0', $6,
-            $7, $8, $9, $10, $11, 0, 0
+            $7, $8, $9, $10, $11, $12, 0, 0
         )
         RETURNING *
         "#,
@@ -501,6 +502,7 @@ pub async fn create_self_service_registration(
     .bind(options.policy_actions)
     .bind(options.max_execution_fee_usd)
     .bind(crate::policy::default_token_spend_limits())
+    .bind(vec![crate::policy::RISK_EXTERNAL_WITHDRAWAL.to_string()])
     .bind(crate::auth::DEFAULT_ROLLING_WINDOW_SECONDS)
     .bind(crate::auth::DEFAULT_MAX_ROLLING_EXECUTION_FEE_USD)
     .bind(crate::auth::DEFAULT_MAX_SPONSORED_GAS_UNITS)
@@ -1722,6 +1724,19 @@ pub enum OwnerApprovalAction {
         passkey_id: Uuid,
         expected_credential_id: String,
     },
+    CreatePaymentPlan {
+        plan: crate::workflows::NormalizedPaymentPlan,
+    },
+    UpdatePaymentPlan {
+        plan_id: Uuid,
+        expected_version: i64,
+        plan: crate::workflows::NormalizedPaymentPlan,
+    },
+    ChangePaymentPlanStatus {
+        plan_id: Uuid,
+        expected_version: i64,
+        change: crate::workflows::PaymentPlanStatusChange,
+    },
 }
 
 impl OwnerApprovalAction {
@@ -1737,6 +1752,9 @@ impl OwnerApprovalAction {
             Self::RotateAgentCredential { .. } => "rotate_agent_credential",
             Self::RotateAgentOnchainSigner { .. } => "rotate_agent_onchain_signer",
             Self::RevokeOwnerPasskey { .. } => "revoke_owner_passkey",
+            Self::CreatePaymentPlan { .. } => "create_payment_plan",
+            Self::UpdatePaymentPlan { .. } => "update_payment_plan",
+            Self::ChangePaymentPlanStatus { .. } => "change_payment_plan_status",
         }
     }
 
@@ -1747,6 +1765,17 @@ impl OwnerApprovalAction {
         {
             if *expected_version <= 0 {
                 anyhow::bail!("expected policy version must be positive");
+            }
+        }
+        if let Self::UpdatePaymentPlan {
+            expected_version, ..
+        }
+        | Self::ChangePaymentPlanStatus {
+            expected_version, ..
+        } = self
+        {
+            if *expected_version <= 0 {
+                anyhow::bail!("expected payment-plan version must be positive");
             }
         }
         match self {
@@ -1828,14 +1857,14 @@ impl OwnerApprovalAction {
                 }
                 if allowed_targets.as_ref().is_some_and(|targets| {
                     targets.iter().any(|target| {
-                        target != "*" && target.parse::<ethers::types::Address>().is_err()
+                        target != "*" && target.parse::<ethers_core::types::Address>().is_err()
                     })
                 }) {
                     anyhow::bail!("allowed_targets must contain EVM addresses or *");
                 }
                 if max_value_wei
                     .as_deref()
-                    .is_some_and(|value| value.parse::<ethers::types::U256>().is_err())
+                    .is_some_and(|value| value.parse::<ethers_core::types::U256>().is_err())
                 {
                     anyhow::bail!("max_value_wei must be an unsigned decimal integer");
                 }
@@ -1893,7 +1922,7 @@ impl OwnerApprovalAction {
                         actions.iter().any(|action| {
                             action == "*"
                                 || action == "transaction:execute"
-                                || action.starts_with("protocol:")
+                                || action == "payment_plan:execute"
                         })
                     });
                 if executes
@@ -1909,10 +1938,10 @@ impl OwnerApprovalAction {
                 if allowed_actions.as_ref().is_some_and(|actions| {
                     actions
                         .iter()
-                        .any(|action| action == "*" || action == "protocol:uniswap-v4:swap")
+                        .any(|action| action == "*" || action == "payment_plan:execute")
                 }) && crate::policy::validate_token_spend_limits(token_spend_limits)?.is_empty()
                 {
-                    anyhow::bail!("Uniswap execution requires at least one token spend limit");
+                    anyhow::bail!("payment-plan execution requires at least one token spend limit");
                 }
             }
             Self::CreateAgent {
@@ -1950,9 +1979,9 @@ impl OwnerApprovalAction {
                 ..
             } => {
                 let account = expected_smart_account_address
-                    .parse::<ethers::types::Address>()
+                    .parse::<ethers_core::types::Address>()
                     .map_err(|_| anyhow::anyhow!("expected smart-account address is invalid"))?;
-                if account == ethers::types::Address::zero() {
+                if account == ethers_core::types::Address::zero() {
                     anyhow::bail!("expected smart-account address cannot be zero");
                 }
                 let expected_chain_id = match expected_chain {
@@ -1972,6 +2001,10 @@ impl OwnerApprovalAction {
                     anyhow::bail!("expected passkey credential ID is invalid");
                 }
             }
+            Self::CreatePaymentPlan { plan } | Self::UpdatePaymentPlan { plan, .. } => {
+                plan.validate()?;
+            }
+            Self::ChangePaymentPlanStatus { .. } => {}
         }
         Ok(())
     }
@@ -2070,7 +2103,8 @@ pub fn validate_delegated_policy(
     match (&parent.max_value_wei, &child.max_value_wei) {
         (Some(_), None) => anyhow::bail!("child policy must retain the parent native-value limit"),
         (Some(parent), Some(child))
-            if child.parse::<ethers::types::U256>()? > parent.parse::<ethers::types::U256>()? =>
+            if child.parse::<ethers_core::types::U256>()?
+                > parent.parse::<ethers_core::types::U256>()? =>
         {
             anyhow::bail!("child policy exceeds the parent native-value limit")
         }
@@ -2129,14 +2163,16 @@ pub fn validate_delegated_policy(
             .ok_or_else(|| anyhow::anyhow!("child policy adds token-spend authority"))?;
         if child_limit
             .max_per_execution_raw
-            .parse::<ethers::types::U256>()?
+            .parse::<ethers_core::types::U256>()?
             > parent_limit
                 .max_per_execution_raw
-                .parse::<ethers::types::U256>()?
-            || child_limit.max_rolling_raw.parse::<ethers::types::U256>()?
+                .parse::<ethers_core::types::U256>()?
+            || child_limit
+                .max_rolling_raw
+                .parse::<ethers_core::types::U256>()?
                 > parent_limit
                     .max_rolling_raw
-                    .parse::<ethers::types::U256>()?
+                    .parse::<ethers_core::types::U256>()?
         {
             anyhow::bail!("child policy exceeds a parent token-spend limit");
         }
@@ -2911,6 +2947,74 @@ pub async fn create_owner_approval_request(
                 ]
             })
         }
+        OwnerApprovalAction::CreatePaymentPlan { plan } => {
+            validate_payment_plan_for_owner(pool, context, plan).await?;
+            serde_json::json!({
+                "title": "Create recurring USDC payment plan",
+                "plan": plan,
+                "effects": [
+                    "Runs automatically on the approved schedule",
+                    "Pays only the listed recipients from the selected agent wallet",
+                    "Preserves the configured reserve plus a conservative execution-fee buffer",
+                    "Skips a run rather than borrowing when funds are insufficient",
+                    "Can be paused immediately"
+                ]
+            })
+        }
+        OwnerApprovalAction::UpdatePaymentPlan {
+            plan_id,
+            expected_version,
+            plan,
+        } => {
+            let (current, recipients) = crate::workflows::get_plan(pool, context, *plan_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("payment plan was not found"))?;
+            if current.version != *expected_version || current.status == "cancelled" {
+                anyhow::bail!("payment plan changed or was cancelled before approval was created");
+            }
+            validate_payment_plan_for_owner(pool, context, plan).await?;
+            serde_json::json!({
+                "title": "Update recurring USDC payment plan",
+                "current_plan": current,
+                "current_recipients": recipients,
+                "proposed_plan": plan,
+                "effect": "Replaces the schedule and payment rules after approval; an already queued run is not modified"
+            })
+        }
+        OwnerApprovalAction::ChangePaymentPlanStatus {
+            plan_id,
+            expected_version,
+            change,
+        } => {
+            let (current, recipients) = crate::workflows::get_plan(pool, context, *plan_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("payment plan was not found"))?;
+            if current.version != *expected_version {
+                anyhow::bail!("payment plan changed before approval was created");
+            }
+            match change {
+                crate::workflows::PaymentPlanStatusChange::Pause if current.status != "active" => {
+                    anyhow::bail!("only an active payment plan can be paused")
+                }
+                crate::workflows::PaymentPlanStatusChange::Resume if current.status != "paused" => {
+                    anyhow::bail!("only a paused payment plan can be resumed")
+                }
+                crate::workflows::PaymentPlanStatusChange::Cancel
+                    if current.status == "cancelled" =>
+                {
+                    anyhow::bail!("payment plan is already cancelled")
+                }
+                _ => {}
+            }
+            serde_json::json!({
+                "title": format!("{:?} recurring USDC payment plan", change),
+                "plan": current,
+                "recipients": recipients,
+                "warning": if matches!(change, crate::workflows::PaymentPlanStatusChange::Cancel) {
+                    Some("Cancellation is permanent and does not cancel an already queued transaction")
+                } else { None }
+            })
+        }
     };
     let id = Uuid::new_v4();
     let payload = serde_json::to_value(action)?;
@@ -2934,6 +3038,71 @@ pub async fn create_owner_approval_request(
     .bind(expires_at)
     .fetch_one(pool)
     .await?)
+}
+
+async fn validate_payment_plan_for_owner(
+    pool: &PgPool,
+    context: &AuthContext,
+    plan: &crate::workflows::NormalizedPaymentPlan,
+) -> Result<()> {
+    plan.validate()?;
+    if let Some(callback_url) = plan.callback_url.as_deref() {
+        crate::webhook::validate_callback_url(Some(callback_url)).await?;
+    }
+    let (agent, policy) = authorize_execution_agent(pool, context, &plan.agent_id).await?;
+    if context.is_bound_to_other_agent(agent.id) {
+        anyhow::bail!("owner session is bound to another agent");
+    }
+    validate_payment_plan_against_policy(&policy, plan)
+}
+
+fn validate_payment_plan_against_policy(
+    policy: &AuthorizationPolicyRow,
+    plan: &crate::workflows::NormalizedPaymentPlan,
+) -> Result<()> {
+    if !policy.allowed_actions.as_ref().is_some_and(|actions| {
+        actions
+            .iter()
+            .any(|action| action == "*" || action == "payment_plan:execute")
+    }) {
+        anyhow::bail!("agent policy does not allow recurring payment-plan execution");
+    }
+    let mut total = ethers_core::types::U256::zero();
+    let mut recipients = Vec::with_capacity(plan.recipients.len() + 1);
+    for recipient in &plan.recipients {
+        total = total
+            .checked_add(ethers_core::types::U256::from_dec_str(
+                &recipient.amount_raw,
+            )?)
+            .ok_or_else(|| anyhow::anyhow!("payment-plan total overflow"))?;
+        recipients.push(recipient.address.clone());
+    }
+    if let Some(surplus) = &plan.surplus {
+        if let Some(maximum) = surplus.maximum_transfer_raw.as_deref() {
+            total = total
+                .checked_add(ethers_core::types::U256::from_dec_str(maximum)?)
+                .ok_or_else(|| anyhow::anyhow!("payment-plan total overflow"))?;
+        }
+        recipients.push(surplus.destination.clone());
+    }
+    let impact = crate::policy::ExecutionPolicyImpact {
+        token_spends: vec![crate::policy::TokenSpend {
+            token: crate::policy::ARC_USDC_ADDRESS.into(),
+            amount_raw: total.to_string(),
+        }],
+        borrowed_value_usd: 0.0,
+        risks: vec![crate::policy::RISK_EXTERNAL_WITHDRAWAL.into()],
+        recipients,
+    };
+    crate::auth::enforce_policy_impact(policy, &impact)?;
+    if policy.allowed_targets.as_ref().is_some_and(|targets| {
+        !targets.iter().any(|target| {
+            target == "*" || target.eq_ignore_ascii_case(crate::policy::ARC_USDC_ADDRESS)
+        })
+    }) {
+        anyhow::bail!("agent policy does not allow the Arc USDC contract target");
+    }
+    Ok(())
 }
 
 pub async fn get_owner_approval_request(
@@ -3635,6 +3804,215 @@ pub async fn complete_owner_approval(
                 "expired_passkey_enrollments": expired_enrollments
             })
         }
+        OwnerApprovalAction::CreatePaymentPlan { mut plan } => {
+            let agent: AgentRow = sqlx::query_as(
+                r#"SELECT a.* FROM agents a
+                   JOIN principal_agent_grants pag ON pag.agent_id = a.id
+                   WHERE a.organization_id = $1 AND a.external_id = $2
+                     AND pag.principal_id = $3 AND a.status = 'active'
+                   FOR UPDATE OF a"#,
+            )
+            .bind(row.organization_id)
+            .bind(&plan.agent_id)
+            .bind(row.principal_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("active payment-plan agent was not found"))?;
+            let policy =
+                get_active_policy_tx(&mut transaction, row.organization_id, agent.policy_id)
+                    .await?;
+            validate_payment_plan_against_policy(&policy, &plan)?;
+            plan.first_run_at = plan.schedule.next_after(Utc::now())?;
+            let plan_id = crate::workflows::insert_plan_tx(
+                &mut transaction,
+                row.organization_id,
+                row.principal_id,
+                agent.id,
+                &plan,
+            )
+            .await?;
+            serde_json::json!({
+                "payment_plan_id": plan_id,
+                "version": 1,
+                "status": "active",
+                "next_run_at": plan.first_run_at
+            })
+        }
+        OwnerApprovalAction::UpdatePaymentPlan {
+            plan_id,
+            expected_version,
+            mut plan,
+        } => {
+            let current: (Uuid, i64, String) = sqlx::query_as(
+                r#"SELECT p.agent_id, p.version, p.status FROM payment_plans p
+                   JOIN principal_agent_grants pag ON pag.agent_id = p.agent_id
+                   WHERE p.id = $1 AND p.organization_id = $2 AND pag.principal_id = $3
+                   FOR UPDATE OF p"#,
+            )
+            .bind(plan_id)
+            .bind(row.organization_id)
+            .bind(row.principal_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("payment plan was not found"))?;
+            if current.1 != expected_version || current.2 == "cancelled" {
+                anyhow::bail!("payment plan changed or was cancelled while approval was pending");
+            }
+            let agent: AgentRow = sqlx::query_as(
+                r#"SELECT a.* FROM agents a
+                   JOIN principal_agent_grants pag ON pag.agent_id = a.id
+                   WHERE a.organization_id = $1 AND a.external_id = $2
+                     AND pag.principal_id = $3 AND a.status = 'active'
+                   FOR UPDATE OF a"#,
+            )
+            .bind(row.organization_id)
+            .bind(&plan.agent_id)
+            .bind(row.principal_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("active payment-plan agent was not found"))?;
+            let policy =
+                get_active_policy_tx(&mut transaction, row.organization_id, agent.policy_id)
+                    .await?;
+            validate_payment_plan_against_policy(&policy, &plan)?;
+            plan.first_run_at = plan.schedule.next_after(Utc::now())?;
+            let cadence = serde_json::to_value(&plan.schedule.cadence)?
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid cadence"))?
+                .to_owned();
+            sqlx::query(
+                r#"UPDATE payment_plans SET agent_id=$4, name=$5, version=version+1,
+                       cadence=$6, timezone=$7, local_time=$8, weekday=$9,
+                       day_of_month=$10, reserve_raw=$11::NUMERIC,
+                       surplus_destination=$12, surplus_minimum_raw=$13::NUMERIC,
+                       surplus_maximum_raw=$14::NUMERIC, callback_url=$15,
+                       next_run_at=$16, updated_at=now()
+                   WHERE id=$1 AND organization_id=$2 AND version=$3"#,
+            )
+            .bind(plan_id)
+            .bind(row.organization_id)
+            .bind(expected_version)
+            .bind(agent.id)
+            .bind(&plan.name)
+            .bind(cadence)
+            .bind(&plan.schedule.timezone)
+            .bind(&plan.schedule.local_time)
+            .bind(
+                plan.schedule
+                    .weekday
+                    .as_ref()
+                    .map(|value| value.to_ascii_lowercase()),
+            )
+            .bind(plan.schedule.day_of_month.map(i16::from))
+            .bind(&plan.reserve_raw)
+            .bind(plan.surplus.as_ref().map(|value| &value.destination))
+            .bind(
+                plan.surplus
+                    .as_ref()
+                    .map(|value| &value.minimum_transfer_raw),
+            )
+            .bind(
+                plan.surplus
+                    .as_ref()
+                    .and_then(|value| value.maximum_transfer_raw.as_ref()),
+            )
+            .bind(&plan.callback_url)
+            .bind(plan.first_run_at)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query("DELETE FROM payment_plan_recipients WHERE plan_id = $1")
+                .bind(plan_id)
+                .execute(&mut *transaction)
+                .await?;
+            for (position, recipient) in plan.recipients.iter().enumerate() {
+                sqlx::query(
+                    r#"INSERT INTO payment_plan_recipients
+                       (id, plan_id, position, recipient_address, amount_raw, label)
+                       VALUES ($1,$2,$3,$4,$5::NUMERIC,$6)"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(plan_id)
+                .bind(position as i16)
+                .bind(&recipient.address)
+                .bind(&recipient.amount_raw)
+                .bind(&recipient.label)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            serde_json::json!({
+                "payment_plan_id": plan_id,
+                "previous_version": expected_version,
+                "version": expected_version + 1,
+                "status": current.2,
+                "next_run_at": plan.first_run_at
+            })
+        }
+        OwnerApprovalAction::ChangePaymentPlanStatus {
+            plan_id,
+            expected_version,
+            change,
+        } => {
+            let current: (String, String, String, Option<i16>) = sqlx::query_as(
+                r#"SELECT p.status, p.cadence, p.timezone, p.day_of_month
+                   FROM payment_plans p
+                   JOIN principal_agent_grants pag ON pag.agent_id = p.agent_id
+                   WHERE p.id=$1 AND p.organization_id=$2 AND pag.principal_id=$3
+                     AND p.version=$4 FOR UPDATE OF p"#,
+            )
+            .bind(plan_id)
+            .bind(row.organization_id)
+            .bind(row.principal_id)
+            .bind(expected_version)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("payment plan changed while approval was pending"))?;
+            let (new_status, next_run_at, cancelled_at) = match change {
+                crate::workflows::PaymentPlanStatusChange::Pause if current.0 == "active" => {
+                    ("paused", None, None)
+                }
+                crate::workflows::PaymentPlanStatusChange::Resume if current.0 == "paused" => {
+                    let schedule_row: (String, Option<String>) =
+                        sqlx::query_as("SELECT local_time, weekday FROM payment_plans WHERE id=$1")
+                            .bind(plan_id)
+                            .fetch_one(&mut *transaction)
+                            .await?;
+                    let cadence = serde_json::from_value(serde_json::Value::String(current.1))?;
+                    let schedule = crate::workflows::PaymentSchedule {
+                        cadence,
+                        timezone: current.2,
+                        local_time: schedule_row.0,
+                        weekday: schedule_row.1,
+                        day_of_month: current.3.map(|value| value as u8),
+                    };
+                    ("active", Some(schedule.next_after(Utc::now())?), None)
+                }
+                crate::workflows::PaymentPlanStatusChange::Cancel if current.0 != "cancelled" => {
+                    ("cancelled", None, Some(Utc::now()))
+                }
+                _ => anyhow::bail!("payment-plan status transition is no longer valid"),
+            };
+            sqlx::query(
+                r#"UPDATE payment_plans SET status=$5, version=version+1,
+                       next_run_at=$6, cancelled_at=$7, updated_at=now()
+                   WHERE id=$1 AND organization_id=$2 AND version=$3 AND status=$4"#,
+            )
+            .bind(plan_id)
+            .bind(row.organization_id)
+            .bind(expected_version)
+            .bind(&current.0)
+            .bind(new_status)
+            .bind(next_run_at)
+            .bind(cancelled_at)
+            .execute(&mut *transaction)
+            .await?;
+            serde_json::json!({
+                "payment_plan_id": plan_id,
+                "previous_version": expected_version,
+                "version": expected_version + 1,
+                "status": new_status,
+                "next_run_at": next_run_at
+            })
+        }
     };
     sqlx::query(
         r#"UPDATE owner_approval_requests
@@ -3943,37 +4321,6 @@ pub async fn get_idempotent_execution_request(
     Ok(row)
 }
 
-/// Recover an already accepted typed execution before re-running mutable
-/// protocol discovery or quote resolution. Ownership checks prevent a key
-/// from revealing another agent's request.
-pub async fn get_execution_request_by_idempotency_key_for_agent(
-    pool: &PgPool,
-    context: &crate::types::AuthContext,
-    agent_external_id: &str,
-    idempotency_key: &str,
-) -> Result<Option<ExecutionRequestRow>> {
-    validate_idempotency_key(idempotency_key)?;
-    let (agent, _) = authorize_execution_agent(pool, context, agent_external_id).await?;
-    let row = sqlx::query_as::<_, ExecutionRequestRow>(
-        r#"
-        SELECT * FROM execution_requests
-        WHERE organization_id = $1 AND idempotency_key = $2
-        "#,
-    )
-    .bind(context.organization_id)
-    .bind(idempotency_key)
-    .fetch_optional(pool)
-    .await?;
-    if row.as_ref().is_some_and(|existing| {
-        existing.principal_id != context.principal_id
-            || existing.agent_uuid != agent.id
-            || existing.instance_id != context.instance_id
-    }) {
-        anyhow::bail!("idempotency key belongs to a different authenticated identity");
-    }
-    Ok(row)
-}
-
 pub async fn fail_unfinished_idempotent_execution(
     pool: &PgPool,
     context: &crate::types::AuthContext,
@@ -4081,7 +4428,7 @@ pub async fn issue_execution_permit(
     execution_fee_raw: Option<&str>,
     ttl_seconds: i64,
 ) -> Result<models::ExecutionPermitRow> {
-    if execution_fee_raw.is_some_and(|amount| amount.parse::<ethers::types::U256>().is_err()) {
+    if execution_fee_raw.is_some_and(|amount| amount.parse::<ethers_core::types::U256>().is_err()) {
         anyhow::bail!("execution permit fee must be an unsigned decimal integer");
     }
     let expires_at = Utc::now() + chrono::Duration::seconds(ttl_seconds.clamp(30, 600));
@@ -4311,10 +4658,10 @@ pub async fn reserve_policy_budget(
     .await?;
 
     let token_limits = crate::policy::validate_token_spend_limits(&policy.token_spend_limits)?;
-    let mut spends = std::collections::BTreeMap::<String, ethers::types::U256>::new();
+    let mut spends = std::collections::BTreeMap::<String, ethers_core::types::U256>::new();
     for spend in impact.token_spends {
         let token = spend.token.to_ascii_lowercase();
-        let amount = ethers::types::U256::from_dec_str(&spend.amount_raw)?;
+        let amount = ethers_core::types::U256::from_dec_str(&spend.amount_raw)?;
         let total = spends.entry(token).or_default();
         *total = total
             .checked_add(amount)
@@ -4341,10 +4688,10 @@ pub async fn reserve_policy_budget(
         .bind(&token)
         .fetch_one(&mut *transaction)
         .await?;
-        let next = ethers::types::U256::from_dec_str(&current)?
+        let next = ethers_core::types::U256::from_dec_str(&current)?
             .checked_add(amount)
             .ok_or_else(|| anyhow::anyhow!("rolling token spend overflow"))?;
-        if next > ethers::types::U256::from_dec_str(&limit.max_rolling_raw)? {
+        if next > ethers_core::types::U256::from_dec_str(&limit.max_rolling_raw)? {
             anyhow::bail!("token spend exceeds rolling authorization policy");
         }
         sqlx::query(
@@ -4874,7 +5221,7 @@ mod tests {
             name: format!("policy-{}", Uuid::new_v4().simple()),
             version: 1,
             allowed_chains: Some(vec!["arc-testnet".into()]),
-            allowed_protocols: Some(vec!["uniswap-v4".into()]),
+            allowed_protocols: None,
             allowed_actions,
             allowed_targets: Some(vec!["0x0000000000000000000000000000000000000001".into()]),
             allow_raw_execution,
@@ -4920,11 +5267,11 @@ mod tests {
     #[test]
     fn owner_approval_policy_drafts_are_restrictive_and_arc_scoped() {
         let valid = OwnerApprovalAction::CreatePolicy {
-            name: "Arc swap policy".into(),
+            name: "Arc payment policy".into(),
             allowed_chains: Some(vec!["arc-testnet".into()]),
-            allowed_protocols: Some(vec!["uniswap-v4".into()]),
-            allowed_actions: Some(vec!["protocol:uniswap-v4:swap".into()]),
-            allowed_targets: Some(vec!["0x0000000000000000000000000000000000000001".into()]),
+            allowed_protocols: None,
+            allowed_actions: Some(vec!["payment_plan:execute".into()]),
+            allowed_targets: Some(vec![crate::policy::ARC_USDC_ADDRESS.into()]),
             allow_raw_execution: false,
             max_value_wei: Some("0".into()),
             max_execution_fee_usd: Some(1.0),
@@ -4983,10 +5330,7 @@ mod tests {
     #[test]
     fn delegated_policies_cannot_expand_parent_authority() {
         let parent = test_policy(
-            Some(vec![
-                "wallet:read".into(),
-                "protocol:uniswap-v4:swap".into(),
-            ]),
+            Some(vec!["wallet:read".into(), "payment_plan:execute".into()]),
             false,
             Some("100"),
             Some(1.0),
@@ -5142,8 +5486,8 @@ mod tests {
         let action = OwnerApprovalAction::CreatePolicy {
             name: policy_name.clone(),
             allowed_chains: Some(vec!["arc-testnet".into()]),
-            allowed_protocols: Some(vec!["uniswap-v4".into()]),
-            allowed_actions: Some(vec!["protocol:uniswap-v4:swap".into()]),
+            allowed_protocols: None,
+            allowed_actions: Some(vec!["payment_plan:execute".into()]),
             allowed_targets: None,
             allow_raw_execution: false,
             max_value_wei: Some("0".into()),
@@ -5937,7 +6281,7 @@ mod tests {
             &OwnerApprovalAction::CreatePolicy {
                 name: format!("narrow-{}", Uuid::new_v4().simple()),
                 allowed_chains: Some(vec!["arc-testnet".into()]),
-                allowed_protocols: Some(vec!["uniswap-v4".into()]),
+                allowed_protocols: Some(vec![]),
                 allowed_actions: Some(vec!["wallet:read".into()]),
                 allowed_targets: Some(vec!["0x0000000000000000000000000000000000000001".into()]),
                 allow_raw_execution: false,
@@ -5995,6 +6339,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(root_policy_id, narrow_policy_id);
+    }
+
+    #[tokio::test]
+    async fn approved_payment_plan_is_persisted_with_exact_recipients() {
+        let pool = setup_pool().await;
+        let fixture = create_owner_control_fixture(&pool).await;
+        let plan = crate::workflows::PaymentPlanInput {
+            name: "Weekly contractors".into(),
+            agent_id: fixture.root_agent.external_id.clone(),
+            schedule: crate::workflows::PaymentSchedule {
+                cadence: crate::workflows::ScheduleCadence::Weekly,
+                timezone: "Africa/Lagos".into(),
+                local_time: "09:00".into(),
+                weekday: Some("friday".into()),
+                day_of_month: None,
+            },
+            recipients: vec![crate::workflows::PaymentRecipientInput {
+                address: "0x0000000000000000000000000000000000000001".into(),
+                amount_usdc: "5.25".into(),
+                label: Some("Contractor".into()),
+            }],
+            reserve_usdc: "10".into(),
+            surplus: None,
+            callback_url: None,
+        }
+        .normalize(Utc::now())
+        .unwrap();
+        let result = approve_test_action(
+            &pool,
+            &fixture,
+            &OwnerApprovalAction::CreatePaymentPlan { plan },
+        )
+        .await
+        .unwrap();
+        let plan_id = Uuid::parse_str(result["payment_plan_id"].as_str().unwrap()).unwrap();
+        let (stored, recipients) = crate::workflows::get_plan(&pool, &fixture.context, plan_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "active");
+        assert_eq!(stored.reserve_raw, "10000000");
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].amount_raw, "5250000");
     }
 
     #[tokio::test]
@@ -6489,9 +6876,9 @@ mod tests {
         .unwrap();
 
         let mut first = sample_request(&external_id);
-        first.policy_impact = crate::policy::ExecutionPolicyImpact::uniswap_swap(
+        first.policy_impact = crate::policy::ExecutionPolicyImpact::token_spend(
             crate::policy::ARC_USDC_ADDRESS.parse().unwrap(),
-            ethers::types::U256::from(20_000_000u64),
+            ethers_core::types::U256::from(20_000_000u64),
         );
         let second = first.clone();
         let first_row = insert_execution_request(
