@@ -2033,6 +2033,18 @@ impl OwnerApprovalAction {
             Self::RevokeExternalWallet { .. } => {}
             Self::CreatePaymentPlan { plan } | Self::UpdatePaymentPlan { plan, .. } => {
                 plan.validate()?;
+                if plan.recipients.iter().any(|recipient| {
+                    recipient
+                        .verification
+                        .as_ref()
+                        .is_none_or(|verification| verification.chain != expected_chain)
+                }) || plan
+                    .surplus_verification
+                    .as_ref()
+                    .is_some_and(|verification| verification.chain != expected_chain)
+                {
+                    anyhow::bail!("payment recipient verification targets the wrong Arc network");
+                }
             }
             Self::ChangePaymentPlanStatus { .. } => {}
         }
@@ -2322,6 +2334,181 @@ fn policy_risk_warnings(action: &OwnerApprovalAction) -> Vec<&'static str> {
         }
     }
     warnings
+}
+
+fn approval_agent_summary(agent: &AgentRow) -> serde_json::Value {
+    serde_json::json!({
+        "name": agent.display_name,
+        "agent": agent.external_id,
+        "status": agent.status
+    })
+}
+
+fn approval_policy_summary(policy: &AuthorizationPolicyRow) -> serde_json::Value {
+    policy_summary(
+        &policy.name,
+        policy.allowed_chains.as_deref(),
+        policy.allowed_actions.as_deref(),
+        &policy.token_spend_limits,
+        &policy.risk_permissions,
+        policy.rolling_window_seconds,
+        policy.max_execution_fee_usd,
+    )
+}
+
+fn approval_policy_action_summary(action: &OwnerApprovalAction) -> serde_json::Value {
+    let (OwnerApprovalAction::CreatePolicy {
+        name,
+        allowed_chains,
+        allowed_actions,
+        token_spend_limits,
+        risk_permissions,
+        rolling_window_seconds,
+        max_execution_fee_usd,
+        ..
+    }
+    | OwnerApprovalAction::UpdatePolicy {
+        name,
+        allowed_chains,
+        allowed_actions,
+        token_spend_limits,
+        risk_permissions,
+        rolling_window_seconds,
+        max_execution_fee_usd,
+        ..
+    }) = action
+    else {
+        return serde_json::Value::Null;
+    };
+    policy_summary(
+        name,
+        allowed_chains.as_deref(),
+        allowed_actions.as_deref(),
+        token_spend_limits,
+        risk_permissions,
+        *rolling_window_seconds,
+        *max_execution_fee_usd,
+    )
+}
+
+fn policy_summary(
+    name: &str,
+    chains: Option<&[String]>,
+    actions: Option<&[String]>,
+    token_limits: &serde_json::Value,
+    risks: &[String],
+    rolling_window_seconds: i64,
+    max_execution_fee_usd: Option<f64>,
+) -> serde_json::Value {
+    let limits = crate::policy::validate_token_spend_limits(token_limits).unwrap_or_default();
+    let usdc = limits.iter().find(|limit| {
+        limit.token == "*"
+            || limit
+                .token
+                .eq_ignore_ascii_case(crate::policy::ARC_USDC_ADDRESS)
+    });
+    serde_json::json!({
+        "policy": name,
+        "network": chains.map(|values| values.iter().map(|value| match value.as_str() {
+            "arc-testnet" => "Arc Testnet".to_string(),
+            "arc" => "Arc".to_string(),
+            other => other.to_string()
+        }).collect::<Vec<_>>().join(", ")).unwrap_or_else(|| "Any network".into()),
+        "abilities": actions.map(|values| values.iter().map(|value| human_policy_action(value)).collect::<Vec<_>>()).unwrap_or_else(|| vec!["Any action".into()]),
+        "per_payment_limit": usdc.map(|limit| format!("{} USDC", format_usdc_raw(&limit.max_per_execution_raw))),
+        "rolling_limit": usdc.map(|limit| format!("{} USDC every {}", format_usdc_raw(&limit.max_rolling_raw), human_duration(rolling_window_seconds))),
+        "maximum_execution_fee": max_execution_fee_usd.map(|value| format!("${value:.2}")),
+        "sensitive_permissions": if risks.is_empty() { serde_json::Value::String("None".into()) } else { serde_json::json!(risks.iter().map(|value| human_policy_action(value)).collect::<Vec<_>>()) }
+    })
+}
+
+fn human_policy_action(value: &str) -> String {
+    match value {
+        "*" => "All actions".into(),
+        "payment_plan:execute" => "Run scheduled payments".into(),
+        "wallet:read" => "View wallet and balances".into(),
+        "workflow:read" => "View payment plans and runs".into(),
+        "workflow:manage" => "Manage payment plans".into(),
+        "external_withdrawal" => "Pay external recipients".into(),
+        other => other.replace(['_', ':'], " "),
+    }
+}
+
+fn approval_payment_plan_summary(
+    plan: &crate::workflows::NormalizedPaymentPlan,
+) -> serde_json::Value {
+    let recipients = plan
+        .recipients
+        .iter()
+        .map(|recipient| {
+            let verification = recipient.verification.as_ref();
+            serde_json::json!({
+                "name": recipient.name.as_deref().unwrap_or("Unnamed recipient"),
+                "address": recipient.address,
+                "amount": format!("{} USDC", format_usdc_raw(&recipient.amount_raw)),
+                "verified": verification.map(|value| format!("Verified {} on {}", value.address_kind, value.chain))
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "plan": plan.name,
+        "agent": plan.agent_id,
+        "schedule": human_schedule(&plan.schedule),
+        "recipients": recipients,
+        "wallet_reserve": format!("{} USDC", format_usdc_raw(&plan.reserve_raw)),
+        "address_check": "Observed on Arc. Recipient names are owner-provided and do not prove identity.",
+        "surplus_rule": plan.surplus.as_ref().map(|surplus| format!(
+            "Send available balance above the reserve to {} when at least {} USDC is available",
+            surplus.destination,
+            format_usdc_raw(&surplus.minimum_transfer_raw)
+        ))
+    })
+}
+
+fn human_schedule(schedule: &crate::workflows::PaymentSchedule) -> String {
+    match schedule.cadence {
+        crate::workflows::ScheduleCadence::Daily => {
+            format!(
+                "Every day at {} ({})",
+                schedule.local_time, schedule.timezone
+            )
+        }
+        crate::workflows::ScheduleCadence::Weekly => format!(
+            "Every {} at {} ({})",
+            schedule.weekday.as_deref().unwrap_or("week"),
+            schedule.local_time,
+            schedule.timezone
+        ),
+        crate::workflows::ScheduleCadence::Monthly => format!(
+            "Day {} of every month at {} ({})",
+            schedule.day_of_month.unwrap_or_default(),
+            schedule.local_time,
+            schedule.timezone
+        ),
+    }
+}
+
+fn human_duration(seconds: i64) -> String {
+    if seconds % 86_400 == 0 {
+        let value = seconds / 86_400;
+        format!("{value} day{}", if value == 1 { "" } else { "s" })
+    } else if seconds % 3_600 == 0 {
+        let value = seconds / 3_600;
+        format!("{value} hour{}", if value == 1 { "" } else { "s" })
+    } else if seconds % 60 == 0 {
+        let value = seconds / 60;
+        format!("{value} minute{}", if value == 1 { "" } else { "s" })
+    } else {
+        format!("{seconds} seconds")
+    }
+}
+
+fn format_usdc_raw(raw: &str) -> String {
+    ethers_core::utils::format_units(
+        ethers_core::types::U256::from_dec_str(raw).unwrap_or_default(),
+        crate::workflows::USDC_DECIMALS as usize,
+    )
+    .unwrap_or_else(|_| raw.to_string())
 }
 
 fn proposed_policy_update(
@@ -2665,7 +2852,8 @@ pub async fn create_owner_approval_request(
     let presentation = match action {
         OwnerApprovalAction::CreatePolicy { .. } => serde_json::json!({
             "title": "Create authorization policy",
-            "proposed_policy": action,
+            "summary": "Choose what an agent may do and how much it may spend.",
+            "policy": approval_policy_action_summary(action),
             "warnings": policy_risk_warnings(action)
         }),
         OwnerApprovalAction::UpdatePolicy {
@@ -2683,14 +2871,11 @@ pub async fn create_owner_approval_request(
             validate_policy_update_assignments(pool, context.organization_id, &proposed).await?;
             serde_json::json!({
                 "title": "Update authorization policy",
-                "current_policy": current,
-                "proposed_policy": proposed,
+                "summary": "Review the agent's new permissions and spending limits.",
+                "current": approval_policy_summary(&current),
+                "new_policy": approval_policy_summary(&proposed),
                 "warnings": policy_risk_warnings(action),
-                "effects": [
-                    "Increments the policy version",
-                    "Revokes unsigned execution permits from the previous version",
-                    "Releases only uncommitted budget reservations from the previous version"
-                ]
+                "note": "Any unsigned work using the previous policy is cancelled."
             })
         }
         OwnerApprovalAction::AssignPolicy {
@@ -2723,9 +2908,10 @@ pub async fn create_owner_approval_request(
                 .await?;
             serde_json::json!({
                 "title": "Assign authorization policy",
-                "agent": agent,
-                "current_policy": current,
-                "proposed_policy": proposed
+                "summary": "Change what this agent is allowed to do.",
+                "agent": approval_agent_summary(&agent),
+                "current": approval_policy_summary(&current),
+                "new_policy": approval_policy_summary(&proposed)
             })
         }
         OwnerApprovalAction::RevokePolicy { policy_id } => {
@@ -2743,7 +2929,8 @@ pub async fn create_owner_approval_request(
             }
             serde_json::json!({
                 "title": "Revoke authorization policy",
-                "policy": policy,
+                "summary": "Remove this policy from future use.",
+                "policy": approval_policy_summary(&policy),
                 "warning": "This policy will no longer be available for assignment"
             })
         }
@@ -2752,7 +2939,7 @@ pub async fn create_owner_approval_request(
             display_name,
             parent_agent_id,
             policy_id,
-            runtime_scopes,
+            runtime_scopes: _,
             enrollment_ttl_seconds,
             ..
         } => {
@@ -2793,15 +2980,14 @@ pub async fn create_owner_approval_request(
             };
             serde_json::json!({
                 "title": "Create agent",
+                "summary": "Add a new autonomous agent to this organization.",
                 "agent": {
                     "agent_id": external_id,
-                    "display_name": display_name,
-                    "runtime_scopes": runtime_scopes,
-                    "enrollment_ttl_seconds": enrollment_ttl_seconds
+                    "display_name": display_name
                 },
-                "assigned_policy": policy,
-                "parent_delegation": parent,
-                "message": "The one-time enrollment credential becomes usable only after approval"
+                "assigned_policy": approval_policy_summary(&policy),
+                "delegated_from": parent.as_ref().and_then(|value| value.get("agent")).and_then(|agent| agent.get("display_name")).cloned(),
+                "note": format!("A one-time enrollment link will remain valid for {}.", human_duration(*enrollment_ttl_seconds))
             })
         }
         OwnerApprovalAction::SuspendAgent { agent_id } => {
@@ -2815,12 +3001,12 @@ pub async fn create_owner_approval_request(
             .await?;
             serde_json::json!({
                 "title": "Suspend agent",
-                "agent": agent,
+                "summary": "Immediately stop this agent from starting new work.",
+                "agent": approval_agent_summary(&agent),
                 "effects": [
-                    "Blocks the agent and its delegated descendants from new execution",
-                    "Revokes local runtime credentials and agent-bound OAuth sessions",
-                    "Revokes workload instances and consumes pending enrollment grants",
-                    "Preserves the agent wallet, smart account, and assets"
+                    "New work and active sessions are blocked",
+                    "Delegated child agents are also suspended",
+                    "Wallets and funds remain untouched"
                 ]
             })
         }
@@ -2840,8 +3026,9 @@ pub async fn create_owner_approval_request(
                 .await?;
             serde_json::json!({
                 "title": "Reactivate agent",
-                "agent": agent,
-                "effective_policy": policy,
+                "summary": "Allow this agent to work again under its existing policy.",
+                "agent": approval_agent_summary(&agent),
+                "policy": approval_policy_summary(&policy),
                 "warning": "Previously revoked credentials remain revoked; issue a new credential separately"
             })
         }
@@ -2861,14 +3048,14 @@ pub async fn create_owner_approval_request(
             .await?;
             serde_json::json!({
                 "title": "Rotate agent runtime credential",
-                "agent": agent,
-                "new_runtime_scopes": runtime_scopes,
-                "enrollment_ttl_seconds": enrollment_ttl_seconds,
+                "summary": "Replace this agent's runtime access credential.",
+                "agent": approval_agent_summary(&agent),
+                "new_access": runtime_scopes,
+                "enrollment_link_valid_for": human_duration(*enrollment_ttl_seconds),
                 "effects": [
-                    "Revokes existing local runtime credentials for this agent",
-                    "Consumes older unused enrollment grants",
-                    "Creates one new one-time enrollment grant",
-                    "Does not rotate the Turnkey onchain wallet signer"
+                    "Existing runtime credentials stop working",
+                    "A new one-time enrollment link is created",
+                    "The wallet signer does not change"
                 ]
             })
         }
@@ -2911,15 +3098,13 @@ pub async fn create_owner_approval_request(
             }
             serde_json::json!({
                 "title": "Rotate agent onchain signer",
-                "agent_id": agent_id,
-                "chain_id": chain_id,
-                "smart_account_address": binding.smart_account_address,
-                "current_signer_address": binding.signer_address,
+                "summary": "Replace the signer controlling this agent's smart account.",
+                "wallet": binding.smart_account_address,
+                "network": "Arc",
                 "effects": [
-                    "Creates a replacement signer inside the organization's Turnkey sub-organization",
-                    "Pauses this agent's execution while rotation is unresolved",
-                    "Updates the smart account owner without changing its address or moving assets",
-                    "Keeps the previous managed-wallet record for audit and recovery"
+                    "The wallet address and funds do not change",
+                    "The agent pauses until rotation is complete",
+                    "The previous signer loses control after confirmation"
                 ]
             })
         }
@@ -2952,18 +3137,16 @@ pub async fn create_owner_approval_request(
             .await?;
             serde_json::json!({
                 "title": "Revoke owner passkey",
+                "summary": "Remove this passkey from your Jusso account.",
                 "passkey": {
-                    "id": passkey_id,
                     "label": passkey.0,
                     "purpose": passkey.1,
-                    "created_at": passkey.3,
                     "last_used_at": passkey.4
                 },
                 "effects": [
-                    "Requires a different active passkey to approve removal",
-                    "Revokes sessions created with this passkey",
-                    "Revokes active organization-control sessions and expires pending sensitive changes",
-                    "Cannot remove the final active passkey or final recovery passkey"
+                    "Sessions created with this passkey are signed out",
+                    "Pending sensitive changes are cancelled",
+                    "Your remaining recovery passkey stays active"
                 ]
             })
         }
@@ -2974,7 +3157,7 @@ pub async fn create_owner_approval_request(
             wallet_address,
             ..
         } => {
-            let connection: (String, DateTime<Utc>) = sqlx::query_as(
+            let _connection: (String, DateTime<Utc>) = sqlx::query_as(
                 r#"SELECT c.challenge, c.expires_at
                    FROM external_wallet_connection_challenges c
                    JOIN principal_agent_grants pag ON pag.agent_id=c.agent_id
@@ -3020,16 +3203,14 @@ pub async fn create_owner_approval_request(
                     "provider": "Circle Agent Wallet",
                     "address": wallet_address,
                     "network": chain,
-                    "ownership_verified": true
+                    "ownership": "Verified"
                 },
-                "challenge_expires_at": connection.1,
                 "effects": [
-                    "Circle keeps the wallet's MPC keys and signing session",
-                    "Jusso will prepare exact one-recipient payment instructions for the agent",
-                    "The agent submits payments with Circle and Jusso verifies every receipt",
-                    "Jusso and Circle spending policies both remain in force"
+                    "Circle continues to control signing and key security",
+                    "Jusso prepares payments and verifies every receipt",
+                    "Both Jusso and Circle spending policies remain active"
                 ],
-                "current_limit": "One recipient per payment plan; surplus sweeps remain on managed wallets until an atomic Circle batch path is available"
+                "note": "Circle payment plans currently support one recipient and no surplus sweep."
             })
         }
         OwnerApprovalAction::RevokeExternalWallet { connection_id } => {
@@ -3055,8 +3236,8 @@ pub async fn create_owner_approval_request(
                 "network": connection.2,
                 "effects": [
                     "Pending payment instructions expire without moving funds",
-                    "The Circle wallet and its funds remain under the owner's control",
-                    "The agent returns to its Jusso-managed wallet for future scheduled runs"
+                    "The Circle wallet and its funds remain untouched",
+                    "Future plans use the agent's Jusso-managed wallet"
                 ]
             })
         }
@@ -3064,14 +3245,9 @@ pub async fn create_owner_approval_request(
             validate_payment_plan_for_owner(pool, context, plan).await?;
             serde_json::json!({
                 "title": "Create recurring USDC payment plan",
-                "plan": plan,
-                "effects": [
-                    "Runs automatically on the approved schedule",
-                    "Pays only the listed recipients from the selected agent wallet",
-                    "Preserves the configured reserve plus a conservative execution-fee buffer",
-                    "Skips a run rather than borrowing when funds are insufficient",
-                    "Can be paused immediately"
-                ]
+                "summary": "Confirm who gets paid, how much, and when.",
+                "payment": approval_payment_plan_summary(plan),
+                "note": "Jusso skips a payment when the wallet cannot pay everyone and preserve its reserve."
             })
         }
         OwnerApprovalAction::UpdatePaymentPlan {
@@ -3079,7 +3255,7 @@ pub async fn create_owner_approval_request(
             expected_version,
             plan,
         } => {
-            let (current, recipients) = crate::workflows::get_plan(pool, context, *plan_id)
+            let (current, _recipients) = crate::workflows::get_plan(pool, context, *plan_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("payment plan was not found"))?;
             if current.version != *expected_version || current.status == "cancelled" {
@@ -3088,10 +3264,9 @@ pub async fn create_owner_approval_request(
             validate_payment_plan_for_owner(pool, context, plan).await?;
             serde_json::json!({
                 "title": "Update recurring USDC payment plan",
-                "current_plan": current,
-                "current_recipients": recipients,
-                "proposed_plan": plan,
-                "effect": "Replaces the schedule and payment rules after approval; an already queued run is not modified"
+                "summary": "Confirm the replacement payment schedule and recipients.",
+                "new_payment": approval_payment_plan_summary(plan),
+                "note": "This replaces the current plan. A payment already submitted onchain cannot be changed."
             })
         }
         OwnerApprovalAction::ChangePaymentPlanStatus {
@@ -3121,8 +3296,16 @@ pub async fn create_owner_approval_request(
             }
             serde_json::json!({
                 "title": format!("{:?} recurring USDC payment plan", change),
-                "plan": current,
-                "recipients": recipients,
+                "summary": match change {
+                    crate::workflows::PaymentPlanStatusChange::Pause => "Temporarily stop future scheduled payments.",
+                    crate::workflows::PaymentPlanStatusChange::Resume => "Restart future scheduled payments.",
+                    crate::workflows::PaymentPlanStatusChange::Cancel => "Permanently stop this payment plan."
+                },
+                "plan": {
+                    "name": current.name,
+                    "status": current.status,
+                    "recipient_count": recipients.len()
+                },
                 "warning": if matches!(change, crate::workflows::PaymentPlanStatusChange::Cancel) {
                     Some("Cancellation is permanent and does not cancel an already queued transaction")
                 } else { None }
@@ -4176,16 +4359,36 @@ pub async fn complete_owner_approval(
             for (position, recipient) in plan.recipients.iter().enumerate() {
                 sqlx::query(
                     r#"INSERT INTO payment_plan_recipients
-                       (id, plan_id, position, recipient_address, amount_raw, label)
-                       VALUES ($1,$2,$3,$4,$5::NUMERIC,$6)"#,
+                       (id, plan_id, position, recipient_address, amount_raw,
+                        recipient_name, address_kind, verified_at)
+                       VALUES ($1,$2,$3,$4,$5::NUMERIC,$6,$7,$8)"#,
                 )
                 .bind(Uuid::new_v4())
                 .bind(plan_id)
                 .bind(position as i16)
                 .bind(&recipient.address)
                 .bind(&recipient.amount_raw)
-                .bind(&recipient.label)
+                .bind(&recipient.name)
+                .bind(
+                    recipient
+                        .verification
+                        .as_ref()
+                        .map(|verification| &verification.address_kind),
+                )
+                .bind(
+                    recipient
+                        .verification
+                        .as_ref()
+                        .map(|verification| verification.verified_at),
+                )
                 .execute(&mut *transaction)
+                .await?;
+                crate::workflows::remember_recipient_contact_tx(
+                    &mut transaction,
+                    row.organization_id,
+                    row.principal_id,
+                    recipient,
+                )
                 .await?;
             }
             serde_json::json!({
@@ -6453,7 +6656,7 @@ mod tests {
     async fn approved_payment_plan_is_persisted_with_exact_recipients() {
         let pool = setup_pool().await;
         let fixture = create_owner_control_fixture(&pool).await;
-        let plan = crate::workflows::PaymentPlanInput {
+        let mut plan = crate::workflows::PaymentPlanInput {
             name: "Weekly contractors".into(),
             agent_id: fixture.root_agent.external_id.clone(),
             schedule: crate::workflows::PaymentSchedule {
@@ -6466,7 +6669,7 @@ mod tests {
             recipients: vec![crate::workflows::PaymentRecipientInput {
                 address: "0x0000000000000000000000000000000000000001".into(),
                 amount_usdc: "5.25".into(),
-                label: Some("Contractor".into()),
+                name: Some("Contractor".into()),
             }],
             reserve_usdc: "10".into(),
             surplus: None,
@@ -6474,6 +6677,12 @@ mod tests {
         }
         .normalize(Utc::now())
         .unwrap();
+        plan.recipients[0].verification = Some(crate::workflows::RecipientAddressVerification {
+            chain: "arc-testnet".into(),
+            address_kind: "wallet".into(),
+            evidence: vec!["transaction_history".into()],
+            verified_at: Utc::now(),
+        });
         let result = approve_test_action(
             &pool,
             &fixture,
@@ -6490,6 +6699,19 @@ mod tests {
         assert_eq!(stored.reserve_raw, "10000000");
         assert_eq!(recipients.len(), 1);
         assert_eq!(recipients[0].amount_raw, "5250000");
+        assert_eq!(recipients[0].name.as_deref(), Some("Contractor"));
+        assert_eq!(recipients[0].address_kind.as_deref(), Some("wallet"));
+        let saved_name: String = sqlx::query_scalar(
+            r#"SELECT recipient_name FROM payment_recipient_contacts
+               WHERE organization_id=$1 AND chain='arc-testnet'
+                 AND recipient_address=$2"#,
+        )
+        .bind(fixture.context.organization_id)
+        .bind(&recipients[0].recipient_address)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(saved_name, "Contractor");
     }
 
     #[tokio::test]

@@ -77,6 +77,14 @@ impl ArcRpcClient {
             .await
     }
 
+    pub async fn get_transaction_count(&self, address: Address) -> Result<U256> {
+        self.quantity(
+            "eth_getTransactionCount",
+            json!([format!("{address:?}"), "latest"]),
+        )
+        .await
+    }
+
     pub async fn get_code(&self, address: Address) -> Result<Bytes> {
         self.bytes("eth_getCode", json!([format!("{address:?}"), "latest"]))
             .await

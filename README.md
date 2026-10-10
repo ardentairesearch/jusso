@@ -20,7 +20,8 @@ every Arc USDC transfer receipt before marking the run complete.
 
 A payment plan defines:
 
-- one agent wallet and 1-16 fixed USDC recipients;
+- one agent wallet and 1-16 fixed USDC recipients, each with an optional saved
+  name;
 - a daily, weekly, or monthly schedule in an IANA time zone;
 - a USDC balance that must remain after every run;
 - an optional surplus destination, minimum transfer, and per-run maximum;
@@ -29,6 +30,14 @@ A payment plan defines:
 Creating, updating, resuming, or cancelling a plan requires an organization
 owner's passkey approval. Pausing is immediate so an owner can stop future runs
 without waiting for a browser ceremony.
+
+Before Jusso creates a payment approval, every destination must be a valid,
+nonzero EVM address with observable account state on the configured Arc
+network. The RPC check distinguishes wallets from deployed contracts and
+rejects an address with no code, transaction history, native balance, or USDC
+balance. A genuinely new wallet must therefore be activated on Arc before it
+can receive an automated plan. Optional recipient names are saved in the
+organization's Arc address book only after owner approval.
 
 At run time Jusso rechecks the plan version, agent state, current policy,
 recipient limits, wallet balance, and execution-fee reserve. Fixed recipients
@@ -226,6 +235,10 @@ multi-replica certification.
 Migration `003` adds Circle Agent Wallet connections and externally verified
 payment intents. It expires pending owner approvals so any in-progress change
 is reviewed again against the new approval model.
+
+Migration `004` adds named, onchain-verified payment recipients and the
+organization-scoped recipient address book. It also expires pending approvals
+created with the older recipient payload so they cannot bypass verification.
 
 ## Railway Testnet Deployment
 

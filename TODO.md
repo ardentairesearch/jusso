@@ -5,8 +5,9 @@ Only unfinished release work belongs here.
 ## Payment Workflow Readiness
 
 - [ ] Run end-to-end Arc testnet tests for plan creation, passkey approval,
-  scheduled execution, insufficient balance, pause, resume, cancellation,
-  webhook delivery, and transaction reconciliation.
+  verified and unseen recipient addresses, saved recipient names, scheduled
+  execution, insufficient balance, pause, resume, cancellation, webhook
+  delivery, and transaction reconciliation.
 - [ ] Certify scheduler crash recovery, lease expiry, retry backoff, duplicate
   prevention, downtime behavior, and multi-replica operation under load.
 - [ ] Add owner notification and expiry handling for abandoned approvals and

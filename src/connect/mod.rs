@@ -1840,7 +1840,7 @@ document.querySelector('#approve').onclick=async()=>{{message.textContent='';try
 }
 
 fn approval_page_css() -> &'static str {
-    r#":root{color-scheme:light;--paper:#f7f8f7;--surface:#fff;--ink:#19231e;--muted:#5c675f;--line:#dce2dc;--soft:#eef2ee;--accent:#007d36;--danger:#a52d2d}*{box-sizing:border-box;letter-spacing:0}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}.topbar{min-height:64px;padding:0 max(24px,calc((100vw - 960px)/2));display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);font:600 10px/1.4 ui-monospace,SFMono-Regular,monospace}.topbar span:last-child{color:var(--muted)}main{width:min(960px,calc(100% - 40px));margin:72px auto 40px}header{display:grid;grid-template-columns:1fr auto;gap:8px 40px;padding-bottom:42px;border-bottom:1px solid var(--line)}.eyebrow{grid-column:1/-1;color:var(--accent);font:600 10px/1.5 ui-monospace,SFMono-Regular,monospace;text-transform:uppercase}h1{margin:4px 0 0;max-width:760px;font:500 clamp(38px,6vw,64px)/1.02 Georgia,serif}.lede{grid-column:1;max-width:640px;margin:16px 0 0;color:var(--muted);font-size:17px}.requester{grid-column:2;grid-row:2;align-self:end;margin:0;color:var(--muted);font-size:12px}.review{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-left:1px solid var(--line);margin-top:32px}.review-block{min-width:0;padding:24px;border:1px solid var(--line);border-left:0;background:var(--surface)}.review-block.wide{grid-column:1/-1}.review-block h2{margin:0 0 18px;font-size:11px;text-transform:uppercase;color:var(--muted)}dl{display:grid;grid-template-columns:minmax(120px,.7fr) minmax(0,1.3fr);gap:12px 20px;margin:0}dt{color:var(--muted);font-size:12px}dd{margin:0;font-weight:600;overflow-wrap:anywhere}ul{margin:0;padding:0;list-style:none;display:grid;gap:10px}li{position:relative;padding-left:20px}li:before{content:"";position:absolute;left:0;top:.62em;width:7px;height:7px;background:var(--accent)}code{font:12px/1.55 ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}.approve{margin-top:32px;padding:24px;display:grid;grid-template-columns:1fr auto;align-items:center;gap:22px;border:1px solid var(--ink);background:var(--ink);color:var(--paper)}.approve div:first-child{display:grid;gap:3px}.approve span{font-size:12px;color:#cbd2cd}.approve button{min-height:50px;padding:13px 20px;border:1px solid var(--paper);background:var(--paper);color:var(--ink);font:inherit;font-weight:700;cursor:pointer}.approve button:hover{background:#9de1b4;border-color:#9de1b4}.approve button:disabled{opacity:.55;cursor:wait}#message{grid-column:1/-1;min-height:0;color:#b8efca;font-size:13px}#message:empty{display:none}footer{display:flex;justify-content:space-between;padding-top:18px;color:var(--muted);font:10px/1.5 ui-monospace,SFMono-Regular,monospace;text-transform:uppercase}@media(prefers-color-scheme:dark){:root{color-scheme:dark;--paper:#111612;--surface:#182019;--ink:#f0f4f0;--muted:#a6b1a8;--line:#323d34;--soft:#1b251d;--accent:#93dfae}.approve{background:#f0f4f0;color:#111612}.approve span{color:#536057}.approve button{background:#111612;color:#f0f4f0;border-color:#111612}}@media(max-width:700px){.topbar{padding:0 20px}.topbar span:last-child{display:none}main{margin-top:42px}header{display:block}.requester{margin-top:18px}.review{grid-template-columns:1fr}.review-block.wide{grid-column:auto}.approve{grid-template-columns:1fr}.approve button{width:100%}dl{grid-template-columns:1fr;gap:3px}dd{margin-bottom:12px}}"#
+    r#":root{color-scheme:light;--paper:#f7f8f7;--surface:#fff;--ink:#19231e;--muted:#647068;--line:#dce2dc;--accent:#007d36}*{box-sizing:border-box;letter-spacing:0}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}.topbar{min-height:60px;padding:0 max(22px,calc((100vw - 760px)/2));display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);font:600 10px/1.4 ui-monospace,SFMono-Regular,monospace}.topbar span:last-child{color:var(--muted)}main{width:min(760px,calc(100% - 36px));margin:54px auto 32px}header{padding-bottom:30px}.eyebrow{color:var(--accent);font:700 10px/1.5 ui-monospace,SFMono-Regular,monospace;text-transform:uppercase}h1{margin:7px 0 0;max-width:680px;font:500 clamp(34px,6vw,50px)/1.06 Georgia,serif}.lede{max-width:610px;margin:14px 0 0;color:var(--muted);font-size:16px}.requester{margin:14px 0 0;color:var(--muted);font-size:12px}.review{display:grid;gap:12px;padding-top:24px;border-top:1px solid var(--line)}.review-block{min-width:0;padding:20px 22px;border:1px solid var(--line);background:var(--surface)}.review-block h2{margin:0 0 14px;color:var(--muted);font-size:10px;text-transform:uppercase}dl{display:grid;grid-template-columns:minmax(130px,.75fr) minmax(0,1.25fr);gap:10px 18px;margin:0}dt{color:var(--muted);font-size:12px}dd{margin:0;font-weight:600;overflow-wrap:anywhere}ul{margin:0;padding:0;list-style:none;display:grid;gap:9px}li{position:relative;padding-left:18px}li:before{content:"";position:absolute;left:0;top:.62em;width:6px;height:6px;background:var(--accent)}li dl{padding:12px 0;border-bottom:1px solid var(--line)}li:last-child dl{border-bottom:0}code{font:12px/1.55 ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}.approve{margin-top:18px;padding:20px 22px;display:grid;grid-template-columns:1fr auto;align-items:center;gap:20px;background:var(--ink);color:var(--paper)}.approve div:first-child{display:grid;gap:2px}.approve span{font-size:12px;color:#cbd2cd}.approve button{min-height:48px;padding:12px 18px;border:1px solid var(--paper);background:var(--paper);color:var(--ink);font:inherit;font-weight:700;cursor:pointer}.approve button:hover{background:#9de1b4;border-color:#9de1b4}.approve button:disabled{opacity:.55;cursor:wait}#message{grid-column:1/-1;color:#b8efca;font-size:13px}#message:empty{display:none}footer{display:flex;justify-content:space-between;padding-top:16px;color:var(--muted);font:10px/1.5 ui-monospace,SFMono-Regular,monospace;text-transform:uppercase}@media(prefers-color-scheme:dark){:root{color-scheme:dark;--paper:#111612;--surface:#182019;--ink:#f0f4f0;--muted:#a6b1a8;--line:#323d34;--accent:#93dfae}.approve{background:#f0f4f0;color:#111612}.approve span{color:#536057}.approve button{background:#111612;color:#f0f4f0;border-color:#111612}}@media(max-width:620px){.topbar{padding:0 18px}.topbar span:last-child{display:none}main{margin-top:36px}.review-block{padding:18px}.approve{grid-template-columns:1fr}.approve button{width:100%}dl{grid-template-columns:1fr;gap:2px}dd{margin-bottom:9px}}"#
 }
 
 fn render_approval_review(presentation: &serde_json::Value) -> String {
@@ -1849,7 +1849,9 @@ fn render_approval_review(presentation: &serde_json::Value) -> String {
     };
     object
         .iter()
-        .filter(|(key, _)| !matches!(key.as_str(), "title" | "summary"))
+        .filter(|(key, value)| {
+            !matches!(key.as_str(), "title" | "summary") && !review_value_is_empty(value)
+        })
         .map(|(key, value)| {
             let wide = matches!(
                 key.as_str(),
@@ -1863,6 +1865,16 @@ fn render_approval_review(presentation: &serde_json::Value) -> String {
             )
         })
         .collect()
+}
+
+fn review_value_is_empty(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(value) => value.trim().is_empty(),
+        serde_json::Value::Array(values) => values.is_empty(),
+        serde_json::Value::Object(values) => values.is_empty(),
+        _ => false,
+    }
 }
 
 fn render_review_value(value: &serde_json::Value) -> String {
@@ -1889,6 +1901,7 @@ fn render_review_value(value: &serde_json::Value) -> String {
             "<dl>{}</dl>",
             values
                 .iter()
+                .filter(|(_, value)| !review_value_is_empty(value))
                 .map(|(key, value)| format!(
                     "<dt>{}</dt><dd>{}</dd>",
                     html_escape(&humanize_key(key)),
@@ -2245,6 +2258,29 @@ mod tests {
         assert!(html.contains("&lt;/pre&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(!html.contains("<pre"));
         assert!(html.contains("Approve with passkey"));
+    }
+
+    #[test]
+    fn approval_review_omits_empty_optional_details() {
+        let html = owner_approval_page_html(
+            "safe-token",
+            "Trusted assistant",
+            &serde_json::json!({
+                "title": "Approve payment",
+                "summary": "Confirm the recipient and amount.",
+                "payment": {
+                    "name": "Ada",
+                    "address": "0x1111111111111111111111111111111111111111",
+                    "amount": "25 USDC",
+                    "unused": null
+                },
+                "warnings": []
+            }),
+        );
+        assert!(html.contains("Ada"));
+        assert!(html.contains("25 USDC"));
+        assert!(!html.contains("Unused"));
+        assert!(!html.contains("Warnings"));
     }
 
     #[test]

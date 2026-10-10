@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     api::{routes::AppState, services},
     policy::{ExecutionPolicyImpact, TokenSpend, ARC_USDC_ADDRESS, RISK_EXTERNAL_WITHDRAWAL},
-    types::{AuthContext, BatchCall, CredentialKind, ExecutionRequest, ExecutionStatus},
+    types::{AuthContext, BatchCall, Chain, CredentialKind, ExecutionRequest, ExecutionStatus},
 };
 
 pub const USDC_DECIMALS: u32 = 6;
@@ -47,7 +47,9 @@ pub struct PaymentSchedule {
 pub struct PaymentRecipientInput {
     pub address: String,
     pub amount_usdc: String,
-    pub label: Option<String>,
+    /// Optional recipient name remembered for this exact Arc address.
+    #[serde(default, alias = "label")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -75,7 +77,18 @@ pub struct PaymentPlanInput {
 pub struct NormalizedRecipient {
     pub address: String,
     pub amount_raw: String,
-    pub label: Option<String>,
+    #[serde(default, alias = "label")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub verification: Option<RecipientAddressVerification>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct RecipientAddressVerification {
+    pub chain: String,
+    pub address_kind: String,
+    pub evidence: Vec<String>,
+    pub verified_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +106,8 @@ pub struct NormalizedPaymentPlan {
     pub recipients: Vec<NormalizedRecipient>,
     pub reserve_raw: String,
     pub surplus: Option<NormalizedSurplusRule>,
+    #[serde(default)]
+    pub surplus_verification: Option<RecipientAddressVerification>,
     pub callback_url: Option<String>,
     pub first_run_at: DateTime<Utc>,
 }
@@ -139,7 +154,9 @@ pub struct PaymentPlanRecipientRow {
     pub position: i16,
     pub recipient_address: String,
     pub amount_raw: String,
-    pub label: Option<String>,
+    pub name: Option<String>,
+    pub address_kind: Option<String>,
+    pub verified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -205,11 +222,12 @@ impl PaymentPlanInput {
                 if !seen.insert(address.clone()) {
                     bail!("payment plan contains a duplicate recipient");
                 }
-                let label = normalize_label(recipient.label.as_deref())?;
+                let name = normalize_recipient_name(recipient.name.as_deref())?;
                 Ok(NormalizedRecipient {
                     address,
                     amount_raw: parse_usdc_amount(&recipient.amount_usdc, false)?.to_string(),
-                    label,
+                    name,
+                    verification: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -251,6 +269,7 @@ impl PaymentPlanInput {
             recipients,
             reserve_raw,
             surplus,
+            surplus_verification: None,
             callback_url,
             first_run_at: self.schedule.next_after(now)?,
         })
@@ -276,7 +295,12 @@ impl NormalizedPaymentPlan {
                 bail!("payment plan recipients must be normalized and unique");
             }
             parse_raw_amount(&recipient.amount_raw, false)?;
-            normalize_label(recipient.label.as_deref())?;
+            normalize_recipient_name(recipient.name.as_deref())?;
+            recipient
+                .verification
+                .as_ref()
+                .context("payment recipient has not been verified onchain")?
+                .validate(&recipient.address)?;
         }
         parse_raw_amount(&self.reserve_raw, true)?;
         if let Some(surplus) = &self.surplus {
@@ -289,12 +313,131 @@ impl NormalizedPaymentPlan {
                     bail!("surplus maximum must be at least its minimum transfer");
                 }
             }
+            self.surplus_verification
+                .as_ref()
+                .context("surplus destination has not been verified onchain")?
+                .validate(&surplus.destination)?;
+        } else if self.surplus_verification.is_some() {
+            bail!("surplus verification is present without a surplus rule");
         }
         if self.recipients.len() + usize::from(self.surplus.is_some()) > MAX_BATCH_CALLS {
             bail!("recipients plus an optional surplus transfer cannot exceed {MAX_BATCH_CALLS} calls");
         }
         Ok(())
     }
+}
+
+impl RecipientAddressVerification {
+    fn validate(&self, address: &str) -> Result<()> {
+        let now = Utc::now();
+        let evidence = self
+            .evidence
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if !matches!(self.chain.as_str(), "arc" | "arc-testnet")
+            || !matches!(self.address_kind.as_str(), "wallet" | "contract")
+            || self.evidence.is_empty()
+            || self.evidence.len() > 4
+            || evidence.len() != self.evidence.len()
+            || self.evidence.iter().any(|value| {
+                !matches!(
+                    value.as_str(),
+                    "deployed_contract" | "transaction_history" | "native_balance" | "usdc_balance"
+                )
+            })
+            || now.signed_duration_since(self.verified_at) > chrono::Duration::minutes(15)
+            || self.verified_at > now + chrono::Duration::minutes(1)
+            || normalize_address(address)? != address
+        {
+            bail!("payment recipient verification is invalid or expired");
+        }
+        Ok(())
+    }
+}
+
+pub async fn prepare_payment_plan_for_approval(
+    state: &AppState,
+    context: &AuthContext,
+    plan: &mut NormalizedPaymentPlan,
+) -> Result<()> {
+    let chain_name = state.config.arc_network.name();
+    for recipient in &mut plan.recipients {
+        if recipient.name.is_none() {
+            recipient.name = sqlx::query_scalar::<_, String>(
+                r#"SELECT recipient_name FROM payment_recipient_contacts
+                   WHERE organization_id=$1 AND chain=$2 AND recipient_address=$3"#,
+            )
+            .bind(context.organization_id)
+            .bind(chain_name)
+            .bind(&recipient.address)
+            .fetch_optional(&state.db_pool)
+            .await?;
+        }
+        recipient.verification = Some(verify_payment_address(state, &recipient.address).await?.1);
+    }
+    plan.surplus_verification = match plan.surplus.as_ref() {
+        Some(surplus) => Some(verify_payment_address(state, &surplus.destination).await?.1),
+        None => None,
+    };
+    plan.validate()?;
+    Ok(())
+}
+
+pub async fn verify_payment_address(
+    state: &AppState,
+    address: &str,
+) -> Result<(String, RecipientAddressVerification)> {
+    let normalized = normalize_address(address)?;
+    let parsed = normalized.parse::<Address>()?;
+    let chain_name = state.config.arc_network.name();
+    let chain = Chain::from_str_loose(chain_name).context("configured Arc network is invalid")?;
+    let provider = state.engine.provider_for_chain(&chain)?;
+    let chain_config = state.config.chain_config(&chain)?;
+    let token = chain_config.execution_token.address;
+    let (observed_chain_id, code, native_balance, transaction_count, usdc_balance) = tokio::try_join!(
+        provider.chain_id(),
+        provider.get_code(parsed),
+        provider.get_balance(parsed),
+        provider.get_transaction_count(parsed),
+        services::fetch_erc20_balance_of(provider.as_ref(), token, parsed),
+    )?;
+    if observed_chain_id != U256::from(chain_config.chain_id) {
+        bail!(
+            "Arc RPC returned chain ID {observed_chain_id}, expected {}",
+            chain_config.chain_id
+        );
+    }
+    let mut evidence = Vec::with_capacity(4);
+    if !code.is_empty() {
+        evidence.push("deployed_contract".into());
+    }
+    if !transaction_count.is_zero() {
+        evidence.push("transaction_history".into());
+    }
+    if !native_balance.is_zero() {
+        evidence.push("native_balance".into());
+    }
+    if !usdc_balance.is_zero() {
+        evidence.push("usdc_balance".into());
+    }
+    if evidence.is_empty() {
+        bail!(
+            "recipient {normalized} is correctly formatted but has no observable account state on {chain_name}; activate the wallet on Arc before approving payments to it"
+        );
+    }
+    Ok((
+        normalized,
+        RecipientAddressVerification {
+            chain: chain_name.into(),
+            address_kind: if code.is_empty() {
+                "wallet".into()
+            } else {
+                "contract".into()
+            },
+            evidence,
+            verified_at: Utc::now(),
+        },
+    ))
 }
 
 impl PaymentSchedule {
@@ -392,13 +535,16 @@ fn normalize_address(value: &str) -> Result<String> {
         .trim()
         .parse::<Address>()
         .map_err(|_| anyhow!("invalid EVM address"))?;
+    if address == Address::zero() {
+        bail!("payment recipient cannot be the zero address");
+    }
     Ok(format!("{address:?}").to_ascii_lowercase())
 }
 
-fn normalize_label(value: Option<&str>) -> Result<Option<String>> {
+fn normalize_recipient_name(value: Option<&str>) -> Result<Option<String>> {
     let value = value.map(str::trim).filter(|value| !value.is_empty());
     if value.is_some_and(|value| value.chars().count() > 80) {
-        bail!("recipient label cannot exceed 80 characters");
+        bail!("recipient name cannot exceed 80 characters");
     }
     Ok(value.map(str::to_owned))
 }
@@ -518,7 +664,8 @@ pub async fn get_plan(
 pub async fn list_recipients(pool: &PgPool, plan_id: Uuid) -> Result<Vec<PaymentPlanRecipientRow>> {
     Ok(sqlx::query_as::<_, PaymentPlanRecipientRow>(
         r#"SELECT id, plan_id, position, recipient_address, amount_raw::TEXT AS amount_raw,
-                  label, created_at FROM payment_plan_recipients
+                  recipient_name AS name, address_kind, verified_at, created_at
+           FROM payment_plan_recipients
            WHERE plan_id = $1 ORDER BY position"#,
     )
     .bind(plan_id)
@@ -591,19 +738,71 @@ pub async fn insert_plan_tx(
     for (position, recipient) in plan.recipients.iter().enumerate() {
         sqlx::query(
             r#"INSERT INTO payment_plan_recipients
-               (id, plan_id, position, recipient_address, amount_raw, label)
-               VALUES ($1,$2,$3,$4,$5::NUMERIC,$6)"#,
+               (id, plan_id, position, recipient_address, amount_raw,
+                recipient_name, address_kind, verified_at)
+               VALUES ($1,$2,$3,$4,$5::NUMERIC,$6,$7,$8)"#,
         )
         .bind(Uuid::new_v4())
         .bind(plan_id)
         .bind(position as i16)
         .bind(&recipient.address)
         .bind(&recipient.amount_raw)
-        .bind(&recipient.label)
+        .bind(&recipient.name)
+        .bind(
+            recipient
+                .verification
+                .as_ref()
+                .map(|verification| &verification.address_kind),
+        )
+        .bind(
+            recipient
+                .verification
+                .as_ref()
+                .map(|verification| verification.verified_at),
+        )
         .execute(&mut **tx)
         .await?;
+        remember_recipient_contact_tx(tx, organization_id, principal_id, recipient).await?;
     }
     Ok(plan_id)
+}
+
+pub async fn remember_recipient_contact_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    principal_id: Uuid,
+    recipient: &NormalizedRecipient,
+) -> Result<()> {
+    let Some(name) = recipient.name.as_deref() else {
+        return Ok(());
+    };
+    let verification = recipient
+        .verification
+        .as_ref()
+        .context("named payment recipient has not been verified")?;
+    sqlx::query(
+        r#"INSERT INTO payment_recipient_contacts (
+               id, organization_id, chain, recipient_address, recipient_name,
+               address_kind, verified_at, created_by_principal_id
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           ON CONFLICT (organization_id, chain, recipient_address) DO UPDATE SET
+               recipient_name=EXCLUDED.recipient_name,
+               address_kind=EXCLUDED.address_kind,
+               verified_at=EXCLUDED.verified_at,
+               created_by_principal_id=EXCLUDED.created_by_principal_id,
+               updated_at=now()"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(organization_id)
+    .bind(&verification.chain)
+    .bind(&recipient.address)
+    .bind(name)
+    .bind(&verification.address_kind)
+    .bind(verification.verified_at)
+    .bind(principal_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 pub async fn pause_plan_immediately(
@@ -642,7 +841,8 @@ async fn claim_due_plan(pool: &PgPool) -> Result<bool> {
     };
     let recipients = sqlx::query_as::<_, PaymentPlanRecipientRow>(
         r#"SELECT id, plan_id, position, recipient_address, amount_raw::TEXT AS amount_raw,
-                  label, created_at FROM payment_plan_recipients
+                  recipient_name AS name, address_kind, verified_at, created_at
+           FROM payment_plan_recipients
            WHERE plan_id = $1 ORDER BY position"#,
     )
     .bind(plan.id)
@@ -673,7 +873,8 @@ async fn claim_due_plan(pool: &PgPool) -> Result<bool> {
             .map(|recipient| NormalizedRecipient {
                 address: recipient.recipient_address,
                 amount_raw: recipient.amount_raw,
-                label: recipient.label,
+                name: recipient.name,
+                verification: None,
             })
             .collect(),
     };
@@ -1003,7 +1204,7 @@ async fn process_run(state: &AppState, run: PaymentPlanRunRow) -> Result<()> {
                     recipient: recipient.address.clone(),
                     amount_raw: recipient.amount_raw.clone(),
                     amount_usdc: format_units(amount, USDC_DECIMALS as usize)?,
-                    label: recipient.label.clone(),
+                    name: recipient.name.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1015,7 +1216,7 @@ async fn process_run(state: &AppState, run: PaymentPlanRunRow) -> Result<()> {
                     .expect("surplus destination"),
                 amount_raw: surplus.to_string(),
                 amount_usdc: format_units(surplus, USDC_DECIMALS as usize)?,
-                label: Some("Surplus sweep".into()),
+                name: Some("Surplus sweep".into()),
             });
         }
         let intent = crate::byow::create_payment_intent(
@@ -1341,12 +1542,12 @@ mod tests {
                 PaymentRecipientInput {
                     address: "0x0000000000000000000000000000000000000001".into(),
                     amount_usdc: "1".into(),
-                    label: None,
+                    name: None,
                 },
                 PaymentRecipientInput {
                     address: "0x0000000000000000000000000000000000000001".into(),
                     amount_usdc: "2".into(),
-                    label: None,
+                    name: None,
                 },
             ],
             reserve_usdc: "5".into(),
@@ -1354,5 +1555,19 @@ mod tests {
             callback_url: None,
         };
         assert!(input.normalize(Utc::now()).is_err());
+    }
+
+    #[test]
+    fn recipient_validation_rejects_zero_and_stale_verification() {
+        assert!(normalize_address("0x0000000000000000000000000000000000000000").is_err());
+        let verification = RecipientAddressVerification {
+            chain: "arc-testnet".into(),
+            address_kind: "wallet".into(),
+            evidence: vec!["transaction_history".into()],
+            verified_at: Utc::now() - chrono::Duration::minutes(16),
+        };
+        assert!(verification
+            .validate("0x0000000000000000000000000000000000000001")
+            .is_err());
     }
 }

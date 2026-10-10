@@ -56,7 +56,8 @@ pub struct ExternalPaymentTransfer {
     pub recipient: String,
     pub amount_raw: String,
     pub amount_usdc: String,
-    pub label: Option<String>,
+    #[serde(default, alias = "label")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

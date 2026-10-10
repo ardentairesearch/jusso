@@ -113,6 +113,12 @@ struct PaymentPlanRunsParams {
     limit: Option<i64>,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct VerifyPaymentRecipientParams {
+    /// Arc recipient address to validate and inspect onchain.
+    address: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct BeginCircleWalletConnectionParams {
     /// Organization agent that will use the Circle wallet.
@@ -789,7 +795,10 @@ impl AgentMcp {
     ) -> Result<McpJson<serde_json::Value>, ErrorData> {
         let auth = request_auth(&context)?;
         require_scope(&auth, "workflow:manage")?;
-        let normalized = plan.normalize(Utc::now()).map_err(tool_error)?;
+        let mut normalized = plan.normalize(Utc::now()).map_err(tool_error)?;
+        crate::workflows::prepare_payment_plan_for_approval(&self.state, &auth, &mut normalized)
+            .await
+            .map_err(tool_error)?;
         self.request_owner_approval(
             &auth,
             db::OwnerApprovalAction::CreatePaymentPlan { plan: normalized },
@@ -807,7 +816,10 @@ impl AgentMcp {
     ) -> Result<McpJson<serde_json::Value>, ErrorData> {
         let auth = request_auth(&context)?;
         require_scope(&auth, "workflow:manage")?;
-        let normalized = params.plan.normalize(Utc::now()).map_err(tool_error)?;
+        let mut normalized = params.plan.normalize(Utc::now()).map_err(tool_error)?;
+        crate::workflows::prepare_payment_plan_for_approval(&self.state, &auth, &mut normalized)
+            .await
+            .map_err(tool_error)?;
         self.request_owner_approval(
             &auth,
             db::OwnerApprovalAction::UpdatePaymentPlan {
@@ -817,6 +829,29 @@ impl AgentMcp {
             },
         )
         .await
+    }
+
+    #[tool(
+        description = "Verify that a payment recipient is a valid, nonzero EVM address with observable account state on the configured Arc network. Use this before proposing a payment plan when the recipient is unfamiliar."
+    )]
+    async fn verify_payment_recipient(
+        &self,
+        Parameters(params): Parameters<VerifyPaymentRecipientParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<McpJson<serde_json::Value>, ErrorData> {
+        let auth = request_auth(&context)?;
+        require_scope(&auth, "workflow:manage")?;
+        let (address, verification) =
+            crate::workflows::verify_payment_address(&self.state, &params.address)
+                .await
+                .map_err(tool_error)?;
+        json_output(serde_json::json!({
+            "address": address,
+            "network": verification.chain,
+            "address_type": verification.address_kind,
+            "onchain_verified": true,
+            "verified_at": verification.verified_at
+        }))
     }
 
     #[tool(
@@ -1560,6 +1595,7 @@ mod tests {
         assert!(names
             .iter()
             .any(|name| name == "request_create_payment_plan_approval"));
+        assert!(names.iter().any(|name| name == "verify_payment_recipient"));
         assert!(names.iter().any(|name| name == "list_agents"));
         assert!(names
             .iter()
