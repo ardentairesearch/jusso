@@ -128,6 +128,11 @@ agent ID. Organization management lives on the same connection; sensitive
 changes still require an owner passkey approval in the browser. Compatible
 clients complete OAuth Authorization Code + PKCE during onboarding.
 
+After a successful browser sign-in, Connect can remember the non-secret owner
+handle and selected agent ID on that device. The next connection pre-fills both
+fields, and the owner can clear them with **Forget saved details**. Passkeys,
+OAuth codes, tokens, and wallet credentials are never stored by this feature.
+
 Owners may also onboard locally:
 
 ```bash
