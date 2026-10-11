@@ -236,7 +236,7 @@ pub struct ExecutionJob {
     /// Agent-supplied webhook URL.  The worker POSTs the result here on completion.
     #[serde(default)]
     pub callback_url: Option<String>,
-    /// Stablecoin fee transfer prepended to the same atomic UserOperation.
+    /// Stablecoin fee transfer appended to the same atomic UserOperation.
     #[serde(default)]
     pub execution_fee: Option<ExecutionFeeCharge>,
 }

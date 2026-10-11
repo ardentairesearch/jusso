@@ -34,13 +34,21 @@ pub const RUNTIME_SCOPES: &[&str] = &["wallet:read", "workflow:read", "execution
 
 pub const SUPPORTED_PROTOCOLS: &[&str] = &[];
 
-pub const SUPPORTED_WORKFLOW_ACTIONS: &[&str] = &["payment_plan:execute"];
+pub const SUPPORTED_WORKFLOW_ACTIONS: &[&str] = &[
+    "payment_plan:execute",
+    "swap:execute",
+    "earn:deposit",
+    "earn:withdraw",
+];
 
 pub const DEFAULT_POLICY_ACTIONS: &[&str] = &[
     "wallet:read",
     "workflow:read",
     "execution:read",
     "payment_plan:execute",
+    "swap:execute",
+    "earn:deposit",
+    "earn:withdraw",
 ];
 
 pub const DEFAULT_MAX_EXECUTION_FEE_USD: f64 = 2.0;

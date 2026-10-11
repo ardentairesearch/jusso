@@ -16,6 +16,8 @@ pub const ARC_TESTNET_RPC_URL: &str = "https://rpc.testnet.arc.io";
 pub const ARC_USDC_ADDRESS: Address = H160([
     0x36, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ]);
+pub const ARC_MAINNET_EURC_ADDRESS: &str = "0xbEf5f6d51CB62b58e6A8f77868681825C6fe21c1";
+pub const ARC_TESTNET_EURC_ADDRESS: &str = "0x89B50855Aa3bE2F677cD6303Cec089B5F319D72a";
 pub const ARC_NATIVE_USDC_DECIMALS: u8 = 18;
 pub const ARC_ERC20_USDC_DECIMALS: u8 = 6;
 pub const ARC_MIN_GAS_PRICE_WEI: u64 = 20_000_000_000;

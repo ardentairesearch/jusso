@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use ethers_core::abi::{decode, ParamType};
 use ethers_core::types::{Address, U256};
-use ethers_core::utils::format_units;
+use ethers_core::utils::{format_units, id};
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tracing::info;
@@ -38,7 +38,10 @@ async fn simulate_arc_request(
         req.batch_calls.as_deref(),
     )?;
     if let Some(fee) = fee {
-        calls.insert(0, fee_transfer_call(fee)?);
+        // Charge after the workflow calls. This lets a swap into USDC fund its
+        // own execution fee while preserving atomicity: if the fee transfer
+        // fails, the entire UserOperation reverts.
+        calls.push(fee_transfer_call(fee)?);
     }
     match engine.arc_client.prepare(sender, &calls).await {
         Ok(prepared) => Ok(SimulationResult {
@@ -516,17 +519,7 @@ async fn prepare_atomic_fee_execution(
     initial_cost_usd: f64,
 ) -> Result<AtomicFeePreparation> {
     let chain_cfg = engine.config.chain_config(chain)?.clone();
-    let provider = engine.provider_for_chain(chain)?;
     let token = &chain_cfg.execution_token;
-
-    let balance_raw = fetch_erc20_balance_of(provider.as_ref(), token.address, smart_wallet)
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "{} execution-fee balance check failed: {error}",
-                token.symbol
-            )
-        })?;
 
     let mut fee_usd = initial_cost_usd;
     let mut fee_raw = usd_to_token_raw_amount(fee_usd, token.decimals)?;
@@ -572,18 +565,9 @@ async fn prepare_atomic_fee_execution(
                 .await?;
     }
 
-    if simulation.success && balance_raw < fee_raw {
-        simulation = SimulationResult {
-            success: false,
-            gas_estimate: 0,
-            max_fee_per_gas_wei: simulation.max_fee_per_gas_wei.clone(),
-            return_data: None,
-            error: Some(format!(
-                "insufficient {} balance for atomic execution fee: balance={}, required={}",
-                token.symbol, balance_raw, fee_raw
-            )),
-        };
-    }
+    // The fee-inclusive simulation is authoritative. A pre-call balance check
+    // would incorrectly reject workflows that acquire USDC before paying the
+    // final atomic fee.
     fee_usd = fee_raw
         .to_string()
         .parse::<f64>()
@@ -613,6 +597,61 @@ pub(crate) async fn fetch_erc20_balance_of(
     let raw = provider.call(token_contract, &data).await?;
     if raw.0.len() < 32 {
         anyhow::bail!("short balanceOf return data length {}", raw.0.len());
+    }
+
+    let mut amount_slot = [0u8; 32];
+    amount_slot.copy_from_slice(&raw.0[raw.0.len() - 32..]);
+    Ok(U256::from_big_endian(&amount_slot))
+}
+
+pub(crate) async fn fetch_erc4626_asset_balance(
+    provider: &crate::arc::rpc::ArcRpcClient,
+    vault: Address,
+    owner: Address,
+) -> Result<U256> {
+    let shares = fetch_erc20_balance_of(provider, vault, owner).await?;
+    if shares.is_zero() {
+        return Ok(U256::zero());
+    }
+
+    let mut data = Vec::with_capacity(4 + 32);
+    data.extend_from_slice(&id("convertToAssets(uint256)")[..4]);
+    let mut shares_slot = [0u8; 32];
+    shares.to_big_endian(&mut shares_slot);
+    data.extend_from_slice(&shares_slot);
+
+    fetch_single_u256_call(provider, vault, &data, "convertToAssets").await
+}
+
+pub(crate) async fn fetch_erc4626_max_withdraw(
+    provider: &crate::arc::rpc::ArcRpcClient,
+    vault: Address,
+    owner: Address,
+) -> Result<U256> {
+    let mut data = Vec::with_capacity(4 + 32);
+    data.extend_from_slice(&id("maxWithdraw(address)")[..4]);
+    let mut owner_slot = [0u8; 32];
+    owner_slot[12..].copy_from_slice(owner.as_bytes());
+    data.extend_from_slice(&owner_slot);
+
+    fetch_single_u256_call(provider, vault, &data, "maxWithdraw").await
+}
+
+async fn fetch_single_u256_call(
+    provider: &crate::arc::rpc::ArcRpcClient,
+    contract: Address,
+    data: &[u8],
+    method: &str,
+) -> Result<U256> {
+    let raw = provider
+        .call(contract, data)
+        .await
+        .with_context(|| format!("{method} call failed for vault {contract:?}"))?;
+    if raw.0.len() < 32 {
+        anyhow::bail!(
+            "short {method} return data from vault {contract:?}: {} bytes",
+            raw.0.len()
+        );
     }
 
     let mut amount_slot = [0u8; 32];
@@ -659,7 +698,7 @@ pub async fn validate_execution_token(engine: &ExecutionEngine) -> Result<()> {
     Ok(())
 }
 
-async fn read_erc20_symbol(
+pub(crate) async fn read_erc20_symbol(
     provider: &crate::arc::rpc::ArcRpcClient,
     token: Address,
 ) -> Result<String> {
@@ -676,7 +715,7 @@ async fn read_erc20_symbol(
         .ok_or_else(|| anyhow::anyhow!("execution token symbol() returned an empty value"))
 }
 
-async fn read_erc20_decimals(
+pub(crate) async fn read_erc20_decimals(
     provider: &crate::arc::rpc::ArcRpcClient,
     token: Address,
 ) -> Result<u8> {

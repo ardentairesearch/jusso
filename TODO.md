@@ -19,28 +19,23 @@ Only unfinished release work belongs here.
 
 ## Funding Readiness
 
-- [ ] Confirm Onramper supports Arc mainnet USDC in each launch market and pin
-  the provider's production asset/network identifiers.
-- [ ] Complete provider sandbox and production checkout tests for wallet
-  locking, signature verification, expiry, replay rejection, KYC handoff,
-  cancellation, and successful onchain settlement.
+- [ ] Complete Circle Onramp production checkout tests for wallet locking,
+  session expiry, KYC handoff, cancellation, and successful Arc mainnet
+  settlement. Revisit testnet checkout only if Circle publishes one.
 - [ ] Add provider-status observability without storing card, bank, or identity
   data in Jusso.
 
 ## Swap And Treasury Yield
 
-- [ ] Keep token-swap tools disabled until the provider can execute from the
-  agent's ERC-4337 smart account. Turnkey Swap currently prices and executes
-  from a Turnkey wallet account; the Turnkey signer must never be presented as
-  a deposit wallet or used as a second custody location.
-- [ ] Validate Arc testnet support, smart-account sender support, quote expiry,
-  allowance scope, slippage limits, minimum received amounts, route integrity,
-  fee disclosure, simulation, and idempotent recovery before enabling swaps.
-- [ ] Keep reserve-yield tools disabled until Turnkey Earn supports Arc and the
-  owner-approved policy model includes a minimum liquid reserve, allocation
-  cap, allowlisted vaults, withdrawal path, loss disclosure, and emergency exit.
-- [ ] Require owner approval for enabling either capability and expose separate
-  policy actions and rolling limits for swaps, deposits, and withdrawals.
+- [ ] Certify Circle Swap on Arc testnet end to end, including supported-token
+  failures, quote expiry, minimum received, exact atomic allowances, conversion
+  into an initially empty USDC wallet, execution-fee settlement, and retry
+  recovery.
+- [ ] Certify Circle Earn on Arc testnet end to end, including discovery,
+  first deposit, reserve enforcement, allocation caps, warnings, withdrawal,
+  disabled-deposit emergency exit, and retry recovery.
+- [ ] Add reconciliation for Circle provider execution IDs and terminal
+  UserOperation status to operational dashboards and alerts.
 
 ## Arc Production Readiness
 

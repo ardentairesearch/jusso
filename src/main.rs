@@ -144,9 +144,13 @@ async fn main() -> anyhow::Result<()> {
     let mut config = AppConfig::from_env()?;
     let admin_auth = routes::AdminAuthState::new(std::mem::take(&mut config.bootstrap_admin_token));
     info!(host = %config.host, port = config.port, "config loaded");
-    if let Some(onramp) = config.onramp.as_ref() {
-        let fingerprint = jusso::funding::signing_key_fingerprint(onramp)?;
-        info!(signing_key_fingerprint = %fingerprint, "fiat funding integration enabled");
+    let circle = config
+        .circle
+        .as_ref()
+        .map(jusso::circle::CircleClient::new)
+        .transpose()?;
+    if circle.is_some() {
+        info!("Circle Onramp, Swap, and Earn integrations enabled");
     }
 
     // ── Database ────────────────────────────────────────────────────
@@ -266,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
         engine,
         config: config.clone(),
         wallet_registry,
+        circle,
     };
     let connect_service = ConnectService::new(db_pool.clone(), redis_conn.clone(), config.clone())?;
     tokio::spawn(workflows::run_scheduler(state.clone()));

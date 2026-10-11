@@ -74,26 +74,22 @@ pub struct AppConfig {
     pub registration_hourly_limit: u64,
     pub webauthn_rp_id: String,
     pub webauthn_origin: String,
-    pub onramp: Option<OnrampConfig>,
+    pub circle: Option<CircleConfig>,
 }
 
 #[derive(Clone)]
-pub struct OnrampConfig {
-    pub widget_url: String,
+pub struct CircleConfig {
     pub api_key: String,
-    pub signing_private_key_pkcs8_base64: String,
-    pub usdc_asset_id: String,
-    pub arc_network_id: String,
+    pub api_base_url: String,
+    pub onramp_widget_url: String,
 }
 
-impl fmt::Debug for OnrampConfig {
+impl fmt::Debug for CircleConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OnrampConfig")
-            .field("widget_url", &self.widget_url)
+        f.debug_struct("CircleConfig")
             .field("api_key", &"[REDACTED]")
-            .field("signing_private_key_pkcs8_base64", &"[REDACTED]")
-            .field("usdc_asset_id", &self.usdc_asset_id)
-            .field("arc_network_id", &self.arc_network_id)
+            .field("api_base_url", &self.api_base_url)
+            .field("onramp_widget_url", &self.onramp_widget_url)
             .finish()
     }
 }
@@ -165,7 +161,7 @@ impl fmt::Debug for AppConfig {
             .field("registration_turnstile_secret", &"[REDACTED]")
             .field("webauthn_rp_id", &self.webauthn_rp_id)
             .field("webauthn_origin", &self.webauthn_origin)
-            .field("onramp", &self.onramp)
+            .field("circle", &self.circle)
             .finish()
     }
 }
@@ -318,48 +314,17 @@ impl AppConfig {
                     .with_context(|| "REGISTRATION_CLIENT_IP_HEADER must be an HTTP header name")
             })
             .transpose()?;
-        let onramp_values = [
-            optional_env("ONRAMPER_API_KEY"),
-            optional_env("ONRAMPER_SIGNING_PRIVATE_KEY_PKCS8_BASE64"),
-            optional_env("ONRAMPER_USDC_ASSET_ID"),
-            optional_env("ONRAMPER_ARC_NETWORK_ID"),
-        ];
-        let onramp = if onramp_values.iter().all(Option::is_none) {
-            None
-        } else {
-            if onramp_values.iter().any(Option::is_none) {
-                bail!("Onramper requires ONRAMPER_API_KEY, ONRAMPER_SIGNING_PRIVATE_KEY_PKCS8_BASE64, ONRAMPER_USDC_ASSET_ID, and ONRAMPER_ARC_NETWORK_ID together");
-            }
-            if arc_network != ArcNetwork::Mainnet {
-                bail!("fiat on-ramping is disabled outside Arc mainnet");
-            }
-            let widget_url = env_or("ONRAMPER_WIDGET_URL", "https://buy.onramper.com");
-            let parsed = reqwest::Url::parse(&widget_url)
-                .context("ONRAMPER_WIDGET_URL must be an absolute URL")?;
-            if parsed.scheme() != "https"
-                || parsed.host_str() != Some("buy.onramper.com")
-                || !parsed.username().is_empty()
-                || parsed.password().is_some()
-                || parsed.path() != "/"
-                || parsed.query().is_some()
-                || parsed.fragment().is_some()
-            {
-                bail!("ONRAMPER_WIDGET_URL must be exactly https://buy.onramper.com");
-            }
-            Some(OnrampConfig {
-                widget_url,
-                api_key: onramp_values[0].clone().unwrap(),
-                signing_private_key_pkcs8_base64: onramp_values[1].clone().unwrap(),
-                usdc_asset_id: validate_onramper_id(
-                    "ONRAMPER_USDC_ASSET_ID",
-                    onramp_values[2].clone().unwrap(),
-                )?,
-                arc_network_id: validate_onramper_id(
-                    "ONRAMPER_ARC_NETWORK_ID",
-                    onramp_values[3].clone().unwrap(),
-                )?,
+        let circle = optional_env("CIRCLE_API_KEY")
+            .map(|api_key| -> Result<CircleConfig> {
+                validate_circle_api_key(&api_key)?;
+                let api_base_url = "https://api.circle.com".to_string();
+                Ok(CircleConfig {
+                    api_key,
+                    api_base_url,
+                    onramp_widget_url: "https://onramp.arc.io".to_string(),
+                })
             })
-        };
+            .transpose()?;
         Ok(Self {
             arc_network,
             host: env_or("HOST", "0.0.0.0"),
@@ -403,7 +368,7 @@ impl AppConfig {
             registration_hourly_limit: parse_positive_u64_env("REGISTRATION_HOURLY_LIMIT", "5")?,
             webauthn_rp_id,
             webauthn_origin,
-            onramp,
+            circle,
         })
     }
 
@@ -456,16 +421,20 @@ fn optional_env(name: &str) -> Option<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
-fn validate_onramper_id(name: &str, value: String) -> Result<String> {
-    if value.len() > 80
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-        })
+fn validate_circle_api_key(value: &str) -> Result<()> {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if parts.len() != 3
+        || !parts[0].ends_with("_API_KEY")
+        || value.len() > 2048
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_graphic()))
     {
-        bail!("{name} must be a lowercase Onramper identifier");
+        bail!("CIRCLE_API_KEY must use Circle's <ENV>_API_KEY:<key-id>:<secret> format");
     }
-    Ok(value)
+    Ok(())
 }
+
 fn required_address(name: &str) -> Result<Address> {
     let address: Address = required_env(name)?
         .parse()

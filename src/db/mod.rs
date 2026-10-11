@@ -1732,6 +1732,9 @@ pub enum OwnerApprovalAction {
     RevokeExternalWallet {
         connection_id: Uuid,
     },
+    ConfigureTreasury {
+        settings: crate::treasury::TreasurySettingsInput,
+    },
     CreatePaymentPlan {
         plan: crate::workflows::NormalizedPaymentPlan,
     },
@@ -1762,6 +1765,7 @@ impl OwnerApprovalAction {
             Self::RevokeOwnerPasskey { .. } => "revoke_owner_passkey",
             Self::ConnectCircleAgentWallet { .. } => "connect_circle_agent_wallet",
             Self::RevokeExternalWallet { .. } => "revoke_external_wallet",
+            Self::ConfigureTreasury { .. } => "configure_treasury",
             Self::CreatePaymentPlan { .. } => "create_payment_plan",
             Self::UpdatePaymentPlan { .. } => "update_payment_plan",
             Self::ChangePaymentPlanStatus { .. } => "change_payment_plan_status",
@@ -1926,9 +1930,16 @@ impl OwnerApprovalAction {
                     }
                 }
                 let executes = allowed_actions.as_ref().is_some_and(|actions| {
-                    actions
-                        .iter()
-                        .any(|action| action == "*" || action == "payment_plan:execute")
+                    actions.iter().any(|action| {
+                        action == "*"
+                            || matches!(
+                                action.as_str(),
+                                "payment_plan:execute"
+                                    | "swap:execute"
+                                    | "earn:deposit"
+                                    | "earn:withdraw"
+                            )
+                    })
                 });
                 if executes
                     && (max_execution_fee_usd.is_none()
@@ -2031,6 +2042,7 @@ impl OwnerApprovalAction {
                 }
             }
             Self::RevokeExternalWallet { .. } => {}
+            Self::ConfigureTreasury { settings } => settings.validate()?,
             Self::CreatePaymentPlan { plan } | Self::UpdatePaymentPlan { plan, .. } => {
                 plan.validate()?;
                 if plan.recipients.iter().any(|recipient| {
@@ -3241,6 +3253,67 @@ pub async fn create_owner_approval_request(
                 ]
             })
         }
+        OwnerApprovalAction::ConfigureTreasury { settings } => {
+            let agent = get_owner_agent_for_status(
+                pool,
+                context.organization_id,
+                context.principal_id,
+                settings.agent_id,
+                "active",
+            )
+            .await?;
+            let current =
+                crate::treasury::get_settings(pool, context.organization_id, settings.agent_id)
+                    .await?;
+            match (&current, settings.expected_version) {
+                (None, None) => {}
+                (Some(current), Some(expected)) if current.version == expected => {}
+                _ => anyhow::bail!(
+                    "treasury settings changed before the approval request was created"
+                ),
+            }
+            let vaults = settings
+                .earn_vaults
+                .iter()
+                .map(|vault| {
+                    serde_json::json!({
+                        "name": vault.name,
+                        "protocol": vault.protocol,
+                        "current_apy_percent": vault.current_apy * 100.0,
+                        "circle_guarded": vault.circle_guarded,
+                        "warnings": vault.warnings
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "title": "Set autonomous treasury rules",
+                "summary": "Choose when this agent may convert assets and put spare USDC to work.",
+                "agent": approval_agent_summary(&agent),
+                "conversions": {
+                    "enabled": settings.swaps_enabled,
+                    "maximum_per_conversion_usdc": crate::circle::format_token_amount(
+                        crate::treasury::parse_raw(&settings.max_swap_usdc_raw, "maximum swap value")?,
+                        6
+                    ),
+                    "maximum_price_movement_percent": settings.max_slippage_bps as f64 / 100.0,
+                    "default_asset": "EURC",
+                    "other_assets": "Require an explicit owner-approved token budget"
+                },
+                "earnings": {
+                    "enabled": settings.earn_enabled,
+                    "minimum_usdc_kept_available": crate::circle::format_token_amount(
+                        crate::treasury::parse_raw(&settings.minimum_liquid_usdc_raw, "minimum liquid reserve")?,
+                        6
+                    ),
+                    "maximum_usdc_put_to_work": crate::circle::format_token_amount(
+                        crate::treasury::parse_raw(&settings.max_earn_allocation_usdc_raw, "maximum earn allocation")?,
+                        6
+                    ),
+                    "approved_opportunities": vaults
+                },
+                "note": "After approval, routine actions inside these limits run automatically. Funds remain in the agent wallet or its approved earn positions."
+            })
+        }
         OwnerApprovalAction::CreatePaymentPlan { plan } => {
             validate_payment_plan_for_owner(pool, context, plan).await?;
             serde_json::json!({
@@ -4234,6 +4307,86 @@ pub async fn complete_owner_approval(
                 "connection_id": connection_id,
                 "status": "revoked",
                 "wallet_funds_moved": false
+            })
+        }
+        OwnerApprovalAction::ConfigureTreasury { settings } => {
+            let agent: AgentRow = sqlx::query_as(
+                r#"SELECT a.* FROM agents a
+                   JOIN principal_agent_grants pag ON pag.agent_id=a.id
+                   WHERE a.id=$1 AND a.organization_id=$2 AND pag.principal_id=$3
+                     AND a.status='active' FOR UPDATE OF a"#,
+            )
+            .bind(settings.agent_id)
+            .bind(row.organization_id)
+            .bind(row.principal_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("active treasury agent is no longer available"))?;
+            let current: Option<(i64,)> = sqlx::query_as(
+                r#"SELECT version FROM agent_treasury_settings
+                   WHERE organization_id=$1 AND agent_id=$2 FOR UPDATE"#,
+            )
+            .bind(row.organization_id)
+            .bind(agent.id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            match (current, settings.expected_version) {
+                (None, None) => {
+                    sqlx::query(
+                        r#"INSERT INTO agent_treasury_settings (
+                               organization_id, agent_id, swaps_enabled, earn_enabled,
+                               max_swap_usdc_raw, max_slippage_bps,
+                               minimum_liquid_usdc_raw, max_earn_allocation_usdc_raw,
+                               allowed_earn_vaults
+                           ) VALUES ($1,$2,$3,$4,$5::NUMERIC,$6,$7::NUMERIC,$8::NUMERIC,$9)"#,
+                    )
+                    .bind(row.organization_id)
+                    .bind(agent.id)
+                    .bind(settings.swaps_enabled)
+                    .bind(settings.earn_enabled)
+                    .bind(&settings.max_swap_usdc_raw)
+                    .bind(settings.max_slippage_bps)
+                    .bind(&settings.minimum_liquid_usdc_raw)
+                    .bind(&settings.max_earn_allocation_usdc_raw)
+                    .bind(settings.approved_vault_addresses())
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+                (Some((current_version,)), Some(expected)) if current_version == expected => {
+                    let updated = sqlx::query(
+                        r#"UPDATE agent_treasury_settings
+                           SET swaps_enabled=$4, earn_enabled=$5,
+                               max_swap_usdc_raw=$6::NUMERIC, max_slippage_bps=$7,
+                               minimum_liquid_usdc_raw=$8::NUMERIC,
+                               max_earn_allocation_usdc_raw=$9::NUMERIC,
+                               allowed_earn_vaults=$10, version=version+1, updated_at=now()
+                           WHERE organization_id=$1 AND agent_id=$2 AND version=$3"#,
+                    )
+                    .bind(row.organization_id)
+                    .bind(agent.id)
+                    .bind(expected)
+                    .bind(settings.swaps_enabled)
+                    .bind(settings.earn_enabled)
+                    .bind(&settings.max_swap_usdc_raw)
+                    .bind(settings.max_slippage_bps)
+                    .bind(&settings.minimum_liquid_usdc_raw)
+                    .bind(&settings.max_earn_allocation_usdc_raw)
+                    .bind(settings.approved_vault_addresses())
+                    .execute(&mut *transaction)
+                    .await?;
+                    if updated.rows_affected() != 1 {
+                        anyhow::bail!("treasury settings changed while approval was pending");
+                    }
+                }
+                _ => anyhow::bail!("treasury settings changed while approval was pending"),
+            }
+            let version = settings.expected_version.map_or(1, |version| version + 1);
+            serde_json::json!({
+                "agent_id": agent.external_id,
+                "version": version,
+                "swaps_enabled": settings.swaps_enabled,
+                "earn_enabled": settings.earn_enabled,
+                "status": "active"
             })
         }
         OwnerApprovalAction::CreatePaymentPlan { mut plan } => {
@@ -6417,6 +6570,66 @@ mod tests {
             "arc-testnet",
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn approved_treasury_settings_are_versioned_and_agent_scoped() {
+        let pool = setup_pool().await;
+        let fixture = create_owner_control_fixture(&pool).await;
+        let initial = OwnerApprovalAction::ConfigureTreasury {
+            settings: crate::treasury::TreasurySettingsInput {
+                agent_id: fixture.root_agent.id,
+                expected_version: None,
+                swaps_enabled: true,
+                earn_enabled: false,
+                max_swap_usdc_raw: "500000000".into(),
+                max_slippage_bps: 100,
+                minimum_liquid_usdc_raw: "0".into(),
+                max_earn_allocation_usdc_raw: "0".into(),
+                earn_vaults: Vec::new(),
+            },
+        };
+        approve_test_action(&pool, &fixture, &initial)
+            .await
+            .unwrap();
+        let stored = crate::treasury::get_settings(
+            &pool,
+            fixture.context.organization_id,
+            fixture.root_agent.id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.version, 1);
+        assert!(stored.swaps_enabled);
+        assert_eq!(stored.max_swap_usdc_raw, "500000000");
+
+        let update = OwnerApprovalAction::ConfigureTreasury {
+            settings: crate::treasury::TreasurySettingsInput {
+                agent_id: fixture.root_agent.id,
+                expected_version: Some(1),
+                swaps_enabled: false,
+                earn_enabled: false,
+                max_swap_usdc_raw: "0".into(),
+                max_slippage_bps: 100,
+                minimum_liquid_usdc_raw: "0".into(),
+                max_earn_allocation_usdc_raw: "0".into(),
+                earn_vaults: Vec::new(),
+            },
+        };
+        approve_test_action(&pool, &fixture, &update).await.unwrap();
+        let stored = crate::treasury::get_settings(
+            &pool,
+            fixture.context.organization_id,
+            fixture.root_agent.id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.version, 2);
+        assert!(!stored.swaps_enabled);
+
+        assert!(approve_test_action(&pool, &fixture, &update).await.is_err());
     }
 
     #[tokio::test]

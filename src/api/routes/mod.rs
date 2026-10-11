@@ -110,6 +110,7 @@ pub struct AppState {
     pub engine: ExecutionEngine,
     pub config: AppConfig,
     pub wallet_registry: AgentWalletRegistry,
+    pub circle: Option<crate::circle::CircleClient>,
 }
 
 #[derive(Clone)]

@@ -80,22 +80,33 @@ disabled until Circle provides a stable atomic batch execution surface.
 The agent MCP can return the smart-account address at any time, including
 before first deployment. USDC can be transferred to that address directly.
 
-On Arc mainnet, an optional Onramper integration can create a 15-minute,
-single-use checkout URL signed by Jusso and locked to the agent's smart-account
-address. Onramper remains responsible for payment methods, quotes, fees,
-country availability, KYC/AML, limits, and fiat settlement. Jusso never handles
-card or bank credentials.
+Circle Onramp can create a short-lived checkout session locked to the agent's
+active wallet on Arc mainnet. Circle currently provides no public Arc testnet
+checkout, so testnet funding continues through the Arc faucet. Circle remains
+responsible for payment methods, quotes, fees, country availability, identity
+checks, limits, and settlement. The Circle API key never reaches the browser,
+and Jusso never handles card or bank credentials.
 
 This is a funding convenience, not a recurring fiat mandate. Payment plans
 spend only USDC already present in the agent wallet; generating a checkout link
 does not authorize future fiat debits.
 
-Token conversion and treasury yield are deliberately not exposed yet. Turnkey
-Swap currently spends from a Turnkey wallet account, while Jusso custody stays
-in the agent's ERC-4337 smart account; the Turnkey address is only the account
-owner signer and must not receive user deposits. Turnkey Earn does not currently
-support Arc. Both capabilities remain release-gated in `TODO.md` rather than
-splitting assets across two wallet models or advertising a nonfunctional route.
+Circle Swap converts owner-authorized Arc assets into USDC from the agent's
+existing ERC-4337 smart account. EURC has a conservative default budget; every
+other input asset requires an explicit owner-approved token budget. Circle Earn
+can place spare USDC into owner-approved
+opportunities and withdraw it back to the same wallet. The owner approves a
+plain-language treasury profile once: conversion cap, price tolerance, liquid
+USDC reserve, Earn allocation cap, and allowed opportunities. Routine actions
+inside those rules run autonomously; withdrawals back to the same wallet remain
+available as a safety action.
+
+Circle returns service-signed adapter instructions, but Jusso still validates
+the chain, wallet beneficiary, asset, amount, deadline, and instruction shape,
+then simulates the complete UserOperation before queueing it. Token approvals
+are exact, reset first, and executed atomically with the action. Swap and Earn
+currently require the Jusso-managed smart account; a connected Circle Agent
+Wallet remains supported for funding and payment workflows.
 
 ## Safety Model
 
@@ -204,18 +215,15 @@ DATABASE_URL=postgres://...
 REDIS_URL=redis://...
 ```
 
-Optional Arc-mainnet funding integration:
+Optional Circle Onramp, Swap, and Earn integration:
 
 ```dotenv
-ONRAMPER_API_KEY=<Onramper API key>
-ONRAMPER_SIGNING_PRIVATE_KEY_PKCS8_BASE64=<Ed25519 PKCS#8 DER as base64>
-ONRAMPER_USDC_ASSET_ID=<Onramper's verified Arc USDC asset ID>
-ONRAMPER_ARC_NETWORK_ID=<Onramper's verified Arc network ID>
+CIRCLE_API_KEY=<ENV>_API_KEY:<key-id>:<secret>
 ```
 
-All four Onramper values are required together. The server refuses to enable
-fiat funding on Arc testnet or with a non-Onramper widget origin. Verify current
-Arc/USDC support and identifiers with the provider before production rollout.
+The Circle API key stays on the server. Jusso pins every Circle request to an
+official HTTPS origin. Onramp is available only in Arc mainnet mode; Swap and
+Earn continue to use Circle's supported Arc network identifiers.
 
 Public registration outside localhost also requires Cloudflare Turnstile and
 allowed hostnames. Copy `.env.example` for the complete configuration contract.
@@ -244,6 +252,9 @@ is reviewed again against the new approval model.
 Migration `004` adds named, onchain-verified payment recipients and the
 organization-scoped recipient address book. It also expires pending approvals
 created with the older recipient payload so they cannot bypass verification.
+
+Migration `005` adds owner-approved treasury settings and durable,
+agent-scoped idempotency records for Circle Swap and Earn operations.
 
 ## Railway Testnet Deployment
 

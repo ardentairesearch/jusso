@@ -134,13 +134,25 @@ pub fn validate_token_spend_limits(value: &serde_json::Value) -> Result<Vec<Toke
 }
 
 pub fn default_token_spend_limits() -> serde_json::Value {
-    serde_json::to_value([TokenSpendLimit {
-        token: ARC_USDC_ADDRESS.into(),
-        // Useful for real payment operations while still bounding a newly
-        // onboarded agent to $500 per run and $2,500 per rolling day.
-        max_per_execution_raw: DEFAULT_USDC_PER_PAYMENT_RAW.into(),
-        max_rolling_raw: DEFAULT_USDC_ROLLING_RAW.into(),
-    }])
+    serde_json::to_value([
+        TokenSpendLimit {
+            token: ARC_USDC_ADDRESS.into(),
+            // Useful for real payment operations while still bounding a newly
+            // onboarded agent to $500 per run and $2,500 per rolling day.
+            max_per_execution_raw: DEFAULT_USDC_PER_PAYMENT_RAW.into(),
+            max_rolling_raw: DEFAULT_USDC_ROLLING_RAW.into(),
+        },
+        TokenSpendLimit {
+            token: crate::arc::ARC_TESTNET_EURC_ADDRESS.into(),
+            max_per_execution_raw: DEFAULT_USDC_PER_PAYMENT_RAW.into(),
+            max_rolling_raw: DEFAULT_USDC_ROLLING_RAW.into(),
+        },
+        TokenSpendLimit {
+            token: crate::arc::ARC_MAINNET_EURC_ADDRESS.into(),
+            max_per_execution_raw: DEFAULT_USDC_PER_PAYMENT_RAW.into(),
+            max_rolling_raw: DEFAULT_USDC_ROLLING_RAW.into(),
+        },
+    ])
     .expect("default token spend policy is serializable")
 }
 
@@ -176,7 +188,7 @@ mod tests {
     fn token_limits_are_structured_unique_and_bounded() {
         let defaults = default_token_spend_limits();
         let parsed = validate_token_spend_limits(&defaults).unwrap();
-        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed.len(), 3);
         assert_eq!(
             parsed[0].max_per_execution_raw,
             DEFAULT_USDC_PER_PAYMENT_RAW
