@@ -388,7 +388,7 @@ pub struct WalletBalanceQuery {
     pub chain: Option<String>,
 }
 
-/// Return the agent smart account's single Arc USDC balance.
+/// Return Arc USDC and known Circle Swap asset balances for the active wallet.
 pub async fn wallet_balance_handler(
     State(state): State<AppState>,
     Extension(api_ctx): Extension<AuthContext>,

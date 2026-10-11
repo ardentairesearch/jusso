@@ -20,7 +20,10 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{
-    arc::{ArcNetwork, ARC_MAINNET_EURC_ADDRESS, ARC_TESTNET_EURC_ADDRESS, ARC_USDC_ADDRESS},
+    arc::{
+        ArcNetwork, ARC_MAINNET_CIRBTC_ADDRESS, ARC_MAINNET_EURC_ADDRESS,
+        ARC_TESTNET_CIRBTC_ADDRESS, ARC_TESTNET_EURC_ADDRESS, ARC_USDC_ADDRESS,
+    },
     config::CircleConfig,
     types::BatchCall,
 };
@@ -30,6 +33,14 @@ pub const CIRCLE_ADAPTER_TESTNET: &str = "0xBBD70b01a1CAbc96d5b7b129Ae1AAabdf50d
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SIGNED_INSTRUCTIONS: usize = 16;
 const MAX_SIGNED_TOKENS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CircleSwapAsset {
+    pub symbol: &'static str,
+    pub address: Address,
+    pub decimals: u8,
+    pub can_convert_to_usdc: bool,
+}
 
 #[derive(Clone)]
 pub struct CircleClient {
@@ -807,8 +818,39 @@ pub fn resolve_swap_token(network: ArcNetwork, value: &str) -> Result<Address> {
         }
         .parse()
         .context("fixed EURC address is invalid"),
+        "CIRBTC" => match network {
+            ArcNetwork::Mainnet => ARC_MAINNET_CIRBTC_ADDRESS,
+            ArcNetwork::Testnet => ARC_TESTNET_CIRBTC_ADDRESS,
+        }
+        .parse()
+        .context("fixed cirBTC address is invalid"),
         _ => parse_nonzero_address(value.trim(), "token"),
     }
+}
+
+pub fn arc_swap_assets(network: ArcNetwork) -> Result<[CircleSwapAsset; 3]> {
+    let eurc = resolve_swap_token(network, "EURC")?;
+    let cirbtc = resolve_swap_token(network, "cirBTC")?;
+    Ok([
+        CircleSwapAsset {
+            symbol: "USDC",
+            address: ARC_USDC_ADDRESS,
+            decimals: 6,
+            can_convert_to_usdc: false,
+        },
+        CircleSwapAsset {
+            symbol: "EURC",
+            address: eurc,
+            decimals: 6,
+            can_convert_to_usdc: true,
+        },
+        CircleSwapAsset {
+            symbol: "cirBTC",
+            address: cirbtc,
+            decimals: 8,
+            can_convert_to_usdc: true,
+        },
+    ])
 }
 
 pub fn parse_token_amount(value: &str, decimals: u8) -> Result<U256> {
@@ -971,6 +1013,19 @@ mod tests {
         assert_eq!(
             resolve_swap_token(ArcNetwork::Mainnet, "EURC").unwrap(),
             ARC_MAINNET_EURC_ADDRESS.parse::<Address>().unwrap()
+        );
+        let testnet_assets = arc_swap_assets(ArcNetwork::Testnet).unwrap();
+        assert_eq!(
+            testnet_assets
+                .iter()
+                .map(|asset| asset.symbol)
+                .collect::<Vec<_>>(),
+            vec!["USDC", "EURC", "cirBTC"]
+        );
+        assert_eq!(testnet_assets[2].decimals, 8);
+        assert_eq!(
+            testnet_assets[2].address,
+            ARC_TESTNET_CIRBTC_ADDRESS.parse::<Address>().unwrap()
         );
     }
 

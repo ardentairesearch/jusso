@@ -763,7 +763,8 @@ pub async fn arc_fee_recipient_status(engine: &ExecutionEngine) -> Result<serde_
     }))
 }
 
-/// Resolve the agent's active payment wallet and return its Arc USDC balance.
+/// Resolve the agent's active payment wallet and return balances for USDC and
+/// every Circle Swap registry asset available on the configured Arc network.
 pub async fn handle_get_wallet_balance(
     engine: &ExecutionEngine,
     pool: &PgPool,
@@ -803,22 +804,38 @@ pub async fn handle_get_wallet_balance(
     };
     let smart_wallet_str = format!("{smart_wallet_address:?}");
 
-    // Arc native and ERC-20 USDC are one balance. Use the six-decimal interface
-    // for the one user-visible balance and execution-fee checks.
-    let raw_balance = fetch_erc20_balance_of(
-        provider.as_ref(),
-        chain_cfg.execution_token.address,
-        smart_wallet_address,
-    )
-    .await?;
-    let formatted = format_units(raw_balance, chain_cfg.execution_token.decimals as usize)?;
-    let tokens = vec![TokenBalance {
-        symbol: chain_cfg.execution_token.symbol,
-        contract_address: format!("{:?}", chain_cfg.execution_token.address),
-        raw: raw_balance.to_string(),
-        formatted,
-        decimals: chain_cfg.execution_token.decimals,
-    }];
+    let assets = crate::circle::arc_swap_assets(engine.config.arc_network)?;
+    if assets[0].address != chain_cfg.execution_token.address
+        || assets[0].decimals != chain_cfg.execution_token.decimals
+    {
+        anyhow::bail!("Circle asset registry does not match the configured Arc USDC token");
+    }
+    let (usdc_balance, eurc_balance, cirbtc_balance) = tokio::try_join!(
+        fetch_erc20_balance_of(provider.as_ref(), assets[0].address, smart_wallet_address),
+        fetch_erc20_balance_of(provider.as_ref(), assets[1].address, smart_wallet_address),
+        fetch_erc20_balance_of(provider.as_ref(), assets[2].address, smart_wallet_address),
+    )?;
+    let conversions_available = wallet_provider == "turnkey_erc4337";
+    let balances = [usdc_balance, eurc_balance, cirbtc_balance];
+    let tokens = assets
+        .into_iter()
+        .zip(balances)
+        .map(|(asset, balance)| {
+            Ok(TokenBalance {
+                symbol: asset.symbol.into(),
+                contract_address: format!("{:?}", asset.address),
+                raw: balance.to_string(),
+                formatted: format_units(balance, asset.decimals as usize)?,
+                decimals: asset.decimals,
+                can_convert_to_usdc: conversions_available && asset.can_convert_to_usdc,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let conversion_message = if conversions_available {
+        "EURC and cirBTC can be converted to USDC when Circle returns a live route and the owner's limits allow it."
+    } else {
+        "Balances are shown for visibility, but autonomous conversion currently requires the Jusso-managed wallet."
+    };
 
     Ok(WalletBalanceResponse {
         agent_id: agent_id.to_string(),
@@ -826,6 +843,8 @@ pub async fn handle_get_wallet_balance(
         wallet_provider,
         chain: chain.to_string(),
         tokens,
+        conversions_available,
+        conversion_message: conversion_message.into(),
     })
 }
 

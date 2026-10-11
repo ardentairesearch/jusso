@@ -92,8 +92,10 @@ spend only USDC already present in the agent wallet; generating a checkout link
 does not authorize future fiat debits.
 
 Circle Swap converts owner-authorized Arc assets into USDC from the agent's
-existing ERC-4337 smart account. EURC has a conservative default budget; every
-other input asset requires an explicit owner-approved token budget. Circle Earn
+existing ERC-4337 smart account. Wallet balance reads always show USDC, EURC,
+and cirBTC, including zero balances, so available conversion assets are easy to
+discover. EURC has a conservative default budget; cirBTC and every other input
+asset require an explicit owner-approved token budget. Circle Earn
 can place spare USDC into owner-approved
 opportunities and withdraw it back to the same wallet. The owner approves a
 plain-language treasury profile once: conversion cap, price tolerance, liquid

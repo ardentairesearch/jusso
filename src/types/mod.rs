@@ -193,6 +193,9 @@ pub struct TokenBalance {
     pub formatted: String,
     /// Number of decimals used for formatting.
     pub decimals: u8,
+    /// Whether the active wallet can convert this asset into USDC through
+    /// Circle Swap. A live route and the owner's policy must still allow it.
+    pub can_convert_to_usdc: bool,
 }
 
 /// Response for `GET /wallet/balance`.
@@ -202,8 +205,13 @@ pub struct WalletBalanceResponse {
     pub smart_wallet_address: String,
     pub wallet_provider: String,
     pub chain: String,
-    /// Arc USDC is shown once, through its six-decimal ERC-20 interface.
+    /// Arc USDC and known Circle Swap assets are always listed, including
+    /// assets whose current balance is zero.
     pub tokens: Vec<TokenBalance>,
+    /// Whether autonomous Circle conversion is available for this wallet type.
+    pub conversions_available: bool,
+    /// Plain-language explanation of conversion availability and routing.
+    pub conversion_message: String,
 }
 
 // ──────────────────────────── Internal Models ─────────────────────────

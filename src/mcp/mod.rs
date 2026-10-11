@@ -102,7 +102,7 @@ struct ExecutionStatusParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct SwapAmountParams {
-    /// Asset symbol (currently EURC) or an Arc token contract address.
+    /// Asset symbol (EURC or cirBTC) or an Arc token contract address.
     token: String,
     /// Human-readable amount, for example "25" or "25.50".
     amount: String,
@@ -110,7 +110,7 @@ struct SwapAmountParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct ExecuteSwapParams {
-    /// Asset symbol (currently EURC) or an Arc token contract address.
+    /// Asset symbol (EURC or cirBTC) or an Arc token contract address.
     token: String,
     /// Human-readable amount to convert to USDC.
     amount: String,
@@ -270,7 +270,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Read the Arc USDC balance held by the connected agent's active payment wallet."
+        description = "Read USDC and every known Circle Swap asset balance held by the connected agent's active Arc wallet. Zero balances are included so available conversion assets remain discoverable."
     )]
     async fn get_wallet_balance(
         &self,
