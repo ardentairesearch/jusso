@@ -945,14 +945,29 @@ fn assert_string_eq(value: &Value, field: &str, expected: &str) -> Result<()> {
 
 fn parse_u256_value(value: &Value, field: &str) -> Result<U256> {
     match value {
-        Value::String(value) => {
-            U256::from_dec_str(value).with_context(|| format!("Circle returned invalid {field}"))
-        }
+        Value::String(value) => parse_u256_string(value, field),
         Value::Number(value) if value.is_u64() => {
             Ok(U256::from(value.as_u64().unwrap_or_default()))
         }
         _ => bail!("Circle returned invalid {field}"),
     }
+}
+
+fn parse_u256_string(value: &str, field: &str) -> Result<U256> {
+    if let Some(value) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("Circle returned invalid {field}");
+        }
+        return U256::from_str_radix(value, 16)
+            .with_context(|| format!("Circle returned invalid {field}"));
+    }
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("Circle returned invalid {field}");
+    }
+    U256::from_dec_str(value).with_context(|| format!("Circle returned invalid {field}"))
 }
 
 fn normalized_address(value: &str, field: &str) -> Result<String> {
@@ -1042,7 +1057,7 @@ mod tests {
                 instructions: vec![SignedInstruction {
                     target: "0x0000000000000000000000000000000000000002".into(),
                     data: "0x1234".into(),
-                    value: json!("0"),
+                    value: json!("0x0"),
                     token_in: format!("{token:?}"),
                     amount_to_approve: json!("1000000"),
                     token_out: format!("{ARC_USDC_ADDRESS:?}"),
@@ -1052,12 +1067,12 @@ mod tests {
                     token: format!("{ARC_USDC_ADDRESS:?}"),
                     beneficiary: format!("{wallet:?}"),
                 }],
-                exec_id: json!("42"),
-                deadline: json!(deadline),
+                exec_id: json!("0x002a"),
+                deadline: json!(format!("0x{:x}", deadline.parse::<u64>().unwrap())),
                 metadata: "0x".into(),
             },
         };
-        let (_, call) = compile_signed_execute(
+        let (provider_execution_id, call) = compile_signed_execute(
             ArcNetwork::Testnet,
             wallet,
             transaction,
@@ -1065,12 +1080,38 @@ mod tests {
             Some(ARC_USDC_ADDRESS),
         )
         .unwrap();
+        assert_eq!(provider_execution_id, "42");
         assert!(call.calldata.starts_with("0x"));
         assert!(call.calldata.len() > 10);
         assert_eq!(
             call.target_contract,
             CIRCLE_ADAPTER_TESTNET.to_ascii_lowercase()
         );
+    }
+
+    #[test]
+    fn circle_uint256_values_accept_decimal_and_hex_service_formats() {
+        assert_eq!(
+            parse_u256_value(&json!("42"), "value").unwrap(),
+            U256::from(42u64)
+        );
+        assert_eq!(
+            parse_u256_value(&json!("0x2a"), "value").unwrap(),
+            U256::from(42u64)
+        );
+        assert_eq!(
+            parse_u256_value(&json!("0X2A"), "value").unwrap(),
+            U256::from(42u64)
+        );
+        assert_eq!(
+            parse_u256_value(&json!(42), "value").unwrap(),
+            U256::from(42u64)
+        );
+
+        for invalid in [json!(""), json!("0x"), json!("-1"), json!("2a")] {
+            assert!(parse_u256_value(&invalid, "value").is_err());
+        }
+        assert!(parse_u256_value(&json!(format!("0x1{}", "0".repeat(64))), "value").is_err());
     }
 
     #[test]
