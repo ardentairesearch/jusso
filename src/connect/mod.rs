@@ -1546,13 +1546,14 @@ fn passkey_enrollment_page_html(
     let label = html_escape(label);
     let purpose = html_escape(purpose);
     let verb = if replacing { "Replace" } else { "Add" };
+    let browser_css = browser_page_css();
+    let browser_script = include_str!("browser.js");
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{verb} owner passkey</title><style>
-:root{{color-scheme:light;--paper:#f7f8f7;--surface:#fff;--ink:#19231e;--muted:#5c675f;--line:#dce2dc;--soft:#eef2ee;--accent:#007d36;--danger:#a52d2d}}*{{box-sizing:border-box;letter-spacing:0}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}body:before{{content:"ARDENT AI RESEARCH     /     JUSSO SECURITY";display:flex;align-items:center;min-height:64px;padding:0 max(24px,calc((100vw - 720px)/2));border-bottom:1px solid var(--line);white-space:pre;font:600 10px/1.4 ui-monospace,SFMono-Regular,monospace}}main{{width:min(720px,calc(100% - 40px));margin:64px auto}}h1{{margin:8px 0 12px;font:500 clamp(40px,7vw,60px)/1.02 Georgia,serif}}p{{margin:0 0 30px;color:var(--muted)}}.mark{{color:var(--accent);font:600 10px/1.5 ui-monospace,SFMono-Regular,monospace}}.panel{{border:1px solid var(--line);padding:28px;background:var(--surface)}}dl{{display:grid;grid-template-columns:130px 1fr;gap:12px 22px;margin:0 0 26px}}dt{{color:var(--muted);font-size:12px}}dd{{margin:0;font-weight:650}}button{{width:100%;min-height:50px;padding:13px 18px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);font:inherit;font-weight:700;cursor:pointer}}button:hover{{background:var(--accent);border-color:var(--accent)}}button:disabled{{opacity:.55;cursor:wait}}#message{{min-height:24px;margin-top:16px;color:var(--danger)}}@media(prefers-color-scheme:dark){{:root{{color-scheme:dark;--paper:#111612;--surface:#182019;--ink:#f0f4f0;--muted:#a6b1a8;--line:#323d34;--soft:#1b251d;--accent:#93dfae;--danger:#ff9595}}}}@media(max-width:560px){{body:before{{padding:0 20px}}main{{margin-top:40px}}.panel{{padding:20px}}dl{{grid-template-columns:1fr;gap:3px}}dd{{margin-bottom:10px}}}}
-</style></head><body><main><div class="mark">OWNER SECURITY</div><h1>{verb} owner passkey.</h1><p>First confirm that it is you, then securely create the new passkey on this device.</p><section class="panel"><dl><dt>Passkey name</dt><dd>{label}</dd><dt>Used for</dt><dd>{purpose}</dd></dl><button id="continue">Continue securely</button><div id="message" role="alert" aria-live="polite"></div></section></main>
+<title>{verb} owner passkey | Jusso</title><style>{browser_css}</style></head><body><div class="topbar"><span class="wordmark">Jusso<b>.</b></span><span class="byline">by Ardent AI Research</span></div><main><header><div class="mark">OWNER SECURITY</div><h1>{verb} owner passkey.</h1><p>First confirm that it is you, then securely create the new passkey on this device.</p></header><section class="panel"><dl><dt>Passkey name</dt><dd>{label}</dd><dt>Used for</dt><dd>{purpose}</dd></dl><button id="continue">Continue securely</button><div id="message" role="alert" aria-live="polite"></div></section><footer>Secured with your device passkey</footer></main>
 <script>
+{browser_script}
 const token={token};const message=document.querySelector('#message');const button=document.querySelector('#continue');
 const b64u=b=>{{let s='';new Uint8Array(b).forEach(v=>s+=String.fromCharCode(v));return btoa(s).replaceAll('+','-').replaceAll('/','_').replaceAll('=','')}};
 const bytes=s=>{{s=s.replaceAll('-','+').replaceAll('_','/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))}};
@@ -1561,7 +1562,7 @@ function request(o){{o.challenge=bytes(o.challenge);(o.allowCredentials||[]).for
 function regJSON(c){{return {{id:c.id,type:c.type,rawId:b64u(c.rawId),authenticatorAttachment:c.authenticatorAttachment,response:{{attestationObject:b64u(c.response.attestationObject),clientDataJSON:b64u(c.response.clientDataJSON),transports:c.response.getTransports?c.response.getTransports():[]}},clientExtensionResults:c.getClientExtensionResults()}}}}
 function authJSON(c){{return {{id:c.id,type:c.type,rawId:b64u(c.rawId),authenticatorAttachment:c.authenticatorAttachment,response:{{authenticatorData:b64u(c.response.authenticatorData),clientDataJSON:b64u(c.response.clientDataJSON),signature:b64u(c.response.signature),userHandle:c.response.userHandle?b64u(c.response.userHandle):null}},clientExtensionResults:c.getClientExtensionResults()}}}}
 async function post(path,body){{const r=await fetch(`/passkeys/enroll/${{token}}/${{path}}`,{{method:'POST',headers:{{'content-type':'application/json'}},body:body?JSON.stringify(body):null}});const j=await r.json();if(!r.ok)throw new Error(j.error||'Request failed');return j}}
-button.onclick=async()=>{{button.disabled=true;message.textContent='Confirming owner passkey...';try{{const auth=await post('authenticate/start');const existing=await navigator.credentials.get({{publicKey:request(auth.options.publicKey)}});const registration=await post('authenticate/finish',{{ceremony_id:auth.ceremony_id,credential:authJSON(existing)}});message.textContent='Create the new passkey...';const created=await navigator.credentials.create({{publicKey:creation(registration.options.publicKey)}});await post('register/finish',{{ceremony_id:registration.ceremony_id,credential:regJSON(created)}});message.textContent='Passkey updated. You may return to your assistant.'}}catch(err){{button.disabled=false;message.textContent=err.message}}}};
+button.onclick=()=>runCeremony(button,async()=>{{const auth=await post('authenticate/start');const existing=await navigator.credentials.get({{publicKey:request(auth.options.publicKey)}});const registration=await post('authenticate/finish',{{ceremony_id:auth.ceremony_id,credential:authJSON(existing)}});showMessage('Create the new passkey on your device.');const created=await navigator.credentials.create({{publicKey:creation(registration.options.publicKey)}});await post('register/finish',{{ceremony_id:registration.ceremony_id,credential:regJSON(created)}});showMessage('Passkey updated. You can return to your assistant.','success')}});
 </script></body></html>"#
     )
 }
@@ -1820,46 +1821,51 @@ fn owner_approval_page_html(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("Review what will change, then approve with your passkey.");
     let review = render_approval_review(presentation);
+    let browser_script = include_str!("browser.js");
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title} | Jusso</title><style>{approval_css}</style></head><body><div class="topbar"><span>ARDENT AI RESEARCH</span><span>JUSSO / OWNER APPROVAL</span></div><main><header><span class="eyebrow">Protected change</span><h1>{title}</h1><p class="lede">{summary}</p><p class="requester">Requested through <strong>{client_name}</strong></p></header><section class="review" aria-label="Change review">{review}</section><section class="approve"><div><strong>Ready to approve?</strong><span>Your passkey confirms this exact change. Nothing else is authorized.</span></div><button id="approve">Approve with passkey <span aria-hidden="true">&nearr;</span></button><div id="message" role="alert" aria-live="polite"></div></section><footer><span>Passkey protected</span><span>Link expires automatically</span></footer></main>
+<title>{title} | Jusso</title><style>{approval_css}</style></head><body><div class="topbar"><span class="wordmark">Jusso<b>.</b></span><span class="byline">by Ardent AI Research</span></div><main class="approval-page"><header><span class="eyebrow">Review &amp; approve</span><h1>{title}</h1><p class="lede">{summary}</p><p class="requester">Requested through <strong>{client_name}</strong></p></header><section class="review" aria-label="Change review">{review}</section><section class="approve"><div><strong>Confirm this change</strong><span>Use your fingerprint, face, or device PIN to approve.</span></div><button id="approve">Approve with passkey</button><div id="message" role="alert" aria-live="polite"></div></section><footer><span>Passkey protected</span><span>Link expires automatically</span></footer></main>
 <script>
+{browser_script}
 const token={token};const message=document.querySelector('#message');
 const b64u=b=>{{let s='';new Uint8Array(b).forEach(v=>s+=String.fromCharCode(v));return btoa(s).replaceAll('+','-').replaceAll('/','_').replaceAll('=','')}};
 const bytes=s=>{{s=s.replaceAll('-','+').replaceAll('_','/');while(s.length%4)s+='=';return Uint8Array.from(atob(s),c=>c.charCodeAt(0))}};
 function request(o){{o.challenge=bytes(o.challenge);(o.allowCredentials||[]).forEach(c=>c.id=bytes(c.id));return o}}
 function authJSON(c){{return {{id:c.id,type:c.type,rawId:b64u(c.rawId),authenticatorAttachment:c.authenticatorAttachment,response:{{authenticatorData:b64u(c.response.authenticatorData),clientDataJSON:b64u(c.response.clientDataJSON),signature:b64u(c.response.signature),userHandle:c.response.userHandle?b64u(c.response.userHandle):null}},clientExtensionResults:c.getClientExtensionResults()}}}}
 async function post(path,body){{const r=await fetch(`/approve/${{token}}/${{path}}`,{{method:'POST',headers:{{'content-type':'application/json'}},body:body?JSON.stringify(body):null}});const j=await r.json();if(!r.ok)throw new Error(j.error||'Request failed');return j}}
-document.querySelector('#approve').onclick=async()=>{{message.textContent='';try{{const start=await post('start');const c=await navigator.credentials.get({{publicKey:request(start.options.publicKey)}});await post('finish',{{ceremony_id:start.ceremony_id,credential:authJSON(c)}});document.querySelector('#approve').disabled=true;message.textContent='Approved. You may return to your assistant.'}}catch(err){{message.textContent=err.message}}}};
+const approveButton=document.querySelector('#approve');approveButton.onclick=()=>runCeremony(approveButton,async()=>{{const start=await post('start');const c=await navigator.credentials.get({{publicKey:request(start.options.publicKey)}});await post('finish',{{ceremony_id:start.ceremony_id,credential:authJSON(c)}});showMessage('Approved. You can return to your assistant.','success')}});
 </script></body></html>"#,
         title = html_escape(title),
         summary = html_escape(summary),
-        approval_css = approval_page_css(),
+        approval_css = browser_page_css(),
     )
 }
 
-fn approval_page_css() -> &'static str {
-    r#":root{color-scheme:light;--paper:#f7f8f7;--surface:#fff;--ink:#19231e;--muted:#647068;--line:#dce2dc;--accent:#007d36}*{box-sizing:border-box;letter-spacing:0}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}.topbar{min-height:60px;padding:0 max(22px,calc((100vw - 760px)/2));display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);font:600 10px/1.4 ui-monospace,SFMono-Regular,monospace}.topbar span:last-child{color:var(--muted)}main{width:min(760px,calc(100% - 36px));margin:54px auto 32px}header{padding-bottom:30px}.eyebrow{color:var(--accent);font:700 10px/1.5 ui-monospace,SFMono-Regular,monospace;text-transform:uppercase}h1{margin:7px 0 0;max-width:680px;font:500 clamp(34px,6vw,50px)/1.06 Georgia,serif}.lede{max-width:610px;margin:14px 0 0;color:var(--muted);font-size:16px}.requester{margin:14px 0 0;color:var(--muted);font-size:12px}.review{display:grid;gap:12px;padding-top:24px;border-top:1px solid var(--line)}.review-block{min-width:0;padding:20px 22px;border:1px solid var(--line);background:var(--surface)}.review-block h2{margin:0 0 14px;color:var(--muted);font-size:10px;text-transform:uppercase}dl{display:grid;grid-template-columns:minmax(130px,.75fr) minmax(0,1.25fr);gap:10px 18px;margin:0}dt{color:var(--muted);font-size:12px}dd{margin:0;font-weight:600;overflow-wrap:anywhere}ul{margin:0;padding:0;list-style:none;display:grid;gap:9px}li{position:relative;padding-left:18px}li:before{content:"";position:absolute;left:0;top:.62em;width:6px;height:6px;background:var(--accent)}li dl{padding:12px 0;border-bottom:1px solid var(--line)}li:last-child dl{border-bottom:0}code{font:12px/1.55 ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}.approve{margin-top:18px;padding:20px 22px;display:grid;grid-template-columns:1fr auto;align-items:center;gap:20px;background:var(--ink);color:var(--paper)}.approve div:first-child{display:grid;gap:2px}.approve span{font-size:12px;color:#cbd2cd}.approve button{min-height:48px;padding:12px 18px;border:1px solid var(--paper);background:var(--paper);color:var(--ink);font:inherit;font-weight:700;cursor:pointer}.approve button:hover{background:#9de1b4;border-color:#9de1b4}.approve button:disabled{opacity:.55;cursor:wait}#message{grid-column:1/-1;color:#b8efca;font-size:13px}#message:empty{display:none}footer{display:flex;justify-content:space-between;padding-top:16px;color:var(--muted);font:10px/1.5 ui-monospace,SFMono-Regular,monospace;text-transform:uppercase}@media(prefers-color-scheme:dark){:root{color-scheme:dark;--paper:#111612;--surface:#182019;--ink:#f0f4f0;--muted:#a6b1a8;--line:#323d34;--accent:#93dfae}.approve{background:#f0f4f0;color:#111612}.approve span{color:#536057}.approve button{background:#111612;color:#f0f4f0;border-color:#111612}}@media(max-width:620px){.topbar{padding:0 18px}.topbar span:last-child{display:none}main{margin-top:36px}.review-block{padding:18px}.approve{grid-template-columns:1fr}.approve button{width:100%}dl{grid-template-columns:1fr;gap:2px}dd{margin-bottom:9px}}"#
+fn browser_page_css() -> &'static str {
+    include_str!("browser.css")
 }
 
 fn render_approval_review(presentation: &serde_json::Value) -> String {
     let Some(object) = presentation.as_object() else {
         return String::new();
     };
-    object
+    let mut fields = object
         .iter()
         .filter(|(key, value)| {
             !matches!(key.as_str(), "title" | "summary") && !review_value_is_empty(value)
         })
+        .collect::<Vec<_>>();
+    fields.sort_by_key(|(key, _)| match key.as_str() {
+        "warnings" => 0,
+        "note" | "effects" => 2,
+        _ => 1,
+    });
+    fields
+        .into_iter()
         .map(|(key, value)| {
-            let wide = matches!(
-                key.as_str(),
-                "effects" | "warnings" | "recipients" | "plan" | "proposed_plan" | "current_plan"
-            );
             format!(
-                "<article class=\"review-block{}\"><h2>{}</h2>{}</article>",
-                if wide { " wide" } else { "" },
+                "<article class=\"review-block\"><h2>{}</h2>{}</article>",
                 html_escape(&humanize_key(key)),
                 render_review_value(value)
             )
@@ -1902,14 +1908,43 @@ fn render_review_value(value: &serde_json::Value) -> String {
             values
                 .iter()
                 .filter(|(_, value)| !review_value_is_empty(value))
-                .map(|(key, value)| format!(
-                    "<dt>{}</dt><dd>{}</dd>",
-                    html_escape(&humanize_key(key)),
-                    render_review_value(value)
-                ))
+                .map(|(key, value)| {
+                    if key == "recipients" {
+                        format!(
+                            "<dt class=\"full-row\">Recipients</dt><dd class=\"full-row\">{}</dd>",
+                            render_review_recipients(value)
+                        )
+                    } else {
+                        format!(
+                            "<dt>{}</dt><dd>{}</dd>",
+                            html_escape(&humanize_key(key)),
+                            render_review_value(value)
+                        )
+                    }
+                })
                 .collect::<String>()
         ),
     }
+}
+
+fn render_review_recipients(value: &serde_json::Value) -> String {
+    let Some(recipients) = value.as_array() else {
+        return render_review_value(value);
+    };
+    let rows = recipients.iter().map(|recipient| {
+        let Some(fields) = recipient.as_object() else {
+            return format!("<li>{}</li>", render_review_value(recipient));
+        };
+        let name = fields.get("name").and_then(serde_json::Value::as_str).unwrap_or("Recipient");
+        let amount = fields.get("amount").map(render_review_value).unwrap_or_default();
+        let address = fields.get("address").map(render_review_value).unwrap_or_default();
+        let other = fields.iter()
+            .filter(|(key, value)| !matches!(key.as_str(), "name" | "amount" | "address") && !review_value_is_empty(value))
+            .map(|(key, value)| format!("<dt>{}</dt><dd>{}</dd>", html_escape(&humanize_key(key)), render_review_value(value)))
+            .collect::<String>();
+        format!("<li><div class=\"recipient-heading\"><strong>{}</strong><span>{amount}</span></div><div class=\"recipient-address\">{address}</div><dl>{other}</dl></li>", html_escape(name))
+    }).collect::<String>();
+    format!("<ul class=\"review-recipients\">{rows}</ul>")
 }
 
 fn humanize_key(key: &str) -> String {
@@ -2017,17 +2052,20 @@ fn connect_page_html(
     client_name: &str,
     scopes: &[String],
 ) -> String {
+    let browser_css = browser_page_css();
+    let browser_script = include_str!("browser.js");
     let token = serde_json::to_string(token).expect("token is serializable");
     let client_name = html_escape(client_name);
     let turnstile = turnstile_site_key.map_or_else(String::new, |key| {
         format!(
             r#"<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-            <div class="cf-turnstile" data-sitekey="{}" data-action="register"></div>"#,
+            <div class="cf-turnstile" data-sitekey="{}" data-action="register" data-size="compact"></div>"#,
             html_escape(key)
         )
     });
-    let sign_in_agent = r#"<label>Agent ID</label><input name="agent_id" required value="primary-agent" autocomplete="off" autocapitalize="none" spellcheck="false">"#;
-    let connection_kind = "Agent workflows and organization management";
+    let sign_in_agent = r#"<label for="signin-agent">Agent</label><input id="signin-agent" name="agent_id" required value="primary-agent" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="agent-help"><span class="helper" id="agent-help">Use the agent name you chose when you joined.</span>"#;
+    let connection_kind =
+        "Manage payments and your Jusso account. Sensitive changes need your approval.";
     let scope_list = scopes
         .iter()
         .map(|scope| format!("<li><code>{}</code></li>", html_escape(scope)))
@@ -2045,26 +2083,25 @@ fn connect_page_html(
     let sign_in_form_class = if registration_enabled { "hidden" } else { "" };
     let registration_form = if registration_enabled {
         format!(
-            r#"<form id="register"><label>Organization</label><input name="organization_name" required minlength="2" autocomplete="organization"><label>Your name</label><input name="display_name" required minlength="2" autocomplete="name"><label>Owner handle</label><input name="owner_handle" required autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="you@example.com"><label>First agent ID</label><input name="agent_id" required value="primary-agent" autocomplete="off" autocapitalize="none" spellcheck="false"><label><input style="width:auto" type="checkbox" name="terms_accepted" required> I authorize this connection and accept the terms.</label><label class="remember"><input type="checkbox" name="remember_account" checked> Remember this account on this device</label>{turnstile}<button class="primary">Create passkey and connect</button></form>"#
+            r#"<form id="register"><label for="organization">Organization or workspace</label><input id="organization" placeholder="Your company or personal workspace" name="organization_name" required minlength="2" autocomplete="organization"><label for="display-name">Your name</label><input id="display-name" name="display_name" required minlength="2" autocomplete="name"><label for="register-handle">Sign-in name</label><input id="register-handle" name="owner_handle" required autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="you@example.com"><label for="register-agent">Name your agent</label><input id="register-agent" name="agent_id" required value="primary-agent" autocomplete="off" autocapitalize="none" spellcheck="false"><label class="check-label"><input type="checkbox" name="terms_accepted" required> I authorize this connection and accept the terms.</label><label class="remember"><input type="checkbox" name="remember_account" checked> Remember this account on this device</label>{turnstile}<button class="primary">Create passkey and connect</button></form>"#
         )
     } else {
         String::new()
     };
     let registration_script = if registration_enabled {
-        r#"document.querySelector('#register').onsubmit=async e=>{e.preventDefault();message.textContent='';try{const f=new FormData(e.target);const start=await post('register/start',{organization_name:f.get('organization_name'),display_name:f.get('display_name'),owner_handle:f.get('owner_handle'),agent_id:f.get('agent_id'),terms_accepted:true,challenge_token:window.turnstile?turnstile.getResponse():null});const c=await navigator.credentials.create({publicKey:creation(start.options.publicKey)});const done=await post('register/finish',{ceremony_id:start.ceremony_id,credential:regJSON(c)});saveRememberedAccount(e.target);location.assign(done.redirect_uri)}catch(err){message.textContent=err.message}};"#
+        r#"document.querySelector('#register').onsubmit=e=>{e.preventDefault();const form=e.target;const f=new FormData(form);runCeremony(form.querySelector('.primary'),async()=>{const start=await post('register/start',{organization_name:f.get('organization_name'),display_name:f.get('display_name'),owner_handle:f.get('owner_handle'),agent_id:f.get('agent_id'),terms_accepted:f.get('terms_accepted')==='on',challenge_token:window.turnstile?turnstile.getResponse():null});const c=await navigator.credentials.create({publicKey:creation(start.options.publicKey)});const done=await post('register/finish',{ceremony_id:start.ceremony_id,credential:regJSON(c)});saveRememberedAccount(form);showMessage('Connected. Returning to your assistant.','success');location.assign(done.redirect_uri)})};"#
     } else {
         ""
     };
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Connect to Jusso</title><style>
-:root{{color-scheme:light;--paper:#f7f8f7;--surface:#fff;--ink:#19231e;--muted:#5c675f;--line:#dce2dc;--soft:#eef2ee;--accent:#007d36;--danger:#a52d2d}}*{{box-sizing:border-box;letter-spacing:0}}body{{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}}body:before{{content:"ARDENT AI RESEARCH     /     JUSSO CONNECT";display:flex;align-items:center;min-height:64px;padding:0 max(24px,calc((100vw - 760px)/2));border-bottom:1px solid var(--line);white-space:pre;font:600 10px/1.4 ui-monospace,SFMono-Regular,monospace}}main{{width:min(760px,calc(100% - 40px));margin:64px auto}}header{{display:grid;gap:10px;margin-bottom:34px}}h1{{margin:0;font:500 clamp(40px,7vw,62px)/1.02 Georgia,serif}}p{{margin:0;max-width:620px;color:var(--muted)}}.mark{{color:var(--accent);font:600 10px/1.5 ui-monospace,SFMono-Regular,monospace}}.panel{{border:1px solid var(--line);padding:28px;background:var(--surface)}}.tabs{{display:flex;border-bottom:1px solid var(--line);margin:28px 0 22px}}button{{font:inherit;cursor:pointer}}.tab{{border:0;background:none;color:var(--muted);padding:10px 16px;border-bottom:2px solid transparent}}.tab.active{{color:var(--ink);border-color:var(--accent)}}label{{display:block;margin:16px 0 6px;font-size:12px;font-weight:650}}input{{width:100%;min-height:48px;padding:11px 13px;border:1px solid var(--line);border-radius:0;background:var(--paper);color:inherit;outline:none}}input:focus{{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}}.remember-row{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:16px}}.remember{{display:flex;align-items:center;gap:8px;margin:0;color:var(--muted);font-weight:500}}.remember input{{width:16px;min-height:16px;margin:0;accent-color:var(--accent)}}.forget{{display:none;border:0;background:none;color:var(--muted);padding:4px 0;font-size:12px;text-decoration:underline}}.forget.visible{{display:block}}.primary{{width:100%;min-height:50px;margin-top:22px;padding:13px 18px;border:1px solid var(--ink);background:var(--ink);color:var(--paper);font-weight:700}}.primary:hover{{background:var(--accent);border-color:var(--accent)}}.primary:disabled{{opacity:.55;cursor:wait}}.hidden{{display:none}}#message{{min-height:24px;margin-top:16px;color:var(--danger)}}.consent{{padding:20px;border:1px solid var(--line);background:var(--soft)}}.consent strong{{display:block;font-size:16px}}.consent span{{color:var(--muted);font-size:12px}}.consent ul{{display:flex;flex-wrap:wrap;gap:7px;margin:14px 0 0;padding:0;list-style:none}}.consent li{{padding:5px 8px;border:1px solid var(--line);background:var(--surface)}}code{{font:11px/1.4 ui-monospace,SFMono-Regular,monospace}}@media(prefers-color-scheme:dark){{:root{{color-scheme:dark;--paper:#111612;--surface:#182019;--ink:#f0f4f0;--muted:#a6b1a8;--line:#323d34;--soft:#1b251d;--accent:#93dfae;--danger:#ff9595}}}}@media(max-width:560px){{body:before{{padding:0 20px}}main{{margin-top:40px}}.panel{{padding:20px}}.remember-row{{align-items:flex-start;flex-direction:column}}}}
-</style></head><body><main><header><div class="mark">SECURE AGENT ONBOARDING</div><h1>Connect your agent.</h1><p>Create or enter your organization, choose the agent this assistant may use, and confirm the connection with a passkey.</p></header>
-<section class="panel"><div class="consent"><strong>{client_name}</strong><span>{connection_kind}</span><ul>{scope_list}</ul></div><div class="tabs">{registration_tab}<button class="{sign_in_tab_class}" data-mode="signin">Sign in</button></div>
+<title>Connect to Jusso</title><style>{browser_css}</style></head><body><div class="topbar"><span class="wordmark">Jusso<b>.</b></span><span class="byline">by Ardent AI Research</span></div><main><header><div class="mark">Welcome to Jusso</div><h1>Your payments, connected.</h1><p>Connect your assistant to Jusso. You stay in control of payment plans and spending limits.</p></header>
+<section class="panel"><div class="consent"><strong>{client_name}</strong><span>{connection_kind}</span><details><summary>View requested permissions</summary><ul>{scope_list}</ul></details></div><div class="tabs">{registration_tab}<button class="{sign_in_tab_class}" data-mode="signin">Sign in</button></div>
 {registration_form}
-<form id="signin" class="{sign_in_form_class}"><label>Owner handle</label><input name="owner_handle" required autocomplete="username" autocapitalize="none" spellcheck="false">{sign_in_agent}<div class="remember-row"><label class="remember"><input type="checkbox" name="remember_account" checked> Remember this account on this device</label><button type="button" class="forget" id="forget-account">Forget saved details</button></div><button class="primary">Approve with passkey</button></form><div id="message" role="alert"></div></section></main>
+<form id="signin" class="{sign_in_form_class}"><label for="signin-handle">Sign-in name</label><input id="signin-handle" placeholder="The name or email you registered with" name="owner_handle" required autocomplete="username" autocapitalize="none" spellcheck="false">{sign_in_agent}<div class="remember-row"><label class="remember"><input type="checkbox" name="remember_account" checked> Remember this account on this device</label><button type="button" class="forget" id="forget-account">Forget saved details</button></div><button class="primary">Approve with passkey</button></form><div id="message" role="alert" aria-live="polite"></div></section><footer>Secured with a passkey. No password to remember.</footer></main>
 <script>
+{browser_script}
 const token={token}; const message=document.querySelector('#message');
 const rememberedAccountKey='jusso.connect.last-account.v1';
 function readRememberedAccount(){{try{{const value=JSON.parse(localStorage.getItem(rememberedAccountKey)||'null');return value&&typeof value.owner_handle==='string'&&typeof value.agent_id==='string'?value:null}}catch(_){{return null}}}}
@@ -2080,7 +2117,8 @@ async function post(path,body){{const r=await fetch(`/connect/${{token}}/${{path
 const remembered=readRememberedAccount();const signin=document.querySelector('#signin');if(remembered){{signin.elements.owner_handle.value=remembered.owner_handle;signin.elements.agent_id.value=remembered.agent_id;document.querySelector('#forget-account').classList.add('visible')}}document.querySelector('#forget-account').onclick=forgetRememberedAccount;
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{{document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));const register=document.querySelector('#register');if(register)register.classList.toggle('hidden',b.dataset.mode!=='register');signin.classList.toggle('hidden',b.dataset.mode!=='signin');message.textContent=''}});
 {registration_script}
-signin.onsubmit=async e=>{{e.preventDefault();message.textContent='';try{{const f=new FormData(e.target);const start=await post('authenticate/start',{{owner_handle:f.get('owner_handle'),agent_id:f.get('agent_id')}});const c=await navigator.credentials.get({{publicKey:request(start.options.publicKey)}});const done=await post('authenticate/finish',{{ceremony_id:start.ceremony_id,credential:authJSON(c)}});saveRememberedAccount(e.target);location.assign(done.redirect_uri)}}catch(err){{message.textContent=err.message}}}};
+if(remembered)document.querySelector('[data-mode="signin"]').click();
+signin.onsubmit=e=>{{e.preventDefault();const form=e.target;const f=new FormData(form);runCeremony(form.querySelector('.primary'),async()=>{{const start=await post('authenticate/start',{{owner_handle:f.get('owner_handle'),agent_id:f.get('agent_id')}});const c=await navigator.credentials.get({{publicKey:request(start.options.publicKey)}});const done=await post('authenticate/finish',{{ceremony_id:start.ceremony_id,credential:authJSON(c)}});saveRememberedAccount(form);showMessage('Connected. Returning to your assistant.','success');location.assign(done.redirect_uri)}})}};
 </script></body></html>"#
     )
 }
@@ -2291,6 +2329,32 @@ mod tests {
         assert!(html.contains("25 USDC"));
         assert!(!html.contains("Unused"));
         assert!(!html.contains("Warnings"));
+    }
+
+    #[test]
+    fn payment_review_keeps_recipients_complete_and_escaped() {
+        let html = owner_approval_page_html(
+            "safe-token",
+            "Assistant",
+            &serde_json::json!({
+                "title": "Review payment",
+                "payment": {"recipients": [{
+                    "name": "<img src=x onerror=alert(1)>",
+                    "amount": "200 USDC",
+                    "address": "0x1111111111111111111111111111111111111111",
+                    "verified": "Observed on Arc"
+                }]},
+                "note": "Payment reserve is preserved."
+            }),
+        );
+        assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(!html.contains("<img src=x"));
+        assert!(html.contains("200 USDC"));
+        assert!(html.contains("0x1111111111111111111111111111111111111111"));
+        assert!(html.contains("Observed on Arc"));
+        assert!(
+            html.find("200 USDC").unwrap() < html.find("Payment reserve is preserved.").unwrap()
+        );
     }
 
     #[test]
