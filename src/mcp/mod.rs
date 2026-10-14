@@ -1203,7 +1203,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Verify that a payment recipient is a valid, nonzero EVM address with observable account state on the configured Arc network. Use this before proposing a payment plan when the recipient is unfamiliar."
+        description = "Check that a payment recipient is a valid, nonzero EVM address and report whether it currently has deployed contract code on the configured Arc network. A new wallet does not need prior onchain activity."
     )]
     async fn verify_payment_recipient(
         &self,
@@ -1220,8 +1220,9 @@ impl AgentMcp {
             "address": address,
             "network": verification.chain,
             "address_type": verification.address_kind,
-            "onchain_verified": true,
-            "verified_at": verification.verified_at
+            "address_valid": true,
+            "has_deployed_code": verification.address_kind == "contract",
+            "checked_at": verification.verified_at
         }))
     }
 

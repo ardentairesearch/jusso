@@ -299,7 +299,7 @@ impl NormalizedPaymentPlan {
             recipient
                 .verification
                 .as_ref()
-                .context("payment recipient has not been verified onchain")?
+                .context("payment recipient address has not been checked")?
                 .validate(&recipient.address)?;
         }
         parse_raw_amount(&self.reserve_raw, true)?;
@@ -315,7 +315,7 @@ impl NormalizedPaymentPlan {
             }
             self.surplus_verification
                 .as_ref()
-                .context("surplus destination has not been verified onchain")?
+                .context("surplus destination address has not been checked")?
                 .validate(&surplus.destination)?;
         } else if self.surplus_verification.is_some() {
             bail!("surplus verification is present without a surplus rule");
@@ -336,7 +336,6 @@ impl RecipientAddressVerification {
             .collect::<std::collections::BTreeSet<_>>();
         if !matches!(self.chain.as_str(), "arc" | "arc-testnet")
             || !matches!(self.address_kind.as_str(), "wallet" | "contract")
-            || self.evidence.is_empty()
             || self.evidence.len() > 4
             || evidence.len() != self.evidence.len()
             || self.evidence.iter().any(|value| {
@@ -393,38 +392,19 @@ pub async fn verify_payment_address(
     let chain = Chain::from_str_loose(chain_name).context("configured Arc network is invalid")?;
     let provider = state.engine.provider_for_chain(&chain)?;
     let chain_config = state.config.chain_config(&chain)?;
-    let token = chain_config.execution_token.address;
-    let (observed_chain_id, code, native_balance, transaction_count, usdc_balance) = tokio::try_join!(
-        provider.chain_id(),
-        provider.get_code(parsed),
-        provider.get_balance(parsed),
-        provider.get_transaction_count(parsed),
-        services::fetch_erc20_balance_of(provider.as_ref(), token, parsed),
-    )?;
+    let (observed_chain_id, code) =
+        tokio::try_join!(provider.chain_id(), provider.get_code(parsed))?;
     if observed_chain_id != U256::from(chain_config.chain_id) {
         bail!(
             "Arc RPC returned chain ID {observed_chain_id}, expected {}",
             chain_config.chain_id
         );
     }
-    let mut evidence = Vec::with_capacity(4);
-    if !code.is_empty() {
-        evidence.push("deployed_contract".into());
-    }
-    if !transaction_count.is_zero() {
-        evidence.push("transaction_history".into());
-    }
-    if !native_balance.is_zero() {
-        evidence.push("native_balance".into());
-    }
-    if !usdc_balance.is_zero() {
-        evidence.push("usdc_balance".into());
-    }
-    if evidence.is_empty() {
-        bail!(
-            "recipient {normalized} is correctly formatted but has no observable account state on {chain_name}; activate the wallet on Arc before approving payments to it"
-        );
-    }
+    let evidence = if code.is_empty() {
+        Vec::new()
+    } else {
+        vec!["deployed_contract".into()]
+    };
     Ok((
         normalized,
         RecipientAddressVerification {
@@ -1558,8 +1538,18 @@ mod tests {
     }
 
     #[test]
-    fn recipient_validation_rejects_zero_and_stale_verification() {
+    fn recipient_validation_accepts_fresh_wallets_and_rejects_stale_checks() {
         assert!(normalize_address("0x0000000000000000000000000000000000000000").is_err());
+        let fresh_wallet = RecipientAddressVerification {
+            chain: "arc".into(),
+            address_kind: "wallet".into(),
+            evidence: Vec::new(),
+            verified_at: Utc::now(),
+        };
+        assert!(fresh_wallet
+            .validate("0x0000000000000000000000000000000000000001")
+            .is_ok());
+
         let verification = RecipientAddressVerification {
             chain: "arc-testnet".into(),
             address_kind: "wallet".into(),

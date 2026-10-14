@@ -2055,7 +2055,7 @@ impl OwnerApprovalAction {
                     .as_ref()
                     .is_some_and(|verification| verification.chain != expected_chain)
                 {
-                    anyhow::bail!("payment recipient verification targets the wrong Arc network");
+                    anyhow::bail!("payment recipient address check targets the wrong Arc network");
                 }
             }
             Self::ChangePaymentPlanStatus { .. } => {}
@@ -2458,7 +2458,7 @@ fn approval_payment_plan_summary(
                 "name": recipient.name.as_deref().unwrap_or("Unnamed recipient"),
                 "address": recipient.address,
                 "amount": format!("{} USDC", format_usdc_raw(&recipient.amount_raw)),
-                "verified": verification.map(|value| format!("Verified {} on {}", value.address_kind, value.chain))
+                "address_check": verification.map(|value| format!("Valid {} address on {}", value.address_kind, value.chain))
             })
         })
         .collect::<Vec<_>>();
@@ -2468,7 +2468,7 @@ fn approval_payment_plan_summary(
         "schedule": human_schedule(&plan.schedule),
         "recipients": recipients,
         "wallet_reserve": format!("{} USDC", format_usdc_raw(&plan.reserve_raw)),
-        "address_check": "Observed on Arc. Recipient names are owner-provided and do not prove identity.",
+        "address_check": "Address format checked. A recipient name is owner-provided and does not prove identity or control.",
         "surplus_rule": plan.surplus.as_ref().map(|surplus| format!(
             "Send available balance above the reserve to {} when at least {} USDC is available",
             surplus.destination,

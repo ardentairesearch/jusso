@@ -2342,7 +2342,7 @@ mod tests {
                     "name": "<img src=x onerror=alert(1)>",
                     "amount": "200 USDC",
                     "address": "0x1111111111111111111111111111111111111111",
-                    "verified": "Observed on Arc"
+                    "address_check": "Valid wallet address on Arc"
                 }]},
                 "note": "Payment reserve is preserved."
             }),
@@ -2351,7 +2351,7 @@ mod tests {
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("200 USDC"));
         assert!(html.contains("0x1111111111111111111111111111111111111111"));
-        assert!(html.contains("Observed on Arc"));
+        assert!(html.contains("Valid wallet address on Arc"));
         assert!(
             html.find("200 USDC").unwrap() < html.find("Payment reserve is preserved.").unwrap()
         );

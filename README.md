@@ -32,12 +32,11 @@ owner's passkey approval. Pausing is immediate so an owner can stop future runs
 without waiting for a browser ceremony.
 
 Before Jusso creates a payment approval, every destination must be a valid,
-nonzero EVM address with observable account state on the configured Arc
-network. The RPC check distinguishes wallets from deployed contracts and
-rejects an address with no code, transaction history, native balance, or USDC
-balance. A genuinely new wallet must therefore be activated on Arc before it
-can receive an automated plan. Optional recipient names are saved in the
-organization's Arc address book only after owner approval.
+nonzero EVM address. The configured Arc RPC is used to distinguish addresses
+with deployed contract code from ordinary or not-yet-deployed wallets, but a
+new wallet does not need prior activity or a balance before it can receive an
+automated payment. Optional recipient names are saved in the organization's
+Arc address book only after owner approval.
 
 At run time Jusso rechecks the plan version, agent state, current policy,
 recipient limits, wallet balance, and execution-fee reserve. Fixed recipients
