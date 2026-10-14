@@ -390,6 +390,16 @@ impl CircleClient {
         Ok(unwrap_data(&response).clone())
     }
 
+    pub async fn earn_position_balance(
+        &self,
+        network: ArcNetwork,
+        wallet: Address,
+        vault: Address,
+    ) -> Result<U256> {
+        let position = self.earn_position(network, wallet, vault).await?;
+        validate_earn_position_balance(&position, wallet, vault)
+    }
+
     pub async fn earn_quote(
         &self,
         network: ArcNetwork,
@@ -605,6 +615,44 @@ fn compile_earn_execute(
         Some(expected_output_token),
     )?;
     Ok((call, total))
+}
+
+fn validate_earn_position_balance(
+    position: &Value,
+    expected_wallet: Address,
+    expected_vault: Address,
+) -> Result<U256> {
+    let wallet = parse_address(
+        required_string(position, "wallet")?,
+        "Circle Earn position wallet",
+    )?;
+    if wallet != expected_wallet {
+        bail!("Circle Earn returned a position for a different wallet");
+    }
+    let vault = parse_address(
+        required_string(position, "vaultAddress")?,
+        "Circle Earn position vault",
+    )?;
+    if vault != expected_vault {
+        bail!("Circle Earn returned a different vault position");
+    }
+    let current = position
+        .get("currentBalance")
+        .and_then(Value::as_object)
+        .context("Circle Earn position is missing currentBalance")?;
+    let decimals = current
+        .get("decimals")
+        .and_then(Value::as_u64)
+        .context("Circle Earn position balance is missing decimals")?;
+    if decimals != 6 {
+        bail!("Circle Earn returned a non-USDC position balance");
+    }
+    parse_u256_value(
+        current
+            .get("raw")
+            .context("Circle Earn position balance is missing raw amount")?,
+        "Circle Earn position balance",
+    )
 }
 
 fn compile_signed_execute(
@@ -1042,6 +1090,35 @@ mod tests {
             testnet_assets[2].address,
             ARC_TESTNET_CIRBTC_ADDRESS.parse::<Address>().unwrap()
         );
+    }
+
+    #[test]
+    fn earn_position_balance_is_bound_to_wallet_vault_and_usdc_units() {
+        let wallet = Address::from_low_u64_be(1);
+        let vault = Address::from_low_u64_be(2);
+        let position = json!({
+            "wallet": format!("{wallet:?}"),
+            "vaultAddress": format!("{vault:?}"),
+            "currentBalance": {"raw": "12345000", "decimals": 6}
+        });
+
+        assert_eq!(
+            validate_earn_position_balance(&position, wallet, vault).unwrap(),
+            U256::from(12_345_000u64)
+        );
+        assert!(
+            validate_earn_position_balance(&position, Address::from_low_u64_be(3), vault).is_err()
+        );
+        assert!(
+            validate_earn_position_balance(&position, wallet, Address::from_low_u64_be(3)).is_err()
+        );
+
+        let wrong_decimals = json!({
+            "wallet": format!("{wallet:?}"),
+            "vaultAddress": format!("{vault:?}"),
+            "currentBalance": {"raw": "12345000", "decimals": 18}
+        });
+        assert!(validate_earn_position_balance(&wrong_decimals, wallet, vault).is_err());
     }
 
     #[test]

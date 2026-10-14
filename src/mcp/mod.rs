@@ -2481,8 +2481,14 @@ async fn execute_earn_action(
             .name
         };
         if withdrawal {
-            let available =
-                services::fetch_erc4626_max_withdraw(provider.as_ref(), vault, wallet).await?;
+            // Circle Earn can wrap opportunities whose position is not exposed
+            // as a directly held ERC-4626 balance on the advertised vault.
+            // Use Circle's wallet-and-vault-bound position response here; the
+            // prepared withdrawal is still constrained by signed instructions
+            // and the complete UserOperation simulation below.
+            let available = circle
+                .earn_position_balance(state.config.arc_network, wallet, vault)
+                .await?;
             if amount_raw > available {
                 anyhow::bail!(
                     "withdrawal exceeds the currently available position of {} USDC",

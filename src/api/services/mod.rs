@@ -623,20 +623,6 @@ pub(crate) async fn fetch_erc4626_asset_balance(
     fetch_single_u256_call(provider, vault, &data, "convertToAssets").await
 }
 
-pub(crate) async fn fetch_erc4626_max_withdraw(
-    provider: &crate::arc::rpc::ArcRpcClient,
-    vault: Address,
-    owner: Address,
-) -> Result<U256> {
-    let mut data = Vec::with_capacity(4 + 32);
-    data.extend_from_slice(&id("maxWithdraw(address)")[..4]);
-    let mut owner_slot = [0u8; 32];
-    owner_slot[12..].copy_from_slice(owner.as_bytes());
-    data.extend_from_slice(&owner_slot);
-
-    fetch_single_u256_call(provider, vault, &data, "maxWithdraw").await
-}
-
 async fn fetch_single_u256_call(
     provider: &crate::arc::rpc::ArcRpcClient,
     contract: Address,
